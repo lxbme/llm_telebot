@@ -28,6 +28,13 @@ type Config struct {
 	MaxTokens      int    // 0 = no limit
 	BotUsername    string // e.g. "@mybot"
 	ContextMode    string // "at" = only @bot messages as context; "global" = all group messages as context
+	AutoDetect     bool   // true = use LLM to judge if an un-mentioned message is relevant and should trigger a reply
+
+	// Separate (optional) model config for the AUTO_DETECT relevance classifier.
+	// When empty, falls back to the main OpenAI settings above.
+	AutoDetectBase  string
+	AutoDetectKey   string
+	AutoDetectModel string
 }
 
 func loadConfig() Config {
@@ -50,16 +57,22 @@ func loadConfig() Config {
 		contextMode = "at"
 	}
 
+	autoDetect := strings.ToLower(getEnv("AUTO_DETECT", "false")) == "true"
+
 	return Config{
-		OpenAIBase:     getEnv("OPENAI_API_BASE", ""),
-		OpenAIKey:      getEnv("OPENAI_API_KEY", ""),
-		OpenAIModel:    getEnv("OPENAI_MODEL", "gpt-4o"),
-		TelegramToken:  getEnv("TELEGRAM_BOT_TOKEN", ""),
-		SystemPrompt:   getEnv("SYSTEM_PROMPT", "You are a helpful assistant."),
-		ContextMaxMsgs: maxMsgs,
-		MaxTokens:      maxTokens,
-		BotUsername:    getEnv("BOT_USERNAME", ""),
-		ContextMode:    contextMode,
+		OpenAIBase:      getEnv("OPENAI_API_BASE", ""),
+		OpenAIKey:       getEnv("OPENAI_API_KEY", ""),
+		OpenAIModel:     getEnv("OPENAI_MODEL", "gpt-4o"),
+		TelegramToken:   getEnv("TELEGRAM_BOT_TOKEN", ""),
+		SystemPrompt:    getEnv("SYSTEM_PROMPT", "You are a helpful assistant."),
+		ContextMaxMsgs:  maxMsgs,
+		MaxTokens:       maxTokens,
+		BotUsername:     getEnv("BOT_USERNAME", ""),
+		ContextMode:     contextMode,
+		AutoDetect:      autoDetect,
+		AutoDetectBase:  getEnv("AUTO_DETECT_API_BASE", ""),
+		AutoDetectKey:   getEnv("AUTO_DETECT_API_KEY", ""),
+		AutoDetectModel: getEnv("AUTO_DETECT_MODEL", ""),
 	}
 }
 
@@ -158,10 +171,12 @@ func (s *HistoryStore) Clear(chatID int64) {
 // ─── Bot ──────────────────────────────────────────────────────────────────────
 
 type Bot struct {
-	cfg   Config
-	ai    *openai.Client
-	store *HistoryStore
-	tg    *tele.Bot
+	cfg           Config
+	ai            *openai.Client // main LLM client
+	detectorAI    *openai.Client // lighter model for relevance detection (may equal ai)
+	detectorModel string         // model name for relevance detection
+	store         *HistoryStore
+	tg            *tele.Bot
 }
 
 func NewBot(cfg Config) (*Bot, error) {
@@ -179,6 +194,28 @@ func NewBot(cfg Config) (*Bot, error) {
 	}
 	aiClient := openai.NewClientWithConfig(aiCfg)
 
+	// Build detector client – falls back to main client if not configured.
+	detectorClient := aiClient
+	detectorModel := cfg.OpenAIModel
+	if cfg.AutoDetectKey != "" || cfg.AutoDetectBase != "" || cfg.AutoDetectModel != "" {
+		detKey := cfg.AutoDetectKey
+		if detKey == "" {
+			detKey = cfg.OpenAIKey
+		}
+		detCfg := openai.DefaultConfig(detKey)
+		detBase := cfg.AutoDetectBase
+		if detBase == "" {
+			detBase = cfg.OpenAIBase
+		}
+		if detBase != "" {
+			detCfg.BaseURL = detBase
+		}
+		detectorClient = openai.NewClientWithConfig(detCfg)
+		if cfg.AutoDetectModel != "" {
+			detectorModel = cfg.AutoDetectModel
+		}
+	}
+
 	// Build Telegram bot.
 	pref := tele.Settings{
 		Token:  cfg.TelegramToken,
@@ -190,10 +227,12 @@ func NewBot(cfg Config) (*Bot, error) {
 	}
 
 	return &Bot{
-		cfg:   cfg,
-		ai:    aiClient,
-		store: NewHistoryStore(),
-		tg:    tgBot,
+		cfg:           cfg,
+		ai:            aiClient,
+		detectorAI:    detectorClient,
+		detectorModel: detectorModel,
+		store:         NewHistoryStore(),
+		tg:            tgBot,
 	}, nil
 }
 
@@ -207,6 +246,100 @@ func (b *Bot) Run() {
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+// relevancePromptTpl is the system prompt template for the lightweight relevance check.
+// The bot's name and persona are injected at runtime so the classifier knows the bot's identity.
+const relevancePromptTpl = `You are a binary classifier that decides whether a new group-chat message should be answered by a chat bot.
+
+Bot info:
+- Telegram username: %s
+- Persona / system prompt: %s
+
+Rules — reply YES if ANY of the following is true:
+1. The message explicitly mentions the bot by name, username, nickname, or any common alias (e.g. "助手", "机器人", "bot", "AI").
+2. The message is a direct reply to one of the bot's previous messages.
+3. The message is clearly continuing or following up on a conversation the bot was just involved in (look at the recent context).
+4. The message asks a question or makes a request that only an AI assistant would be expected to answer, and there is no other obvious human addressee.
+
+Reply NO if the message is clearly directed at another human, is casual chatter unrelated to the bot, or is a greeting with no indication it is aimed at the bot.
+
+!!! Reply with ONLY one word: YES or NO. Do not explain. !!!`
+
+// isRelevant uses a cheap, low-token LLM call to decide whether an
+// un-mentioned group message is relevant to this bot and should trigger a reply.
+func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	botName := b.cfg.BotUsername
+	if botName == "" {
+		botName = "@" + b.tg.Me.Username
+	}
+
+	systemPrompt := fmt.Sprintf(relevancePromptTpl, botName, b.cfg.SystemPrompt)
+
+	// Build a minimal prompt: classifier system + recent context + new message.
+	msgs := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+	}
+
+	// Include up to 5 recent history messages for context (keep it cheap).
+	history := b.store.Get(chatID)
+	if len(history) > 5 {
+		history = history[len(history)-5:]
+	}
+	for _, h := range history {
+		msgs = append(msgs, openai.ChatCompletionMessage{
+			Role:    h.Role,
+			Content: h.Content,
+		})
+	}
+
+	msgs = append(msgs, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: fmt.Sprintf("New message from %s:\n%s\n\nShould the bot reply? YES or NO.", sanitizeName(sender.ID), text),
+	})
+
+	req := openai.ChatCompletionRequest{
+		Model:     b.detectorModel,
+		Messages:  msgs,
+		MaxTokens: 100,
+	}
+
+	// Retry up to 3 times on transient errors (EOF, timeout, etc.).
+	var resp openai.ChatCompletionResponse
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err = b.detectorAI.CreateChatCompletion(ctx, req)
+		if err == nil {
+			break
+		}
+		// Only retry on transient network errors (EOF, connection reset, etc.).
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "EOF") ||
+			strings.Contains(errMsg, "connection reset") ||
+			strings.Contains(errMsg, "timeout") {
+			log.Printf("isRelevant attempt %d/%d transient error: %v", attempt+1, 3, err)
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+			continue
+		}
+		break // non-transient error, don't retry
+	}
+	if err != nil {
+		log.Printf("isRelevant error after retries: %v", err)
+		return false
+	}
+	if len(resp.Choices) == 0 {
+		log.Println("isRelevant: no choices returned")
+		return false
+	}
+	// Debug: log full response details
+	choice := resp.Choices[0]
+	log.Printf("isRelevant debug: finish_reason=%s, content=%q, role=%s",
+		choice.FinishReason, choice.Message.Content, choice.Message.Role)
+	answer := strings.TrimSpace(strings.ToUpper(choice.Message.Content))
+	return strings.HasPrefix(answer, "YES")
+}
 
 func (b *Bot) handleStart(c tele.Context) error {
 	return c.Reply("👋 Hello! I'm your AI assistant. Ask me anything.\nUse /clear to reset conversation history.")
@@ -245,7 +378,18 @@ func (b *Bot) handleText(c tele.Context) error {
 					Content: buildUserContent(msg.Sender, text),
 				}, b.cfg.ContextMaxMsgs)
 			}
-			return nil // not mentioned – do not reply
+
+			// AUTO_DETECT: ask LLM whether this message is relevant to the bot.
+			if b.cfg.AutoDetect && text != "" {
+				if b.isRelevant(c.Chat().ID, msg.Sender, text) {
+					// Treat as if the bot was mentioned – fall through to reply.
+					mentioned = true
+				}
+			}
+
+			if !mentioned {
+				return nil // not mentioned and not relevant – do not reply
+			}
 		}
 
 		// strip the mention from the text so LLM sees clean input
