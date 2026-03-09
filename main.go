@@ -135,6 +135,18 @@ func (s *HistoryStore) Append(chatID int64, msg openai.ChatCompletionMessage, ma
 	}
 }
 
+// AppendBatch atomically appends multiple messages and trims the history.
+// This is used to write the user message and assistant reply as a pair so
+// concurrent requests cannot interleave between them.
+func (s *HistoryStore) AppendBatch(chatID int64, msgs []openai.ChatCompletionMessage, maxMessages int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.history[chatID] = append(s.history[chatID], msgs...)
+	if len(s.history[chatID]) > maxMessages {
+		s.history[chatID] = s.history[chatID][len(s.history[chatID])-maxMessages:]
+	}
+}
+
 // Clear deletes the history for a chat.
 func (s *HistoryStore) Clear(chatID int64) {
 	s.mu.Lock()
@@ -252,19 +264,21 @@ func (b *Bot) handleText(c tele.Context) error {
 	chatID := c.Chat().ID
 	sender := msg.Sender
 
-	// Add user message to history with a structured sender header so the LLM
-	// always has unambiguous context about who said what.
-	b.store.Append(chatID, openai.ChatCompletionMessage{
+	// Build the user message but do NOT append it to history yet.
+	// We will atomically append (user msg + assistant reply) after the
+	// LLM finishes, so concurrent requests never interleave.
+	userMsg := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
 		Name:    sanitizeName(sender.ID),
 		Content: buildUserContent(sender, text),
-	}, b.cfg.ContextMaxMsgs)
+	}
 
-	// Build the full messages slice: system prompt + history.
+	// Snapshot current history and build the prompt.
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: b.cfg.SystemPrompt},
 	}
 	messages = append(messages, b.store.Get(chatID)...)
+	messages = append(messages, userMsg)
 
 	// Send the initial placeholder message.
 	placeholder, err := b.tg.Send(c.Chat(), "⏳ Thinking…")
@@ -273,7 +287,7 @@ func (b *Bot) handleText(c tele.Context) error {
 	}
 
 	// Run streaming in a goroutine so we can tick-update Telegram.
-	go b.streamReply(chatID, messages, placeholder)
+	go b.streamReply(chatID, userMsg, messages, placeholder)
 
 	return nil
 }
@@ -282,6 +296,7 @@ func (b *Bot) handleText(c tele.Context) error {
 
 func (b *Bot) streamReply(
 	chatID int64,
+	userMsg openai.ChatCompletionMessage,
 	messages []openai.ChatCompletionMessage,
 	placeholder *tele.Message,
 ) {
@@ -373,10 +388,11 @@ func (b *Bot) streamReply(
 	// One final edit with the complete text.
 	b.editOrLog(placeholder, finalText)
 
-	// Persist assistant reply in history.
-	b.store.Append(chatID, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleAssistant,
-		Content: finalText,
+	// Atomically persist the user message and assistant reply as a pair
+	// so concurrent requests never interleave between them.
+	b.store.AppendBatch(chatID, []openai.ChatCompletionMessage{
+		userMsg,
+		{Role: openai.ChatMessageRoleAssistant, Content: finalText},
 	}, b.cfg.ContextMaxMsgs)
 }
 
