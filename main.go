@@ -88,6 +88,7 @@ func buildUserContent(sender *tele.User, text string) string {
 	if fullName := strings.TrimSpace(sender.FirstName + " " + sender.LastName); fullName != "" {
 		fmt.Fprintf(&sb, " name:%q", fullName)
 	}
+	fmt.Fprintf(&sb, " time:%s", time.Now().UTC().Format(time.RFC3339))
 	sb.WriteString("]\n")
 	sb.WriteString(text)
 	return sb.String()
