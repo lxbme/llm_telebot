@@ -1,3 +1,4 @@
 .env
 llm_telebot
 data
+mcp_config.json

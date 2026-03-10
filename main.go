@@ -60,6 +60,11 @@ type Config struct {
 	SummaryBase  string
 	SummaryKey   string
 	SummaryModel string
+
+	// Tool calling (MCP) settings.
+	ToolsEnabled       bool   // enable LLM tool/function calling
+	ToolsMaxIterations int    // max tool-call round-trips per request (default 5)
+	MCPConfigPath      string // path to MCP servers JSON config file
 }
 
 func loadConfig() Config {
@@ -92,6 +97,11 @@ func loadConfig() Config {
 	summaryMinOverflow, _ := strconv.Atoi(getEnv("SUMMARY_MIN_OVERFLOW", "6"))
 	if summaryMinOverflow <= 0 {
 		summaryMinOverflow = 6
+	}
+
+	toolsMaxIter, _ := strconv.Atoi(getEnv("TOOLS_MAX_ITERATIONS", "5"))
+	if toolsMaxIter <= 0 {
+		toolsMaxIter = 5
 	}
 
 	allowedUsers := parseIDList(getEnv("ALLOWED_USERS", ""))
@@ -139,6 +149,9 @@ func loadConfig() Config {
 		SummaryBase:         getEnv("SUMMARY_API_BASE", ""),
 		SummaryKey:          getEnv("SUMMARY_API_KEY", ""),
 		SummaryModel:        getEnv("SUMMARY_MODEL", ""),
+		ToolsEnabled:        strings.ToLower(getEnv("TOOLS_ENABLED", "false")) == "true",
+		ToolsMaxIterations:  toolsMaxIter,
+		MCPConfigPath:       getEnv("MCP_CONFIG_PATH", ""),
 	}
 }
 
@@ -297,8 +310,10 @@ type Bot struct {
 	summaryAI     *openai.Client // LLM client for conversation summarisation (may equal ai)
 	summaryModel  string         // model name for conversation summarisation
 	store         *HistoryStore
-	summaries     *SummaryStore // per-chat conversation summaries
-	profiles      *ProfileStore // NoSQL user-profile store (nil if disabled)
+	summaries     *SummaryStore     // per-chat conversation summaries
+	profiles      *ProfileStore     // NoSQL user-profile store (nil if disabled)
+	tools         *ToolRegistry     // registered MCP tools (nil if disabled)
+	mcpClients    *MCPClientManager // remote MCP server connections (nil if none)
 	tg            *tele.Bot
 }
 
@@ -406,6 +421,27 @@ func NewBot(cfg Config) (*Bot, error) {
 		log.Printf("Summary enabled (min_overflow: %d, model: %s)", cfg.SummaryMinOverflow, summaryModel)
 	}
 
+	// Optionally initialise tool registry.
+	var toolRegistry *ToolRegistry
+	var mcpManager *MCPClientManager
+	if cfg.ToolsEnabled {
+		toolRegistry = NewToolRegistry()
+		RegisterBuiltinTools(toolRegistry)
+
+		// Connect to external MCP servers if configured.
+		if cfg.MCPConfigPath != "" {
+			mcpCfg, err := LoadMCPConfig(cfg.MCPConfigPath)
+			if err != nil {
+				log.Printf("Warning: failed to load MCP config from %s: %v", cfg.MCPConfigPath, err)
+			} else {
+				mcpManager = NewMCPClientManager()
+				mcpManager.ConnectAll(mcpCfg, toolRegistry)
+			}
+		}
+
+		log.Printf("Tool calling enabled (%d tools, max %d iterations)", toolRegistry.Count(), cfg.ToolsMaxIterations)
+	}
+
 	return &Bot{
 		cfg:           cfg,
 		ai:            aiClient,
@@ -418,6 +454,8 @@ func NewBot(cfg Config) (*Bot, error) {
 		store:         NewHistoryStore(),
 		summaries:     NewSummaryStore(),
 		profiles:      profiles,
+		tools:         toolRegistry,
+		mcpClients:    mcpManager,
 		tg:            tgBot,
 	}, nil
 }
@@ -769,6 +807,83 @@ func (b *Bot) streamReply(
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
+	// ── Tool-call loop ──────────────────────────────────────────────────
+	// If tools are enabled, we do non-streaming requests in a loop so the
+	// LLM can call tools repeatedly. Once all tool calls are resolved, the
+	// conversation (including tool results) is sent to the streaming path
+	// so the LLM can summarise/present the results fluently.
+	if b.tools != nil && b.tools.Count() > 0 {
+		maxIter := b.cfg.ToolsMaxIterations
+		for i := 0; i < maxIter; i++ {
+			req := openai.ChatCompletionRequest{
+				Model:     b.cfg.OpenAIModel,
+				Messages:  messages,
+				Tools:     b.tools.OpenAITools(),
+				MaxTokens: b.cfg.MaxTokens,
+			}
+
+			resp, err := b.ai.CreateChatCompletion(ctx, req)
+			if err != nil {
+				b.editOrLog(placeholder, fmt.Sprintf("\u274c Error: %v", err))
+				return
+			}
+			if len(resp.Choices) == 0 {
+				b.editOrLog(placeholder, "\u26a0\ufe0f The model returned an empty response.")
+				return
+			}
+
+			choice := resp.Choices[0]
+
+			// If the model chose to call tool(s):
+			if len(choice.Message.ToolCalls) > 0 {
+				// Append the assistant's tool-call message to the conversation.
+				messages = append(messages, choice.Message)
+
+				// Show the user which tools are being called.
+				var toolNames []string
+				for _, tc := range choice.Message.ToolCalls {
+					toolNames = append(toolNames, tc.Function.Name)
+				}
+				b.editOrLog(placeholder, fmt.Sprintf("\U0001f527 Calling tools: %s…", strings.Join(toolNames, ", ")))
+
+				// Execute each tool call and append the results.
+				for _, tc := range choice.Message.ToolCalls {
+					log.Printf("[tools] executing %s(%s)", tc.Function.Name, tc.Function.Arguments)
+					result := b.tools.ExecuteToolCall(tc)
+					log.Printf("[tools] %s → %s", tc.Function.Name, truncate(result, 200))
+					messages = append(messages, openai.ChatCompletionMessage{
+						Role:       openai.ChatMessageRoleTool,
+						Content:    result,
+						ToolCallID: tc.ID,
+					})
+				}
+				continue // loop back to let the LLM process tool results
+			}
+
+			// No more tool calls — break out to the streaming path below
+			// so the LLM's final answer is streamed to the user.
+			break
+		}
+	}
+
+	// ── Streaming path ──────────────────────────────────────────────────
+	// Streams the LLM's final response to the user. When tools were used,
+	// the messages slice now contains the full tool-call conversation, so
+	// the LLM will summarise the tool results into a natural reply.
+	finalText := b.doStream(ctx, messages, placeholder)
+	if finalText == "" {
+		return // error already reported by doStream
+	}
+	b.postReply(chatID, userMsg, finalText, sender)
+}
+
+// doStream performs the streaming LLM call and returns the final text.
+// Returns empty string if an error was already reported to the user.
+func (b *Bot) doStream(
+	ctx context.Context,
+	messages []openai.ChatCompletionMessage,
+	placeholder *tele.Message,
+) string {
 	req := openai.ChatCompletionRequest{
 		Model:     b.cfg.OpenAIModel,
 		Messages:  messages,
@@ -776,10 +891,17 @@ func (b *Bot) streamReply(
 		MaxTokens: b.cfg.MaxTokens,
 	}
 
+	// If tools are enabled, include them so the model knows about them
+	// even in streaming mode (shouldn't happen in practice since tool-call
+	// loop is handled above, but keeps the request consistent).
+	if b.tools != nil && b.tools.Count() > 0 {
+		req.Tools = b.tools.OpenAITools()
+	}
+
 	stream, err := b.ai.CreateChatCompletionStream(ctx, req)
 	if err != nil {
 		b.editOrLog(placeholder, fmt.Sprintf("❌ Error starting stream: %v", err))
-		return
+		return ""
 	}
 	defer stream.Close()
 
@@ -791,6 +913,9 @@ func (b *Bot) streamReply(
 		lastSent string
 	)
 	defer ticker.Stop()
+
+	// Cancel context for ticker goroutine.
+	streamCtx, streamCancel := context.WithCancel(ctx)
 
 	// Goroutine: periodically push intermediate updates to Telegram.
 	done := make(chan struct{})
@@ -806,7 +931,7 @@ func (b *Bot) streamReply(
 					b.editOrLog(placeholder, current+"▌")
 					lastSent = current
 				}
-			case <-ctx.Done():
+			case <-streamCtx.Done():
 				return
 			}
 		}
@@ -833,7 +958,7 @@ func (b *Bot) streamReply(
 	}()
 
 	// Stop the ticker goroutine.
-	cancel()
+	streamCancel()
 	<-done
 
 	finalText := fullResponse.String()
@@ -844,7 +969,7 @@ func (b *Bot) streamReply(
 			errMsg = finalText + "\n\n" + errMsg
 		}
 		b.editOrLog(placeholder, errMsg)
-		return
+		return ""
 	}
 
 	if finalText == "" {
@@ -853,7 +978,17 @@ func (b *Bot) streamReply(
 
 	// One final edit with the complete text.
 	b.editOrLog(placeholder, finalText)
+	return finalText
+}
 
+// postReply handles post-response bookkeeping: history persistence, summary
+// triggering, and profile extraction.
+func (b *Bot) postReply(
+	chatID int64,
+	userMsg openai.ChatCompletionMessage,
+	finalText string,
+	sender *tele.User,
+) {
 	// Atomically persist the user message and assistant reply as a pair
 	// so concurrent requests never interleave between them.
 	b.store.AppendBatch(chatID, []openai.ChatCompletionMessage{
@@ -874,6 +1009,15 @@ func (b *Bot) streamReply(
 			go b.extractProfile(sender.Username, displayName, allMsgs)
 		}
 	}
+}
+
+// truncate shortens a string for logging purposes.
+func truncate(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "\u2026"
 }
 
 // editOrLog edits a Telegram message, falling back to a log on error.
@@ -902,6 +1046,9 @@ func main() {
 	}
 	if bot.profiles != nil {
 		defer bot.profiles.Close()
+	}
+	if bot.mcpClients != nil {
+		defer bot.mcpClients.Close()
 	}
 
 	bot.Run()
