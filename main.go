@@ -35,6 +35,21 @@ type Config struct {
 	AutoDetectBase  string
 	AutoDetectKey   string
 	AutoDetectModel string
+
+	// Access control. When both are empty, the bot is open to everyone.
+	AllowedUsers  map[int64]bool // user IDs allowed in private chats
+	AllowedGroups map[int64]bool // group/supergroup IDs where all members are allowed
+
+	// User profile extraction settings.
+	ProfileEnabled      bool   // enable NoSQL user-profile extraction
+	ProfileDBPath       string // bbolt database file path
+	ProfileExtractEvery int    // trigger extraction every N bot-replies per user
+
+	// Separate (optional) model config for profile extraction.
+	// When empty, falls back to the main OpenAI settings above.
+	ProfileBase  string
+	ProfileKey   string
+	ProfileModel string
 }
 
 func loadConfig() Config {
@@ -59,20 +74,51 @@ func loadConfig() Config {
 
 	autoDetect := strings.ToLower(getEnv("AUTO_DETECT", "false")) == "true"
 
+	profileExtractEvery, _ := strconv.Atoi(getEnv("PROFILE_EXTRACT_EVERY", "3"))
+	if profileExtractEvery <= 0 {
+		profileExtractEvery = 3
+	}
+
+	allowedUsers := parseIDList(getEnv("ALLOWED_USERS", ""))
+	allowedGroups := parseIDList(getEnv("ALLOWED_GROUPS", ""))
+
+	if len(allowedUsers) > 0 {
+		ids := make([]string, 0, len(allowedUsers))
+		for id := range allowedUsers {
+			ids = append(ids, strconv.FormatInt(id, 10))
+		}
+		log.Printf("Access control: ALLOWED_USERS = %v", ids)
+	}
+	if len(allowedGroups) > 0 {
+		ids := make([]string, 0, len(allowedGroups))
+		for id := range allowedGroups {
+			ids = append(ids, strconv.FormatInt(id, 10))
+		}
+		log.Printf("Access control: ALLOWED_GROUPS = %v", ids)
+	}
+
 	return Config{
-		OpenAIBase:      getEnv("OPENAI_API_BASE", ""),
-		OpenAIKey:       getEnv("OPENAI_API_KEY", ""),
-		OpenAIModel:     getEnv("OPENAI_MODEL", "gpt-4o"),
-		TelegramToken:   getEnv("TELEGRAM_BOT_TOKEN", ""),
-		SystemPrompt:    getEnv("SYSTEM_PROMPT", "You are a helpful assistant."),
-		ContextMaxMsgs:  maxMsgs,
-		MaxTokens:       maxTokens,
-		BotUsername:     getEnv("BOT_USERNAME", ""),
-		ContextMode:     contextMode,
-		AutoDetect:      autoDetect,
-		AutoDetectBase:  getEnv("AUTO_DETECT_API_BASE", ""),
-		AutoDetectKey:   getEnv("AUTO_DETECT_API_KEY", ""),
-		AutoDetectModel: getEnv("AUTO_DETECT_MODEL", ""),
+		OpenAIBase:          getEnv("OPENAI_API_BASE", ""),
+		OpenAIKey:           getEnv("OPENAI_API_KEY", ""),
+		OpenAIModel:         getEnv("OPENAI_MODEL", "gpt-4o"),
+		TelegramToken:       getEnv("TELEGRAM_BOT_TOKEN", ""),
+		SystemPrompt:        getEnv("SYSTEM_PROMPT", "You are a helpful assistant."),
+		ContextMaxMsgs:      maxMsgs,
+		MaxTokens:           maxTokens,
+		BotUsername:         getEnv("BOT_USERNAME", ""),
+		ContextMode:         contextMode,
+		AutoDetect:          autoDetect,
+		AutoDetectBase:      getEnv("AUTO_DETECT_API_BASE", ""),
+		AutoDetectKey:       getEnv("AUTO_DETECT_API_KEY", ""),
+		AutoDetectModel:     getEnv("AUTO_DETECT_MODEL", ""),
+		AllowedUsers:        allowedUsers,
+		AllowedGroups:       allowedGroups,
+		ProfileEnabled:      strings.ToLower(getEnv("PROFILE_ENABLED", "true")) == "true",
+		ProfileDBPath:       getEnv("PROFILE_DB_PATH", "./data/profiles.db"),
+		ProfileExtractEvery: profileExtractEvery,
+		ProfileBase:         getEnv("PROFILE_API_BASE", ""),
+		ProfileKey:          getEnv("PROFILE_API_KEY", ""),
+		ProfileModel:        getEnv("PROFILE_MODEL", ""),
 	}
 }
 
@@ -81,6 +127,32 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseIDList parses a comma-separated string of int64 IDs into a set.
+// Invalid entries are silently skipped.
+func parseIDList(raw string) map[int64]bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	set := make(map[int64]bool)
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			log.Printf("Warning: ignoring invalid ID %q in whitelist", s)
+			continue
+		}
+		set[id] = true
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -175,7 +247,10 @@ type Bot struct {
 	ai            *openai.Client // main LLM client
 	detectorAI    *openai.Client // lighter model for relevance detection (may equal ai)
 	detectorModel string         // model name for relevance detection
+	profileAI     *openai.Client // LLM client for profile extraction (may equal ai)
+	profileModel  string         // model name for profile extraction
 	store         *HistoryStore
+	profiles      *ProfileStore // NoSQL user-profile store (nil if disabled)
 	tg            *tele.Bot
 }
 
@@ -226,19 +301,89 @@ func NewBot(cfg Config) (*Bot, error) {
 		return nil, fmt.Errorf("failed to create Telegram bot: %w", err)
 	}
 
+	// Optionally initialise user-profile store and its LLM client.
+	var profiles *ProfileStore
+	profileClient := aiClient
+	profileModel := cfg.OpenAIModel
+	if cfg.ProfileEnabled {
+		profiles, err = NewProfileStore(cfg.ProfileDBPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init profile store: %w", err)
+		}
+		// Build profile-extraction LLM client – falls back to main client.
+		if cfg.ProfileKey != "" || cfg.ProfileBase != "" || cfg.ProfileModel != "" {
+			pKey := cfg.ProfileKey
+			if pKey == "" {
+				pKey = cfg.OpenAIKey
+			}
+			pCfg := openai.DefaultConfig(pKey)
+			pBase := cfg.ProfileBase
+			if pBase == "" {
+				pBase = cfg.OpenAIBase
+			}
+			if pBase != "" {
+				pCfg.BaseURL = pBase
+			}
+			profileClient = openai.NewClientWithConfig(pCfg)
+			if cfg.ProfileModel != "" {
+				profileModel = cfg.ProfileModel
+			}
+		}
+		log.Printf("User profile extraction enabled (db: %s, every %d msgs, model: %s)",
+			cfg.ProfileDBPath, cfg.ProfileExtractEvery, profileModel)
+	}
+
 	return &Bot{
 		cfg:           cfg,
 		ai:            aiClient,
 		detectorAI:    detectorClient,
 		detectorModel: detectorModel,
+		profileAI:     profileClient,
+		profileModel:  profileModel,
 		store:         NewHistoryStore(),
+		profiles:      profiles,
 		tg:            tgBot,
 	}, nil
+}
+
+// isAllowed checks whether a message from the given chat/user is permitted.
+// When no whitelist is configured (both maps nil), everything is allowed.
+func (b *Bot) isAllowed(c tele.Context) bool {
+	// No whitelist configured → open to everyone.
+	if b.cfg.AllowedUsers == nil && b.cfg.AllowedGroups == nil {
+		return true
+	}
+
+	chat := c.Chat()
+	if chat == nil {
+		return false
+	}
+
+	switch chat.Type {
+	case tele.ChatPrivate:
+		// Private chat: check user ID.
+		if b.cfg.AllowedUsers != nil && b.cfg.AllowedUsers[c.Sender().ID] {
+			return true
+		}
+	default:
+		// Group / supergroup / channel: check group ID.
+		if b.cfg.AllowedGroups != nil && b.cfg.AllowedGroups[chat.ID] {
+			return true
+		}
+		// Also allow if the sender is individually whitelisted.
+		if b.cfg.AllowedUsers != nil && c.Sender() != nil && b.cfg.AllowedUsers[c.Sender().ID] {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (b *Bot) Run() {
 	b.tg.Handle("/start", b.handleStart)
 	b.tg.Handle("/clear", b.handleClear)
+	b.tg.Handle("/clearp", b.handleClearProfile)
+	b.tg.Handle("/displayp", b.handleDisplayProfile)
 	b.tg.Handle(tele.OnText, b.handleText)
 
 	log.Printf("Bot @%s is running…", b.tg.Me.Username)
@@ -342,16 +487,77 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 }
 
 func (b *Bot) handleStart(c tele.Context) error {
+	if !b.isAllowed(c) {
+		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
 	return c.Reply("👋 Hello! I'm your AI assistant. Ask me anything.\nUse /clear to reset conversation history.")
 }
 
 func (b *Bot) handleClear(c tele.Context) error {
+	if !b.isAllowed(c) {
+		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
 	chatID := c.Chat().ID
 	b.store.Clear(chatID)
 	return c.Reply("✅ Conversation history cleared.")
 }
 
+func (b *Bot) handleClearProfile(c tele.Context) error {
+	if !b.isAllowed(c) {
+		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
+	username := c.Sender().Username
+	if username == "" {
+		return c.Reply("⚠️ You don't have a Telegram username set, so no profile is stored.")
+	}
+	if b.profiles == nil {
+		return c.Reply("⚠️ Profile extraction is disabled.")
+	}
+	if err := b.profiles.Delete(username); err != nil {
+		log.Printf("[profile] delete error for @%s: %v", username, err)
+		return c.Reply("❌ Failed to clear profile.")
+	}
+	return c.Reply("✅ Your user profile has been cleared.")
+}
+
+func (b *Bot) handleDisplayProfile(c tele.Context) error {
+	if !b.isAllowed(c) {
+		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
+	username := c.Sender().Username
+	if username == "" {
+		return c.Reply("⚠️ You don't have a Telegram username set, so no profile is stored.")
+	}
+	if b.profiles == nil {
+		return c.Reply("⚠️ Profile extraction is disabled.")
+	}
+	profile, err := b.profiles.Get(username)
+	if err != nil {
+		log.Printf("[profile] read error for @%s: %v", username, err)
+		return c.Reply("❌ Failed to read profile.")
+	}
+	if profile == nil || len(profile.Facts) == 0 {
+		return c.Reply("📭 No profile data yet. Keep chatting and I'll learn about you!")
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("👤 Profile for @%s:\n", username))
+	for i, fact := range profile.Facts {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, fact))
+	}
+	sb.WriteString(fmt.Sprintf("\n🕐 Last updated: %s", profile.UpdatedAt.Format("2006-01-02 15:04 UTC")))
+	return c.Reply(sb.String())
+}
+
 func (b *Bot) handleText(c tele.Context) error {
+	if !b.isAllowed(c) {
+		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
+
 	msg := c.Message()
 	if msg == nil {
 		return nil
@@ -419,10 +625,16 @@ func (b *Bot) handleText(c tele.Context) error {
 	}
 
 	// Snapshot current history and build the prompt.
+	history := b.store.Get(chatID)
+
+	// Inject user profiles of conversation participants into the system prompt.
+	profileSection := b.buildProfileSection(append(history, userMsg))
+	systemPrompt := b.cfg.SystemPrompt + profileSection
+
 	messages := []openai.ChatCompletionMessage{
-		{Role: openai.ChatMessageRoleSystem, Content: b.cfg.SystemPrompt},
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 	}
-	messages = append(messages, b.store.Get(chatID)...)
+	messages = append(messages, history...)
 	messages = append(messages, userMsg)
 
 	// Send the initial placeholder message.
@@ -432,7 +644,7 @@ func (b *Bot) handleText(c tele.Context) error {
 	}
 
 	// Run streaming in a goroutine so we can tick-update Telegram.
-	go b.streamReply(chatID, userMsg, messages, placeholder)
+	go b.streamReply(chatID, userMsg, messages, placeholder, sender)
 
 	return nil
 }
@@ -444,6 +656,7 @@ func (b *Bot) streamReply(
 	userMsg openai.ChatCompletionMessage,
 	messages []openai.ChatCompletionMessage,
 	placeholder *tele.Message,
+	sender *tele.User,
 ) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -539,6 +752,15 @@ func (b *Bot) streamReply(
 		userMsg,
 		{Role: openai.ChatMessageRoleAssistant, Content: finalText},
 	}, b.cfg.ContextMaxMsgs)
+
+	// Trigger background user-profile extraction if due.
+	if b.profiles != nil && sender != nil && sender.Username != "" {
+		if b.profiles.ShouldExtract(sender.Username, b.cfg.ProfileExtractEvery, 2*time.Minute) {
+			allMsgs := b.store.Get(chatID)
+			displayName := strings.TrimSpace(sender.FirstName + " " + sender.LastName)
+			go b.extractProfile(sender.Username, displayName, allMsgs)
+		}
+	}
 }
 
 // editOrLog edits a Telegram message, falling back to a log on error.
@@ -564,6 +786,9 @@ func main() {
 	bot, err := NewBot(cfg)
 	if err != nil {
 		log.Fatalf("Failed to initialise bot: %v", err)
+	}
+	if bot.profiles != nil {
+		defer bot.profiles.Close()
 	}
 
 	bot.Run()

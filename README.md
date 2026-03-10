@@ -13,6 +13,7 @@
 - **智能自动检测 (AUTO_DETECT)** — 利用 LLM 判断群聊中未 @机器人 的消息是否与机器人相关，自动触发回复
 - **独立检测模型** — AUTO_DETECT 可配置单独的轻量模型（如 gpt-4o-mini），节省 token 开销
 - **并发安全** — 快照 + 原子追加机制，多个并发请求不会导致上下文错乱
+- **白名单 / 权限控制** — 通过 `ALLOWED_USERS` 和 `ALLOWED_GROUPS` 限制 bot 的使用范围
 - **OpenAI 兼容** — 支持任何 OpenAI 兼容 API（如 DeepSeek、通义千问、Ollama 等）
 - **用户身份追踪** — 每条消息自动附带发送者信息，LLM 能区分不同用户
 
@@ -70,6 +71,19 @@ docker run --env-file .env llm-telebot
 | `CONTEXT_MODE` | `at` | `at` = 仅 @消息作为上下文；`global` = 所有群聊消息作为上下文 |
 | `AUTO_DETECT` | `false` | `true` = 自动判断未 @消息 是否与机器人相关并回复 |
 
+### 访问控制 / 白名单（可选）
+
+当 `ALLOWED_USERS` 和 `ALLOWED_GROUPS` 均未设置时，bot 对所有人开放。设置后，只有白名单中的用户/群组可以使用 bot。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `ALLOWED_USERS` | — | 允许使用 bot 的用户 ID 列表，逗号分隔。适用于私聊；群聊中该用户也被放行 |
+| `ALLOWED_GROUPS` | — | 允许使用 bot 的群组/超级群组 ID 列表，逗号分隔。群内所有成员均可使用 |
+
+> **提示：** 获取用户/群组 ID 的方法：向 [@userinfobot](https://t.me/userinfobot) 发送消息可获取用户 ID；将 [@RawDataBot](https://t.me/RawDataBot) 加入群组可获取群组 ID（通常为负数）。
+>
+> 示例：`ALLOWED_USERS=123456789,987654321`  `ALLOWED_GROUPS=-1001234567890`
+
 ### 自动检测独立模型（可选）
 
 当 `AUTO_DETECT=true` 时，可为相关性判断配置独立的轻量模型，节省主模型的 token 消耗。未设置时，回退到主模型配置。
@@ -91,6 +105,10 @@ docker run --env-file .env llm-telebot
 
 ```
 用户消息 → handleText()
+            ├─ 权限检查: isAllowed()
+            │   ├─ 私聊: 检查 ALLOWED_USERS
+            │   └─ 群聊: 检查 ALLOWED_GROUPS 或 ALLOWED_USERS
+            │           └─ 未授权 → 静默忽略
             ├─ 私聊: 直接处理
             └─ 群聊: 检查 @mention
                      ├─ 被 @ → 处理
