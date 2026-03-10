@@ -65,6 +65,7 @@ type Config struct {
 	ToolsEnabled       bool   // enable LLM tool/function calling
 	ToolsMaxIterations int    // max tool-call round-trips per request (default 5)
 	MCPConfigPath      string // path to MCP servers JSON config file
+	UserMCPDBPath      string // bbolt database for per-user MCP configs
 }
 
 func loadConfig() Config {
@@ -152,6 +153,7 @@ func loadConfig() Config {
 		ToolsEnabled:        strings.ToLower(getEnv("TOOLS_ENABLED", "false")) == "true",
 		ToolsMaxIterations:  toolsMaxIter,
 		MCPConfigPath:       getEnv("MCP_CONFIG_PATH", ""),
+		UserMCPDBPath:       getEnv("USER_MCP_DB_PATH", "./data/user_mcp.db"),
 	}
 }
 
@@ -312,8 +314,9 @@ type Bot struct {
 	store         *HistoryStore
 	summaries     *SummaryStore     // per-chat conversation summaries
 	profiles      *ProfileStore     // NoSQL user-profile store (nil if disabled)
-	tools         *ToolRegistry     // registered MCP tools (nil if disabled)
-	mcpClients    *MCPClientManager // remote MCP server connections (nil if none)
+	tools         *ToolRegistry     // global registered MCP tools (nil if disabled)
+	mcpClients    *MCPClientManager // global remote MCP server connections (nil if none)
+	userTools     *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
 	tg            *tele.Bot
 }
 
@@ -426,7 +429,6 @@ func NewBot(cfg Config) (*Bot, error) {
 	var mcpManager *MCPClientManager
 	if cfg.ToolsEnabled {
 		toolRegistry = NewToolRegistry()
-		RegisterBuiltinTools(toolRegistry)
 
 		// Connect to external MCP servers if configured.
 		if cfg.MCPConfigPath != "" {
@@ -439,7 +441,19 @@ func NewBot(cfg Config) (*Bot, error) {
 			}
 		}
 
-		log.Printf("Tool calling enabled (%d tools, max %d iterations)", toolRegistry.Count(), cfg.ToolsMaxIterations)
+		log.Printf("Tool calling enabled (%d global tools, max %d iterations)", toolRegistry.Count(), cfg.ToolsMaxIterations)
+	}
+
+	// Initialise per-user MCP tool manager (always enabled when tools are enabled).
+	var userToolMgr *UserToolManager
+	if cfg.ToolsEnabled {
+		umcpStore, err := NewUserMCPStore(cfg.UserMCPDBPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init user MCP store: %w", err)
+		}
+		userToolMgr = NewUserToolManager(umcpStore)
+		userToolMgr.RestoreAll()
+		log.Printf("Per-user dynamic MCP enabled (db: %s)", cfg.UserMCPDBPath)
 	}
 
 	return &Bot{
@@ -456,6 +470,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		profiles:      profiles,
 		tools:         toolRegistry,
 		mcpClients:    mcpManager,
+		userTools:     userToolMgr,
 		tg:            tgBot,
 	}, nil
 }
@@ -499,6 +514,9 @@ func (b *Bot) Run() {
 	b.tg.Handle("/summary", b.handleSummary)
 	b.tg.Handle("/clearp", b.handleClearProfile)
 	b.tg.Handle("/displayp", b.handleDisplayProfile)
+	b.tg.Handle("/mcp_list", b.handleMCPList)
+	b.tg.Handle("/mcp_del", b.handleMCPDel)
+	b.tg.Handle("/mcp_clear", b.handleMCPClear)
 	b.tg.Handle(tele.OnText, b.handleText)
 
 	log.Printf("Bot @%s is running…", b.tg.Me.Username)
@@ -691,6 +709,62 @@ func (b *Bot) handleDisplayProfile(c tele.Context) error {
 	return c.Reply(sb.String())
 }
 
+// ─── MCP Management Commands ─────────────────────────────────────────────────
+
+func (b *Bot) handleMCPList(c tele.Context) error {
+	if !b.isAllowed(c) {
+		return nil
+	}
+	if b.userTools == nil {
+		return c.Reply("⚠️ Tool calling is disabled.")
+	}
+	userID := c.Sender().ID
+	servers, err := b.userTools.ListServers(userID)
+	if err != nil {
+		log.Printf("[user-mcp] list error for user %d: %v", userID, err)
+		return c.Reply("❌ Failed to list MCP servers.")
+	}
+	return c.Reply(FormatServerList(servers))
+}
+
+func (b *Bot) handleMCPDel(c tele.Context) error {
+	if !b.isAllowed(c) {
+		return nil
+	}
+	if b.userTools == nil {
+		return c.Reply("⚠️ Tool calling is disabled.")
+	}
+	name := strings.TrimSpace(c.Message().Payload)
+	if name == "" {
+		return c.Reply("Usage: /mcp_del <server_name>\n\nUse /mcp_list to see your servers.")
+	}
+	userID := c.Sender().ID
+	found, err := b.userTools.RemoveServer(userID, name)
+	if err != nil {
+		log.Printf("[user-mcp] remove error for user %d: %v", userID, err)
+		return c.Reply("❌ Failed to remove MCP server.")
+	}
+	if !found {
+		return c.Reply(fmt.Sprintf("⚠️ Server %q not found in your config.", name))
+	}
+	return c.Reply(fmt.Sprintf("✅ Removed MCP server %q.", name))
+}
+
+func (b *Bot) handleMCPClear(c tele.Context) error {
+	if !b.isAllowed(c) {
+		return nil
+	}
+	if b.userTools == nil {
+		return c.Reply("⚠️ Tool calling is disabled.")
+	}
+	userID := c.Sender().ID
+	if err := b.userTools.ClearAll(userID); err != nil {
+		log.Printf("[user-mcp] clear error for user %d: %v", userID, err)
+		return c.Reply("❌ Failed to clear MCP servers.")
+	}
+	return c.Reply("✅ All your personal MCP servers have been removed.")
+}
+
 func (b *Bot) handleText(c tele.Context) error {
 	if !b.isAllowed(c) {
 		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
@@ -703,6 +777,31 @@ func (b *Bot) handleText(c tele.Context) error {
 	}
 
 	text := strings.TrimSpace(msg.Text)
+
+	// ── Skip bot commands ────────────────────────────────────────────────────
+	// Commands like /mcp_list should be handled by their own handlers, not by
+	// the LLM. Guard against any edge cases where they might reach handleText.
+	if strings.HasPrefix(text, "/") {
+		return nil
+	}
+
+	// ── MCP JSON auto-detection ──────────────────────────────────────────────
+	// If the user sends a JSON block with "mcpServers", treat it as an MCP
+	// import command rather than a normal chat message.
+	if strings.HasPrefix(text, "{") {
+		if mcpCfg, ok := TryParseMCPConfig(text); ok {
+			if b.userTools == nil {
+				return c.Reply("⚠️ Tool calling is disabled. Cannot import MCP servers.")
+			}
+			userID := c.Sender().ID
+			names, err := b.userTools.AddServers(userID, mcpCfg.MCPServers)
+			if err != nil {
+				log.Printf("[user-mcp] add error for user %d: %v", userID, err)
+				return c.Reply(fmt.Sprintf("❌ Failed to add MCP servers: %v", err))
+			}
+			return c.Reply(fmt.Sprintf("✅ Added/updated MCP servers: %s\n\nUse /mcp_list to see all your servers.", strings.Join(names, ", ")))
+		}
+	}
 
 	// ── Group logic: only respond when mentioned ──────────────────────────────
 	mentioned := false
@@ -807,18 +906,28 @@ func (b *Bot) streamReply(
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
+	// Build a merged tool view: global tools + this user's personal tools.
+	var toolView *MergedToolView
+	if b.tools != nil {
+		var userReg *ToolRegistry
+		if b.userTools != nil && sender != nil {
+			userReg = b.userTools.GetRegistry(sender.ID)
+		}
+		toolView = NewMergedToolView(b.tools, userReg)
+	}
+
 	// ── Tool-call loop ──────────────────────────────────────────────────
 	// If tools are enabled, we do non-streaming requests in a loop so the
 	// LLM can call tools repeatedly. Once all tool calls are resolved, the
 	// conversation (including tool results) is sent to the streaming path
 	// so the LLM can summarise/present the results fluently.
-	if b.tools != nil && b.tools.Count() > 0 {
+	if toolView != nil && toolView.Count() > 0 {
 		maxIter := b.cfg.ToolsMaxIterations
 		for i := 0; i < maxIter; i++ {
 			req := openai.ChatCompletionRequest{
 				Model:     b.cfg.OpenAIModel,
 				Messages:  messages,
-				Tools:     b.tools.OpenAITools(),
+				Tools:     toolView.OpenAITools(),
 				MaxTokens: b.cfg.MaxTokens,
 			}
 
@@ -848,9 +957,9 @@ func (b *Bot) streamReply(
 
 				// Execute each tool call and append the results.
 				for _, tc := range choice.Message.ToolCalls {
-					log.Printf("[tools] executing %s(%s)", tc.Function.Name, tc.Function.Arguments)
-					result := b.tools.ExecuteToolCall(tc)
-					log.Printf("[tools] %s → %s", tc.Function.Name, truncate(result, 200))
+					log.Printf("[tools] executing %s", tc.Function.Name)
+					result := toolView.ExecuteToolCall(tc)
+					log.Printf("[tools] %s done (%d bytes)", tc.Function.Name, len(result))
 					messages = append(messages, openai.ChatCompletionMessage{
 						Role:       openai.ChatMessageRoleTool,
 						Content:    result,
@@ -870,7 +979,7 @@ func (b *Bot) streamReply(
 	// Streams the LLM's final response to the user. When tools were used,
 	// the messages slice now contains the full tool-call conversation, so
 	// the LLM will summarise the tool results into a natural reply.
-	finalText := b.doStream(ctx, messages, placeholder)
+	finalText := b.doStream(ctx, messages, placeholder, toolView)
 	if finalText == "" {
 		return // error already reported by doStream
 	}
@@ -879,10 +988,12 @@ func (b *Bot) streamReply(
 
 // doStream performs the streaming LLM call and returns the final text.
 // Returns empty string if an error was already reported to the user.
+// toolView may be nil if tools are disabled.
 func (b *Bot) doStream(
 	ctx context.Context,
 	messages []openai.ChatCompletionMessage,
 	placeholder *tele.Message,
+	toolView *MergedToolView,
 ) string {
 	req := openai.ChatCompletionRequest{
 		Model:     b.cfg.OpenAIModel,
@@ -891,11 +1002,10 @@ func (b *Bot) doStream(
 		MaxTokens: b.cfg.MaxTokens,
 	}
 
-	// If tools are enabled, include them so the model knows about them
-	// even in streaming mode (shouldn't happen in practice since tool-call
-	// loop is handled above, but keeps the request consistent).
-	if b.tools != nil && b.tools.Count() > 0 {
-		req.Tools = b.tools.OpenAITools()
+	// If tools are available, include them so the model knows about them
+	// even in streaming mode.
+	if toolView != nil && toolView.Count() > 0 {
+		req.Tools = toolView.OpenAITools()
 	}
 
 	stream, err := b.ai.CreateChatCompletionStream(ctx, req)
@@ -1049,6 +1159,9 @@ func main() {
 	}
 	if bot.mcpClients != nil {
 		defer bot.mcpClients.Close()
+	}
+	if bot.userTools != nil {
+		defer bot.userTools.Close()
 	}
 
 	bot.Run()

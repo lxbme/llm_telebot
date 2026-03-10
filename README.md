@@ -1,6 +1,6 @@
 # LLM Telegram Bot
 
-一个基于 Go 开发的 Telegram 聊天机器人，接入 OpenAI 兼容 API，支持流式回复、多轮上下文、群聊智能检测等功能。
+一个基于 Go 开发的 Telegram 聊天机器人，接入 OpenAI 兼容 API，支持流式回复、多轮上下文、群聊智能检测、MCP 工具调用等功能。
 
 ## 功能特性
 
@@ -15,6 +15,8 @@
 - **智能自动检测 (AUTO_DETECT)** — 利用 LLM 判断群聊中未 @机器人 的消息是否与机器人相关，自动触发回复
 - **独立模型配置** — AUTO_DETECT、用户画像提取、对话摘要均可配置独立的轻量模型，节省主模型 token 开销
 - **工具调用 (MCP)** — LLM 可自主判断是否需要调用工具（如获取时间、计算器），并根据工具返回结果生成回复；支持通过实现 `MCPTool` 接口轻松扩展新工具
+- **远程 MCP 服务器** — 通过 JSON 配置文件接入远程 MCP 服务器，支持 Streamable HTTP、SSE、Stdio 三种传输方式
+- **动态 per-user MCP** — 每个用户可在聊天中通过发送 JSON 导入自己专属的 MCP 服务器，持久化存储、重启不丢失，通过命令管理
 - **并发安全** — 快照 + 原子追加机制，多个并发请求不会导致上下文错乱
 - **白名单 / 权限控制** — 通过 `ALLOWED_USERS` 和 `ALLOWED_GROUPS` 限制 bot 的使用范围
 - **OpenAI 兼容** — 支持任何 OpenAI 兼容 API（如 DeepSeek、通义千问、Ollama 等）
@@ -120,21 +122,96 @@ docker run --env-file .env llm-telebot
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
+| `SUMMARY_ENABLED` | `true` | 是否启用对话摘要 |
 | `SUMMARY_MIN_OVERFLOW` | `6` | 累积多少条溢出消息后才触发一次摘要（避免频繁调用） |
 | `SUMMARY_API_BASE` | `OPENAI_API_BASE` | 摘要模型的 API 地址 |
 | `SUMMARY_API_KEY` | `OPENAI_API_KEY` | 摘要模型的 API Key |
 | `SUMMARY_MODEL` | `OPENAI_MODEL` | 摘要模型名称（推荐轻量模型） |
 
-### 工具调用 / MCP（可选）
+### 工具调用 / MCP
 
-启用后，LLM 可自主判断是否需要调用注册的工具，并根据工具返回结果生成最终回复。内置工具包括：获取当前时间、随机数生成、算术计算器。
+启用后，LLM 可自主判断是否需要调用注册的工具，并根据工具返回结果生成最终回复。
 
-**扩展方式**：实现 `MCPTool` 接口（`Name`/`Description`/`Parameters`/`Execute`），在 `builtin_tools.go` 的 `RegisterBuiltinTools()` 中注册即可。
+#### 内置工具
+
+| 工具 | 说明 |
+|---|---|
+| `get_current_time` | 获取指定时区的当前时间 |
+| `random_number` | 生成指定范围内的随机数 |
+| `calculator` | 算术表达式计算器 |
+
+#### 全局 MCP 配置
+
+通过 JSON 配置文件接入远程 MCP 服务器，所有用户共享这些工具。
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `TOOLS_ENABLED` | `false` | 是否启用工具调用 |
 | `TOOLS_MAX_ITERATIONS` | `5` | 每次请求最多允许的工具调用轮数（防止无限循环） |
+| `MCP_CONFIG_PATH` | — | 全局 MCP 服务器 JSON 配置文件路径 |
+| `USER_MCP_DB_PATH` | `./data/user_mcp.db` | 用户动态 MCP 配置的 bbolt 数据库路径 |
+
+**全局配置文件示例** (`mcp_config.json`)：
+
+```json
+{
+  "mcpServers": {
+    "mcd-mcp": {
+      "type": "streamablehttp",
+      "url": "https://mcp.mcd.cn",
+      "headers": {
+        "Authorization": "Bearer YOUR_MCP_TOKEN"
+      }
+    },
+    "local-tool": {
+      "type": "stdio",
+      "command": "/usr/local/bin/mytool",
+      "args": ["--flag"],
+      "env": ["KEY=VALUE"]
+    }
+  }
+}
+```
+
+支持的传输方式：
+
+| type | 说明 | 必填字段 |
+|---|---|---|
+| `streamablehttp` | Streamable HTTP (推荐) | `url`，可选 `headers` |
+| `sse` | Server-Sent Events | `url`，可选 `headers` |
+| `stdio` | 标准输入输出子进程 | `command`，可选 `args`、`env` |
+
+#### 动态 Per-User MCP
+
+每个用户可以在聊天中导入自己专属的 MCP 服务器。**用户的 MCP 工具只对该用户可见**，不同用户互不干扰。配置持久化存储在 bbolt 中，重启后自动恢复连接。
+
+**导入方式**：直接向 bot 发送一条 JSON 消息即可：
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "type": "streamablehttp",
+      "url": "https://my-mcp-server.com",
+      "headers": {
+        "Authorization": "Bearer my-token"
+      }
+    }
+  }
+}
+```
+
+Bot 会自动识别 JSON 格式并导入，返回确认消息。可多次发送以追加或更新服务器配置。
+
+**管理命令**：
+
+| 命令 | 说明 |
+|---|---|
+| `/mcp_list` | 查看你的个人 MCP 服务器列表 |
+| `/mcp_del <name>` | 删除指定名称的 MCP 服务器 |
+| `/mcp_clear` | 清除你所有的个人 MCP 服务器 |
+
+**扩展内置工具**：实现 `MCPTool` 接口（`Name`/`Description`/`Parameters`/`Execute`），在 `builtin_tools.go` 的 `RegisterBuiltinTools()` 中注册即可。
 
 ## Bot 命令
 
@@ -145,6 +222,9 @@ docker run --env-file .env llm-telebot
 | `/summary` | 查看当前对话的摘要内容 |
 | `/displayp` | 查看自己的用户画像 |
 | `/clearp` | 清除自己的用户画像 |
+| `/mcp_list` | 查看个人 MCP 服务器列表 |
+| `/mcp_del <name>` | 删除指定 MCP 服务器 |
+| `/mcp_clear` | 清除所有个人 MCP 服务器 |
 
 ## 架构简述
 
@@ -154,6 +234,8 @@ docker run --env-file .env llm-telebot
             │   ├─ 私聊: 检查 ALLOWED_USERS
             │   └─ 群聊: 检查 ALLOWED_GROUPS 或 ALLOWED_USERS
             │           └─ 未授权 → 静默忽略
+            ├─ MCP JSON 自动检测
+            │   └─ 消息以 { 开头且包含 "mcpServers" → 导入用户 MCP 配置
             ├─ 私聊: 直接处理
             └─ 群聊: 检查 @mention
                      ├─ 被 @ → 处理
@@ -166,13 +248,14 @@ docker run --env-file .env llm-telebot
   1. 快照当前上下文 (snapshot)
   2. 注入用户画像 + 对话摘要到系统提示词
   3. 构建 [system_prompt + 摘要 + 画像 + snapshot + user_msg] 发送给 LLM
-  4. 若启用工具调用 → 非流式请求，LLM 可能返回 tool_calls
-     ├─ 有 tool_calls → 执行工具，将结果追加到消息，循环回步骤 4
-     └─ 无 tool_calls → 得到最终文本回复
-  5. 若未启用工具 → 流式接收，每 1.5s 更新 Telegram 消息
-  6. 完成后原子追加 [user_msg, assistant_reply] 到历史
-  7. 若溢出消息 ≥ SUMMARY_MIN_OVERFLOW → 后台触发摘要压缩
-  8. 若满足提取条件 → 后台触发用户画像提取
+  4. 合并工具视图: 全局工具 + 用户个人 MCP 工具 → MergedToolView
+  5. 若启用工具调用 → 非流式请求，LLM 可能返回 tool_calls
+     ├─ 有 tool_calls → 执行工具（全局或用户专属），将结果追加到消息，循环回步骤 5
+     └─ 无 tool_calls → 进入流式路径
+  6. 流式接收 LLM 最终回复，每 1.5s 更新 Telegram 消息
+  7. 完成后原子追加 [user_msg, assistant_reply] 到历史
+  8. 若溢出消息 ≥ SUMMARY_MIN_OVERFLOW → 后台触发摘要压缩
+  9. 若满足提取条件 → 后台触发用户画像提取
 ```
 
 ## 技术依赖
@@ -180,7 +263,8 @@ docker run --env-file .env llm-telebot
 - [telebot v3](https://github.com/tucnak/telebot) — Telegram Bot 框架
 - [go-openai](https://github.com/sashabaranov/go-openai) — OpenAI Go SDK
 - [godotenv](https://github.com/joho/godotenv) — .env 文件加载
-- [bbolt](https://github.com/etcd-io/bbolt) — 嵌入式 key-value 数据库（用户画像持久化）
+- [bbolt](https://github.com/etcd-io/bbolt) — 嵌入式 key-value 数据库（用户画像 + MCP 配置持久化）
+- [mcp-go](https://github.com/mark3labs/mcp-go) — MCP (Model Context Protocol) Go 客户端
 
 ## License
 

@@ -51,6 +51,22 @@ type MCPConfig struct {
 	MCPServers map[string]MCPServerConfig `json:"mcpServers"`
 }
 
+// InferTransportType auto-detects the transport type from the config fields
+// when the "type" field is omitted. If "command" is set → stdio; if "url" is
+// set → streamablehttp; otherwise returns "".
+func InferTransportType(srv *MCPServerConfig) string {
+	if srv.Type != "" {
+		return srv.Type
+	}
+	if srv.Command != "" {
+		return "stdio"
+	}
+	if srv.URL != "" {
+		return "streamablehttp"
+	}
+	return ""
+}
+
 // LoadMCPConfig reads and parses the MCP configuration JSON file.
 func LoadMCPConfig(path string) (*MCPConfig, error) {
 	data, err := os.ReadFile(path)
@@ -108,7 +124,8 @@ func (m *MCPClientManager) connectOne(
 	var c *client.Client
 	var err error
 
-	switch strings.ToLower(srv.Type) {
+	transportType := InferTransportType(&srv)
+	switch strings.ToLower(transportType) {
 	case "streamablehttp", "streamable-http", "http":
 		if srv.URL == "" {
 			return fmt.Errorf("url is required for streamablehttp transport")
@@ -146,7 +163,7 @@ func (m *MCPClientManager) connectOne(
 		}
 
 	default:
-		return fmt.Errorf("unsupported transport type %q (use streamablehttp, sse, or stdio)", srv.Type)
+		return fmt.Errorf("unsupported transport type %q (use streamablehttp, sse, or stdio)", transportType)
 	}
 
 	// Initialize the MCP session.
@@ -213,16 +230,63 @@ func (t *MCPRemoteTool) Description() string { return t.tool.Description }
 
 // Parameters returns the tool's input schema as a raw JSON-serializable object
 // compatible with OpenAI's FunctionDefinition.Parameters (any type).
+// Enum values are coerced to strings for compatibility with APIs like Gemini.
 func (t *MCPRemoteTool) Parameters() any {
 	// If the tool has a RawInputSchema, return it as-is.
 	if t.tool.RawInputSchema != nil {
 		var raw any
 		if err := json.Unmarshal(t.tool.RawInputSchema, &raw); err == nil {
+			sanitizeSchema(raw)
 			return raw
 		}
 	}
-	// Otherwise convert the structured InputSchema.
-	return t.tool.InputSchema
+	// Otherwise convert the structured InputSchema to map and sanitize.
+	data, err := json.Marshal(t.tool.InputSchema)
+	if err != nil {
+		return t.tool.InputSchema
+	}
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return t.tool.InputSchema
+	}
+	sanitizeSchema(raw)
+	return raw
+}
+
+// sanitizeSchema walks a JSON schema tree and fixes enum fields for
+// compatibility with APIs like Gemini that only allow enum on STRING types.
+// When a property has "enum", its type is forced to "string" and all enum
+// values are coerced to strings.
+func sanitizeSchema(v any) {
+	switch val := v.(type) {
+	case map[string]any:
+		// If this object has an "enum" array, force type to string and
+		// coerce all values to strings.
+		if enumArr, ok := val["enum"].([]any); ok {
+			val["type"] = "string"
+			for i, item := range enumArr {
+				switch n := item.(type) {
+				case float64:
+					if n == float64(int64(n)) {
+						enumArr[i] = fmt.Sprintf("%d", int64(n))
+					} else {
+						enumArr[i] = fmt.Sprintf("%g", n)
+					}
+				case bool:
+					enumArr[i] = fmt.Sprintf("%t", n)
+				}
+				// strings stay as-is
+			}
+		}
+		// Recurse into all values.
+		for _, child := range val {
+			sanitizeSchema(child)
+		}
+	case []any:
+		for _, child := range val {
+			sanitizeSchema(child)
+		}
+	}
 }
 
 // Execute calls the remote MCP tool and returns the text result.
