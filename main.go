@@ -50,6 +50,15 @@ type Config struct {
 	ProfileBase  string
 	ProfileKey   string
 	ProfileModel string
+
+	// Summary settings.
+	SummaryMinOverflow int // minimum overflow messages before triggering summarisation (default 6)
+
+	// Separate (optional) model config for conversation summarisation.
+	// When empty, falls back to the main OpenAI settings above.
+	SummaryBase  string
+	SummaryKey   string
+	SummaryModel string
 }
 
 func loadConfig() Config {
@@ -77,6 +86,11 @@ func loadConfig() Config {
 	profileExtractEvery, _ := strconv.Atoi(getEnv("PROFILE_EXTRACT_EVERY", "3"))
 	if profileExtractEvery <= 0 {
 		profileExtractEvery = 3
+	}
+
+	summaryMinOverflow, _ := strconv.Atoi(getEnv("SUMMARY_MIN_OVERFLOW", "6"))
+	if summaryMinOverflow <= 0 {
+		summaryMinOverflow = 6
 	}
 
 	allowedUsers := parseIDList(getEnv("ALLOWED_USERS", ""))
@@ -119,6 +133,10 @@ func loadConfig() Config {
 		ProfileBase:         getEnv("PROFILE_API_BASE", ""),
 		ProfileKey:          getEnv("PROFILE_API_KEY", ""),
 		ProfileModel:        getEnv("PROFILE_MODEL", ""),
+		SummaryMinOverflow:  summaryMinOverflow,
+		SummaryBase:         getEnv("SUMMARY_API_BASE", ""),
+		SummaryKey:          getEnv("SUMMARY_API_KEY", ""),
+		SummaryModel:        getEnv("SUMMARY_MODEL", ""),
 	}
 }
 
@@ -188,13 +206,15 @@ func sanitizeName(id int64) string {
 // ─── Chat History ─────────────────────────────────────────────────────────────
 
 type HistoryStore struct {
-	mu      sync.RWMutex
-	history map[int64][]openai.ChatCompletionMessage
+	mu       sync.RWMutex
+	history  map[int64][]openai.ChatCompletionMessage
+	overflow map[int64][]openai.ChatCompletionMessage // messages trimmed from the sliding window
 }
 
 func NewHistoryStore() *HistoryStore {
 	return &HistoryStore{
-		history: make(map[int64][]openai.ChatCompletionMessage),
+		history:  make(map[int64][]openai.ChatCompletionMessage),
+		overflow: make(map[int64][]openai.ChatCompletionMessage),
 	}
 }
 
@@ -212,32 +232,55 @@ func (s *HistoryStore) Get(chatID int64) []openai.ChatCompletionMessage {
 }
 
 // Append adds a message and trims the history to maxMessages.
+// Trimmed messages are accumulated in the overflow buffer for later summarisation.
 func (s *HistoryStore) Append(chatID int64, msg openai.ChatCompletionMessage, maxMessages int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.history[chatID] = append(s.history[chatID], msg)
 	if len(s.history[chatID]) > maxMessages {
-		s.history[chatID] = s.history[chatID][len(s.history[chatID])-maxMessages:]
+		trimCount := len(s.history[chatID]) - maxMessages
+		s.overflow[chatID] = append(s.overflow[chatID], s.history[chatID][:trimCount]...)
+		s.history[chatID] = s.history[chatID][trimCount:]
 	}
 }
 
 // AppendBatch atomically appends multiple messages and trims the history.
 // This is used to write the user message and assistant reply as a pair so
 // concurrent requests cannot interleave between them.
+// Trimmed messages are accumulated in the overflow buffer for later summarisation.
 func (s *HistoryStore) AppendBatch(chatID int64, msgs []openai.ChatCompletionMessage, maxMessages int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.history[chatID] = append(s.history[chatID], msgs...)
 	if len(s.history[chatID]) > maxMessages {
-		s.history[chatID] = s.history[chatID][len(s.history[chatID])-maxMessages:]
+		trimCount := len(s.history[chatID]) - maxMessages
+		s.overflow[chatID] = append(s.overflow[chatID], s.history[chatID][:trimCount]...)
+		s.history[chatID] = s.history[chatID][trimCount:]
 	}
 }
 
-// Clear deletes the history for a chat.
+// Clear deletes the history and overflow buffer for a chat.
 func (s *HistoryStore) Clear(chatID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.history, chatID)
+	delete(s.overflow, chatID)
+}
+
+// OverflowCount returns the number of messages in the overflow buffer.
+func (s *HistoryStore) OverflowCount(chatID int64) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.overflow[chatID])
+}
+
+// DrainOverflow returns accumulated overflow messages and clears the buffer.
+func (s *HistoryStore) DrainOverflow(chatID int64) []openai.ChatCompletionMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	overflow := s.overflow[chatID]
+	delete(s.overflow, chatID)
+	return overflow
 }
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────
@@ -249,7 +292,10 @@ type Bot struct {
 	detectorModel string         // model name for relevance detection
 	profileAI     *openai.Client // LLM client for profile extraction (may equal ai)
 	profileModel  string         // model name for profile extraction
+	summaryAI     *openai.Client // LLM client for conversation summarisation (may equal ai)
+	summaryModel  string         // model name for conversation summarisation
 	store         *HistoryStore
+	summaries     *SummaryStore // per-chat conversation summaries
 	profiles      *ProfileStore // NoSQL user-profile store (nil if disabled)
 	tg            *tele.Bot
 }
@@ -333,6 +379,29 @@ func NewBot(cfg Config) (*Bot, error) {
 			cfg.ProfileDBPath, cfg.ProfileExtractEvery, profileModel)
 	}
 
+	// Build summary LLM client – falls back to main client if not configured.
+	summaryClient := aiClient
+	summaryModel := cfg.OpenAIModel
+	if cfg.SummaryKey != "" || cfg.SummaryBase != "" || cfg.SummaryModel != "" {
+		sKey := cfg.SummaryKey
+		if sKey == "" {
+			sKey = cfg.OpenAIKey
+		}
+		sCfg := openai.DefaultConfig(sKey)
+		sBase := cfg.SummaryBase
+		if sBase == "" {
+			sBase = cfg.OpenAIBase
+		}
+		if sBase != "" {
+			sCfg.BaseURL = sBase
+		}
+		summaryClient = openai.NewClientWithConfig(sCfg)
+		if cfg.SummaryModel != "" {
+			summaryModel = cfg.SummaryModel
+		}
+	}
+	log.Printf("Summary enabled (min_overflow: %d, model: %s)", cfg.SummaryMinOverflow, summaryModel)
+
 	return &Bot{
 		cfg:           cfg,
 		ai:            aiClient,
@@ -340,7 +409,10 @@ func NewBot(cfg Config) (*Bot, error) {
 		detectorModel: detectorModel,
 		profileAI:     profileClient,
 		profileModel:  profileModel,
+		summaryAI:     summaryClient,
+		summaryModel:  summaryModel,
 		store:         NewHistoryStore(),
+		summaries:     NewSummaryStore(),
 		profiles:      profiles,
 		tg:            tgBot,
 	}, nil
@@ -382,6 +454,7 @@ func (b *Bot) isAllowed(c tele.Context) bool {
 func (b *Bot) Run() {
 	b.tg.Handle("/start", b.handleStart)
 	b.tg.Handle("/clear", b.handleClear)
+	b.tg.Handle("/summary", b.handleSummary)
 	b.tg.Handle("/clearp", b.handleClearProfile)
 	b.tg.Handle("/displayp", b.handleDisplayProfile)
 	b.tg.Handle(tele.OnText, b.handleText)
@@ -501,7 +574,26 @@ func (b *Bot) handleClear(c tele.Context) error {
 	}
 	chatID := c.Chat().ID
 	b.store.Clear(chatID)
-	return c.Reply("✅ Conversation history cleared.")
+	b.summaries.Clear(chatID)
+	return c.Reply("✅ Conversation history and summary cleared.")
+}
+
+func (b *Bot) handleSummary(c tele.Context) error {
+	if !b.isAllowed(c) {
+		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
+	chatID := c.Chat().ID
+	summary := b.summaries.Get(chatID)
+	if summary == "" {
+		return c.Reply("📭 No conversation summary yet. A summary will be generated automatically when the context window overflows.")
+	}
+	reply := fmt.Sprintf("📝 Current conversation summary:\n\n%s", summary)
+	if len([]rune(reply)) > 4096 {
+		runes := []rune(reply)
+		reply = string(runes[:4093]) + "…"
+	}
+	return c.Reply(reply)
 }
 
 func (b *Bot) handleClearProfile(c tele.Context) error {
@@ -631,6 +723,11 @@ func (b *Bot) handleText(c tele.Context) error {
 	profileSection := b.buildProfileSection(append(history, userMsg))
 	systemPrompt := b.cfg.SystemPrompt + profileSection
 
+	// Inject conversation summary (compressed history beyond the sliding window).
+	if summary := b.summaries.Get(chatID); summary != "" {
+		systemPrompt += "\n\n=== Previous Conversation Summary ===\n" + summary
+	}
+
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 	}
@@ -752,6 +849,11 @@ func (b *Bot) streamReply(
 		userMsg,
 		{Role: openai.ChatMessageRoleAssistant, Content: finalText},
 	}, b.cfg.ContextMaxMsgs)
+
+	// Trigger background summarisation when enough overflow has accumulated.
+	if b.store.OverflowCount(chatID) >= b.cfg.SummaryMinOverflow {
+		go b.summarizeOverflow(chatID)
+	}
 
 	// Trigger background user-profile extraction if due.
 	if b.profiles != nil && sender != nil && sender.Username != "" {

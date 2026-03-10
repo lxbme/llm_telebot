@@ -6,12 +6,14 @@
 
 - **流式回复** — 实时编辑消息，逐步展示 LLM 的生成内容，无需等待完整回复
 - **多轮对话上下文** — 滑动窗口记忆最近 N 条消息，支持连续对话
+- **动态对话摘要** — 当对话超出滑动窗口时，自动将更早的对话压缩为摘要，赋予 LLM 更长的记忆能力
+- **用户画像提取** — 从对话中自动提取用户兴趣、职业等标签，注入系统提示词让 LLM 了解对话对象
 - **群聊支持** — 通过 @机器人 触发回复，自动识别并剥离 @mention
 - **上下文模式**
   - `at` 模式：仅记录 @机器人 的消息作为上下文
   - `global` 模式：记录群聊中所有消息作为上下文，提供更完整的对话理解
 - **智能自动检测 (AUTO_DETECT)** — 利用 LLM 判断群聊中未 @机器人 的消息是否与机器人相关，自动触发回复
-- **独立检测模型** — AUTO_DETECT 可配置单独的轻量模型（如 gpt-4o-mini），节省 token 开销
+- **独立模型配置** — AUTO_DETECT、用户画像提取、对话摘要均可配置独立的轻量模型，节省主模型 token 开销
 - **并发安全** — 快照 + 原子追加机制，多个并发请求不会导致上下文错乱
 - **白名单 / 权限控制** — 通过 `ALLOWED_USERS` 和 `ALLOWED_GROUPS` 限制 bot 的使用范围
 - **OpenAI 兼容** — 支持任何 OpenAI 兼容 API（如 DeepSeek、通义千问、Ollama 等）
@@ -94,12 +96,43 @@ docker run --env-file .env llm-telebot
 | `AUTO_DETECT_API_KEY` | `OPENAI_API_KEY` | 检测模型的 API Key |
 | `AUTO_DETECT_MODEL` | `OPENAI_MODEL` | 检测模型名称（推荐使用 `gpt-4o-mini` 等轻量模型） |
 
+### 用户画像提取（可选）
+
+自动从对话中提取用户的兴趣、职业、位置等标签，存入本地 bbolt 数据库。提取结果会注入到系统提示词中，帮助 LLM 了解对话对象。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `PROFILE_ENABLED` | `true` | 是否启用用户画像提取 |
+| `PROFILE_DB_PATH` | `./data/profiles.db` | bbolt 数据库文件路径 |
+| `PROFILE_EXTRACT_EVERY` | `3` | 每 N 次 bot 回复触发一次后台提取（另有 2 分钟冷却） |
+| `PROFILE_API_BASE` | `OPENAI_API_BASE` | 画像提取模型的 API 地址 |
+| `PROFILE_API_KEY` | `OPENAI_API_KEY` | 画像提取模型的 API Key |
+| `PROFILE_MODEL` | `OPENAI_MODEL` | 画像提取模型名称（推荐轻量模型） |
+
+### 对话摘要（自动长期记忆）
+
+当滑动窗口溢出时，溢出的消息不会丢失，而是被后台 LLM 调用压缩成一段摘要。每次发给 LLM 的上下文结构为：
+
+```
+[系统提示词 + 用户画像 + 历史摘要] + [滑窗内原始对话] + [当前用户消息]
+```
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `SUMMARY_MIN_OVERFLOW` | `6` | 累积多少条溢出消息后才触发一次摘要（避免频繁调用） |
+| `SUMMARY_API_BASE` | `OPENAI_API_BASE` | 摘要模型的 API 地址 |
+| `SUMMARY_API_KEY` | `OPENAI_API_KEY` | 摘要模型的 API Key |
+| `SUMMARY_MODEL` | `OPENAI_MODEL` | 摘要模型名称（推荐轻量模型） |
+
 ## Bot 命令
 
 | 命令 | 说明 |
 |---|---|
 | `/start` | 显示欢迎信息 |
-| `/clear` | 清除当前对话的上下文历史 |
+| `/clear` | 清除当前对话的上下文历史和摘要 |
+| `/summary` | 查看当前对话的摘要内容 |
+| `/displayp` | 查看自己的用户画像 |
+| `/clearp` | 清除自己的用户画像 |
 
 ## 架构简述
 
@@ -119,9 +152,12 @@ docker run --env-file .env llm-telebot
 
 处理流程:
   1. 快照当前上下文 (snapshot)
-  2. 构建 [system_prompt + snapshot + user_msg] 发送给 LLM
-  3. 流式接收 → 每 1.5s 更新 Telegram 消息
-  4. 完成后原子追加 [user_msg, assistant_reply] 到历史
+  2. 注入用户画像 + 对话摘要到系统提示词
+  3. 构建 [system_prompt + 摘要 + 画像 + snapshot + user_msg] 发送给 LLM
+  4. 流式接收 → 每 1.5s 更新 Telegram 消息
+  5. 完成后原子追加 [user_msg, assistant_reply] 到历史
+  6. 若溢出消息 ≥ SUMMARY_MIN_OVERFLOW → 后台触发摘要压缩
+  7. 若满足提取条件 → 后台触发用户画像提取
 ```
 
 ## 技术依赖
@@ -129,6 +165,7 @@ docker run --env-file .env llm-telebot
 - [telebot v3](https://github.com/tucnak/telebot) — Telegram Bot 框架
 - [go-openai](https://github.com/sashabaranov/go-openai) — OpenAI Go SDK
 - [godotenv](https://github.com/joho/godotenv) — .env 文件加载
+- [bbolt](https://github.com/etcd-io/bbolt) — 嵌入式 key-value 数据库（用户画像持久化）
 
 ## License
 
