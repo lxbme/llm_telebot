@@ -52,7 +52,8 @@ type Config struct {
 	ProfileModel string
 
 	// Summary settings.
-	SummaryMinOverflow int // minimum overflow messages before triggering summarisation (default 6)
+	SummaryEnabled     bool // enable conversation summary
+	SummaryMinOverflow int  // minimum overflow messages before triggering summarisation (default 6)
 
 	// Separate (optional) model config for conversation summarisation.
 	// When empty, falls back to the main OpenAI settings above.
@@ -133,6 +134,7 @@ func loadConfig() Config {
 		ProfileBase:         getEnv("PROFILE_API_BASE", ""),
 		ProfileKey:          getEnv("PROFILE_API_KEY", ""),
 		ProfileModel:        getEnv("PROFILE_MODEL", ""),
+		SummaryEnabled:      strings.ToLower(getEnv("SUMMARY_ENABLED", "true")) == "true",
 		SummaryMinOverflow:  summaryMinOverflow,
 		SummaryBase:         getEnv("SUMMARY_API_BASE", ""),
 		SummaryKey:          getEnv("SUMMARY_API_KEY", ""),
@@ -382,25 +384,27 @@ func NewBot(cfg Config) (*Bot, error) {
 	// Build summary LLM client – falls back to main client if not configured.
 	summaryClient := aiClient
 	summaryModel := cfg.OpenAIModel
-	if cfg.SummaryKey != "" || cfg.SummaryBase != "" || cfg.SummaryModel != "" {
-		sKey := cfg.SummaryKey
-		if sKey == "" {
-			sKey = cfg.OpenAIKey
+	if cfg.SummaryEnabled {
+		if cfg.SummaryKey != "" || cfg.SummaryBase != "" || cfg.SummaryModel != "" {
+			sKey := cfg.SummaryKey
+			if sKey == "" {
+				sKey = cfg.OpenAIKey
+			}
+			sCfg := openai.DefaultConfig(sKey)
+			sBase := cfg.SummaryBase
+			if sBase == "" {
+				sBase = cfg.OpenAIBase
+			}
+			if sBase != "" {
+				sCfg.BaseURL = sBase
+			}
+			summaryClient = openai.NewClientWithConfig(sCfg)
+			if cfg.SummaryModel != "" {
+				summaryModel = cfg.SummaryModel
+			}
 		}
-		sCfg := openai.DefaultConfig(sKey)
-		sBase := cfg.SummaryBase
-		if sBase == "" {
-			sBase = cfg.OpenAIBase
-		}
-		if sBase != "" {
-			sCfg.BaseURL = sBase
-		}
-		summaryClient = openai.NewClientWithConfig(sCfg)
-		if cfg.SummaryModel != "" {
-			summaryModel = cfg.SummaryModel
-		}
+		log.Printf("Summary enabled (min_overflow: %d, model: %s)", cfg.SummaryMinOverflow, summaryModel)
 	}
-	log.Printf("Summary enabled (min_overflow: %d, model: %s)", cfg.SummaryMinOverflow, summaryModel)
 
 	return &Bot{
 		cfg:           cfg,
@@ -553,8 +557,8 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 	}
 	// Debug: log full response details
 	choice := resp.Choices[0]
-	log.Printf("isRelevant debug: finish_reason=%s, content=%q, role=%s",
-		choice.FinishReason, choice.Message.Content, choice.Message.Role)
+	// log.Printf("isRelevant debug: finish_reason=%s, content=%q, role=%s",
+	// 	choice.FinishReason, choice.Message.Content, choice.Message.Role)
 	answer := strings.TrimSpace(strings.ToUpper(choice.Message.Content))
 	return strings.HasPrefix(answer, "YES")
 }
@@ -574,7 +578,9 @@ func (b *Bot) handleClear(c tele.Context) error {
 	}
 	chatID := c.Chat().ID
 	b.store.Clear(chatID)
-	b.summaries.Clear(chatID)
+	if b.cfg.SummaryEnabled {
+		b.summaries.Clear(chatID)
+	}
 	return c.Reply("✅ Conversation history and summary cleared.")
 }
 
@@ -582,6 +588,9 @@ func (b *Bot) handleSummary(c tele.Context) error {
 	if !b.isAllowed(c) {
 		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
 		return nil
+	}
+	if !b.cfg.SummaryEnabled {
+		return c.Reply("⚠️ Conversation summary is disabled.")
 	}
 	chatID := c.Chat().ID
 	summary := b.summaries.Get(chatID)
@@ -724,8 +733,10 @@ func (b *Bot) handleText(c tele.Context) error {
 	systemPrompt := b.cfg.SystemPrompt + profileSection
 
 	// Inject conversation summary (compressed history beyond the sliding window).
-	if summary := b.summaries.Get(chatID); summary != "" {
-		systemPrompt += "\n\n=== Previous Conversation Summary ===\n" + summary
+	if b.cfg.SummaryEnabled {
+		if summary := b.summaries.Get(chatID); summary != "" {
+			systemPrompt += "\n\n=== Previous Conversation Summary ===\n" + summary
+		}
 	}
 
 	messages := []openai.ChatCompletionMessage{
@@ -851,7 +862,7 @@ func (b *Bot) streamReply(
 	}, b.cfg.ContextMaxMsgs)
 
 	// Trigger background summarisation when enough overflow has accumulated.
-	if b.store.OverflowCount(chatID) >= b.cfg.SummaryMinOverflow {
+	if b.cfg.SummaryEnabled && b.store.OverflowCount(chatID) >= b.cfg.SummaryMinOverflow {
 		go b.summarizeOverflow(chatID)
 	}
 
