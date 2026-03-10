@@ -1086,8 +1086,8 @@ func (b *Bot) doStream(
 		finalText = "⚠️ The model returned an empty response."
 	}
 
-	// One final edit with the complete text.
-	b.editOrLog(placeholder, finalText)
+	// One final edit with the complete text, rendered as Telegram HTML.
+	b.editFinalResponse(placeholder, finalText)
 	return finalText
 }
 
