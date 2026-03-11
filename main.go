@@ -72,6 +72,7 @@ type Config struct {
 
 	// Admin settings.
 	AdminIDs map[int64]bool // user IDs allowed to add command-based (stdio) MCP servers
+	AdminAll bool           // when true, all users are treated as admin (ADMIN_ID=*)
 }
 
 func loadConfig() Config {
@@ -162,6 +163,7 @@ func loadConfig() Config {
 		MCPConfigPath:       getEnv("MCP_CONFIG_PATH", ""),
 		UserMCPDBPath:       getEnv("USER_MCP_DB_PATH", "./data/user_mcp.db"),
 		AdminIDs:            parseIDList(getEnv("ADMIN_ID", "")),
+		AdminAll:            strings.TrimSpace(getEnv("ADMIN_ID", "")) == "*",
 	}
 }
 
@@ -560,7 +562,11 @@ func (b *Bot) isAllowed(c tele.Context) bool {
 }
 
 // isAdmin checks whether the given user ID is in the ADMIN_ID list.
+// When ADMIN_ID is set to "*", all users are considered admins.
 func (b *Bot) isAdmin(userID int64) bool {
+	if b.cfg.AdminAll {
+		return true
+	}
 	return len(b.cfg.AdminIDs) > 0 && b.cfg.AdminIDs[userID]
 }
 

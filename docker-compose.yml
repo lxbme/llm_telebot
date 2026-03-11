@@ -1,0 +1,23 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-telebot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist bbolt databases (chat history, profiles, user MCP configs)
+      - bot-data:/app/data
+      # Mount MCP config if present (optional)
+      - ./mcp_config.json:/app/mcp_config.json:ro
+    environment:
+      # Override DB paths to use the container volume mount
+      - CHAT_DB_PATH=/app/data/chat.db
+      - PROFILE_DB_PATH=/app/data/profiles.db
+      - USER_MCP_DB_PATH=/app/data/user_mcp.db
+      - MCP_CONFIG_PATH=/app/mcp_config.json
+
+volumes:
+  bot-data:

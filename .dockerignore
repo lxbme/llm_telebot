@@ -1,0 +1,19 @@
+# Build artifacts
+llm_telebot
+
+# Data & secrets
+data/
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Git
+.git/
+.gitignore
+
+# Docs
+README.md
+LICENSE

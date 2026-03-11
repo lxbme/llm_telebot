@@ -1,5 +1,7 @@
 # LLM Telegram Bot
 
+> ⚠️本项目完全采用 **Vibe Coding** 方式开发。
+
 一个基于 Go 开发的 Telegram 聊天机器人，接入 OpenAI 兼容 API，支持流式回复、多轮上下文、群聊智能检测、MCP 工具调用等功能。
 
 ## 功能特性
@@ -45,12 +47,41 @@ cp .env.example .env
 go run .
 ```
 
-### 使用 Docker（可选）
+### 使用 Docker Compose（推荐）
+
+```bash
+# 复制并编辑配置
+cp .env.example .env
+# 编辑 .env 填入你的 API Key 和 Bot Token
+
+# 如需 MCP 工具，编辑 mcp_config.json（可选）
+
+# 一键启动
+docker compose up -d
+
+# 查看日志
+docker compose logs -f
+
+# 停止
+docker compose down
+```
+
+### 手动 Docker 构建
 
 ```bash
 docker build -t llm-telebot .
-docker run --env-file .env llm-telebot
+docker run --env-file .env -v llm-telebot-data:/app/data llm-telebot
 ```
+
+### 使用 GitHub Packages 预构建镜像
+
+每次 push 会自动构建并发布镜像到 GitHub Container Registry：
+
+```bash
+docker pull ghcr.io/lxbme/llm_telebot:latest
+docker run --env-file .env -v llm-telebot-data:/app/data ghcr.io/lxbme/llm_telebot:latest
+```
+
 
 ## 配置说明
 
@@ -88,6 +119,16 @@ docker run --env-file .env llm-telebot
 > **提示：** 获取用户/群组 ID 的方法：向 [@userinfobot](https://t.me/userinfobot) 发送消息可获取用户 ID；将 [@RawDataBot](https://t.me/RawDataBot) 加入群组可获取群组 ID（通常为负数）。
 >
 > 示例：`ALLOWED_USERS=123456789,987654321`  `ALLOWED_GROUPS=-1001234567890`
+
+### 管理员配置（可选）
+
+管理员可以通过 JSON 导入 command-based (stdio) MCP 服务器。非管理员用户只能添加 HTTP/SSE 类型的远程 MCP 服务器。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `ADMIN_ID` | — | 管理员用户 ID 列表，逗号分隔。设为 `*` 表示所有用户均为管理员 |
+
+> **容器化场景：** 当 bot 运行在 Docker 容器中时，stdio MCP 子进程也在容器内执行，天然具有沙箱隔离。此时可安全地设置 `ADMIN_ID=*` 允许所有用户添加 command-based MCP 服务器。
 
 ### 自动检测独立模型（可选）
 
