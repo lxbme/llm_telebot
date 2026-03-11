@@ -17,20 +17,35 @@ import (
 // ─── MCP Server Configuration ────────────────────────────────────────────────
 
 // MCPServerConfig describes a single MCP server entry in the JSON config.
+// Fully compatible with Claude Desktop's claude_desktop_config.json format.
 // Supports "streamablehttp", "sse", and "stdio" transport types.
 //
-//	Example JSON:
+// Claude Desktop format (env as object):
+//
 //	{
 //	  "mcpServers": {
-//	    "mcd-mcp": {
+//	    "my-server": {
+//	      "command": "npx",
+//	      "args": ["-y", "some-package"],
+//	      "env": {
+//	        "API_KEY": "value"
+//	      }
+//	    }
+//	  }
+//	}
+//
+// Extended format (env as array, explicit type, headers for HTTP/SSE):
+//
+//	{
+//	  "mcpServers": {
+//	    "remote-mcp": {
 //	      "type": "streamablehttp",
-//	      "url": "https://mcp.mcd.cn",
+//	      "url": "https://mcp.example.com",
 //	      "headers": {
-//	        "Authorization": "Bearer YOUR_MCP_TOKEN"
+//	        "Authorization": "Bearer TOKEN"
 //	      }
 //	    },
 //	    "local-tool": {
-//	      "type": "stdio",
 //	      "command": "/usr/local/bin/mytool",
 //	      "args": ["--flag"],
 //	      "env": ["KEY=VALUE"]
@@ -38,12 +53,53 @@ import (
 //	  }
 //	}
 type MCPServerConfig struct {
-	Type    string            `json:"type"`              // "streamablehttp", "sse", or "stdio"
-	URL     string            `json:"url,omitempty"`     // for streamablehttp / sse
-	Headers map[string]string `json:"headers,omitempty"` // for streamablehttp / sse
-	Command string            `json:"command,omitempty"` // for stdio
-	Args    []string          `json:"args,omitempty"`    // for stdio
-	Env     []string          `json:"env,omitempty"`     // for stdio
+	Type     string            `json:"type,omitempty"`     // "streamablehttp", "sse", or "stdio" (auto-inferred if empty)
+	URL      string            `json:"url,omitempty"`      // for streamablehttp / sse
+	Headers  map[string]string `json:"headers,omitempty"`  // for streamablehttp / sse
+	Command  string            `json:"command,omitempty"`  // for stdio
+	Args     []string          `json:"args,omitempty"`     // for stdio
+	Env      FlexEnv           `json:"env,omitempty"`      // for stdio: accepts both ["K=V"] and {"K":"V"}
+	Disabled bool              `json:"disabled,omitempty"` // if true, skip this server (Claude Desktop compat)
+}
+
+// FlexEnv holds environment variables and supports JSON unmarshalling from
+// either an array of "KEY=VALUE" strings (our extended format) or an object
+// of {"KEY": "VALUE"} pairs (Claude Desktop format).
+type FlexEnv struct {
+	Pairs []string // always stored as ["KEY=VALUE", …]
+}
+
+// MarshalJSON serialises FlexEnv as an array of strings.
+func (e FlexEnv) MarshalJSON() ([]byte, error) {
+	if e.Pairs == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(e.Pairs)
+}
+
+// UnmarshalJSON accepts both ["KEY=VALUE"] and {"KEY": "VALUE"} forms.
+func (e *FlexEnv) UnmarshalJSON(data []byte) error {
+	// Try array first.
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		e.Pairs = arr
+		return nil
+	}
+	// Try object (Claude Desktop format).
+	var obj map[string]string
+	if err := json.Unmarshal(data, &obj); err == nil {
+		for k, v := range obj {
+			e.Pairs = append(e.Pairs, k+"="+v)
+		}
+		return nil
+	}
+	return fmt.Errorf("env must be an array of \"KEY=VALUE\" strings or an object of {\"KEY\": \"VALUE\"} pairs")
+}
+
+// EnvList returns the environment variables as a string slice suitable
+// for transport.NewStdio.
+func (s *MCPServerConfig) EnvList() []string {
+	return s.Env.Pairs
 }
 
 // MCPConfig is the top-level JSON configuration structure.
@@ -97,20 +153,27 @@ func NewMCPClientManager() *MCPClientManager {
 
 // ConnectAll connects to all MCP servers defined in the config, discovers
 // their tools, and registers them into the given ToolRegistry.
-// Servers that fail to connect are logged and skipped (non-fatal).
-func (m *MCPClientManager) ConnectAll(cfg *MCPConfig, registry *ToolRegistry) {
+// Returns a map of server name → error for servers that failed to connect.
+// Successfully connected servers are not included in the returned map.
+func (m *MCPClientManager) ConnectAll(cfg *MCPConfig, registry *ToolRegistry) map[string]error {
 	if cfg == nil || len(cfg.MCPServers) == 0 {
-		return
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	var failures map[string]error
 	for name, srv := range cfg.MCPServers {
 		if err := m.connectOne(ctx, name, srv, registry); err != nil {
 			log.Printf("[mcp] failed to connect %q: %v", name, err)
+			if failures == nil {
+				failures = make(map[string]error)
+			}
+			failures[name] = err
 		}
 	}
+	return failures
 }
 
 // connectOne establishes a connection to a single MCP server, initializes it,
@@ -156,7 +219,7 @@ func (m *MCPClientManager) connectOne(
 		if srv.Command == "" {
 			return fmt.Errorf("command is required for stdio transport")
 		}
-		stdioTransport := transport.NewStdio(srv.Command, srv.Env, srv.Args...)
+		stdioTransport := transport.NewStdio(srv.Command, srv.EnvList(), srv.Args...)
 		c = client.NewClient(stdioTransport)
 		if err := c.Start(ctx); err != nil {
 			return fmt.Errorf("start stdio client: %w", err)

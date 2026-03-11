@@ -61,11 +61,17 @@ type Config struct {
 	SummaryKey   string
 	SummaryModel string
 
+	// Persistent chat storage.
+	ChatDBPath string // bbolt database for persistent chat history & summaries
+
 	// Tool calling (MCP) settings.
 	ToolsEnabled       bool   // enable LLM tool/function calling
 	ToolsMaxIterations int    // max tool-call round-trips per request (default 5)
 	MCPConfigPath      string // path to MCP servers JSON config file
 	UserMCPDBPath      string // bbolt database for per-user MCP configs
+
+	// Admin settings.
+	AdminIDs map[int64]bool // user IDs allowed to add command-based (stdio) MCP servers
 }
 
 func loadConfig() Config {
@@ -150,10 +156,12 @@ func loadConfig() Config {
 		SummaryBase:         getEnv("SUMMARY_API_BASE", ""),
 		SummaryKey:          getEnv("SUMMARY_API_KEY", ""),
 		SummaryModel:        getEnv("SUMMARY_MODEL", ""),
+		ChatDBPath:          getEnv("CHAT_DB_PATH", "./data/chat.db"),
 		ToolsEnabled:        strings.ToLower(getEnv("TOOLS_ENABLED", "false")) == "true",
 		ToolsMaxIterations:  toolsMaxIter,
 		MCPConfigPath:       getEnv("MCP_CONFIG_PATH", ""),
 		UserMCPDBPath:       getEnv("USER_MCP_DB_PATH", "./data/user_mcp.db"),
+		AdminIDs:            parseIDList(getEnv("ADMIN_ID", "")),
 	}
 }
 
@@ -226,13 +234,28 @@ type HistoryStore struct {
 	mu       sync.RWMutex
 	history  map[int64][]openai.ChatCompletionMessage
 	overflow map[int64][]openai.ChatCompletionMessage // messages trimmed from the sliding window
+	db       *ChatDB                                  // optional persistent backend
 }
 
-func NewHistoryStore() *HistoryStore {
-	return &HistoryStore{
+func NewHistoryStore(db *ChatDB) *HistoryStore {
+	s := &HistoryStore{
 		history:  make(map[int64][]openai.ChatCompletionMessage),
 		overflow: make(map[int64][]openai.ChatCompletionMessage),
+		db:       db,
 	}
+	// Restore persisted data on startup.
+	if db != nil {
+		for chatID, msgs := range db.LoadAllHistory() {
+			s.history[chatID] = msgs
+		}
+		for chatID, msgs := range db.LoadAllOverflow() {
+			s.overflow[chatID] = msgs
+		}
+		if len(s.history) > 0 {
+			log.Printf("[chat-db] restored history for %d chat(s)", len(s.history))
+		}
+	}
+	return s
 }
 
 // Get returns a copy of the message history for a chat.
@@ -259,6 +282,7 @@ func (s *HistoryStore) Append(chatID int64, msg openai.ChatCompletionMessage, ma
 		s.overflow[chatID] = append(s.overflow[chatID], s.history[chatID][:trimCount]...)
 		s.history[chatID] = s.history[chatID][trimCount:]
 	}
+	s.persistChat(chatID)
 }
 
 // AppendBatch atomically appends multiple messages and trims the history.
@@ -274,6 +298,7 @@ func (s *HistoryStore) AppendBatch(chatID int64, msgs []openai.ChatCompletionMes
 		s.overflow[chatID] = append(s.overflow[chatID], s.history[chatID][:trimCount]...)
 		s.history[chatID] = s.history[chatID][trimCount:]
 	}
+	s.persistChat(chatID)
 }
 
 // Clear deletes the history and overflow buffer for a chat.
@@ -282,6 +307,10 @@ func (s *HistoryStore) Clear(chatID int64) {
 	defer s.mu.Unlock()
 	delete(s.history, chatID)
 	delete(s.overflow, chatID)
+	if s.db != nil {
+		s.db.DeleteHistory(chatID)
+		s.db.DeleteOverflow(chatID)
+	}
 }
 
 // OverflowCount returns the number of messages in the overflow buffer.
@@ -297,7 +326,20 @@ func (s *HistoryStore) DrainOverflow(chatID int64) []openai.ChatCompletionMessag
 	defer s.mu.Unlock()
 	overflow := s.overflow[chatID]
 	delete(s.overflow, chatID)
+	if s.db != nil {
+		s.db.DeleteOverflow(chatID)
+	}
 	return overflow
+}
+
+// persistChat saves both history and overflow for a chat to the database.
+// Must be called with s.mu held.
+func (s *HistoryStore) persistChat(chatID int64) {
+	if s.db == nil {
+		return
+	}
+	s.db.SaveHistory(chatID, s.history[chatID])
+	s.db.SaveOverflow(chatID, s.overflow[chatID])
 }
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────
@@ -311,6 +353,7 @@ type Bot struct {
 	profileModel  string         // model name for profile extraction
 	summaryAI     *openai.Client // LLM client for conversation summarisation (may equal ai)
 	summaryModel  string         // model name for conversation summarisation
+	chatDB        *ChatDB        // persistent chat storage (nil-safe)
 	store         *HistoryStore
 	summaries     *SummaryStore     // per-chat conversation summaries
 	profiles      *ProfileStore     // NoSQL user-profile store (nil if disabled)
@@ -399,6 +442,13 @@ func NewBot(cfg Config) (*Bot, error) {
 			cfg.ProfileDBPath, cfg.ProfileExtractEvery, profileModel)
 	}
 
+	// Open persistent chat database.
+	chatDB, err := OpenChatDB(cfg.ChatDBPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init chat db: %w", err)
+	}
+	log.Printf("Persistent chat storage enabled (db: %s)", cfg.ChatDBPath)
+
 	// Build summary LLM client – falls back to main client if not configured.
 	summaryClient := aiClient
 	summaryModel := cfg.OpenAIModel
@@ -465,8 +515,9 @@ func NewBot(cfg Config) (*Bot, error) {
 		profileModel:  profileModel,
 		summaryAI:     summaryClient,
 		summaryModel:  summaryModel,
-		store:         NewHistoryStore(),
-		summaries:     NewSummaryStore(),
+		chatDB:        chatDB,
+		store:         NewHistoryStore(chatDB),
+		summaries:     NewSummaryStore(chatDB),
 		profiles:      profiles,
 		tools:         toolRegistry,
 		mcpClients:    mcpManager,
@@ -506,6 +557,11 @@ func (b *Bot) isAllowed(c tele.Context) bool {
 	}
 
 	return false
+}
+
+// isAdmin checks whether the given user ID is in the ADMIN_ID list.
+func (b *Bot) isAdmin(userID int64) bool {
+	return len(b.cfg.AdminIDs) > 0 && b.cfg.AdminIDs[userID]
 }
 
 func (b *Bot) Run() {
@@ -794,12 +850,18 @@ func (b *Bot) handleText(c tele.Context) error {
 				return c.Reply("⚠️ Tool calling is disabled. Cannot import MCP servers.")
 			}
 			userID := c.Sender().ID
-			names, err := b.userTools.AddServers(userID, mcpCfg.MCPServers)
+			// Non-admin users may only add network-based (HTTP/SSE) MCP servers.
+			if !b.isAdmin(userID) {
+				if rejected := filterCommandMCPs(mcpCfg); len(rejected) > 0 {
+					return c.Reply(fmt.Sprintf("🚫 Only admins can add command-based (stdio) MCP servers.\nRejected: %s", strings.Join(rejected, ", ")))
+				}
+			}
+			result, err := b.userTools.AddServers(userID, mcpCfg.MCPServers)
 			if err != nil {
 				log.Printf("[user-mcp] add error for user %d: %v", userID, err)
 				return c.Reply(fmt.Sprintf("❌ Failed to add MCP servers: %v", err))
 			}
-			return c.Reply(fmt.Sprintf("✅ Added/updated MCP servers: %s\n\nUse /mcp_list to see all your servers.", strings.Join(names, ", ")))
+			return c.Reply(formatMCPAddResult(result))
 		}
 	}
 
@@ -1153,6 +1215,9 @@ func main() {
 	bot, err := NewBot(cfg)
 	if err != nil {
 		log.Fatalf("Failed to initialise bot: %v", err)
+	}
+	if bot.chatDB != nil {
+		defer bot.chatDB.Close()
 	}
 	if bot.profiles != nil {
 		defer bot.profiles.Close()

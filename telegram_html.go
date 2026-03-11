@@ -157,7 +157,7 @@ func (r *tgHTMLRenderer) renderList(w util.BufWriter, _ []byte, node ast.Node, e
 	return ast.WalkContinue, nil
 }
 
-func (r *tgHTMLRenderer) renderListItem(w util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
+func (r *tgHTMLRenderer) renderListItem(w util.BufWriter, _ []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering && len(r.listStack) > 0 {
 		top := &r.listStack[len(r.listStack)-1]
 		indent := strings.Repeat("  ", len(r.listStack)-1)
@@ -168,12 +168,36 @@ func (r *tgHTMLRenderer) renderListItem(w util.BufWriter, _ []byte, _ ast.Node, 
 			fmt.Fprintf(w, "%s• ", indent)
 		}
 	}
+	if !entering {
+		// Add a newline after the list item, but only if the last child
+		// isn't a nested list (which already ends with its own newlines).
+		last := node.LastChild()
+		if last != nil && last.Kind() == ast.KindList {
+			// Nested list already wrote its trailing newline.
+			return ast.WalkContinue, nil
+		}
+		w.WriteByte('\n')
+		// For loose lists (items contain Paragraph nodes), add an extra
+		// blank line between items for visual spacing — but not after
+		// the last item.
+		if node.NextSibling() != nil && isLooseListItem(node) {
+			w.WriteByte('\n')
+		}
+	}
 	return ast.WalkContinue, nil
 }
 
 func (r *tgHTMLRenderer) renderParagraph(w util.BufWriter, _ []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
 	if !entering {
-		if isInListItem(node) || isInBlockquote(node) {
+		if isInListItem(node) {
+			// In a loose list (blank lines between items), paragraphs
+			// need a trailing newline for proper spacing between items.
+			// In tight lists, TextBlock is used instead of Paragraph.
+			if node.NextSibling() != nil {
+				// Multi-paragraph list item: separate paragraphs.
+				w.WriteByte('\n')
+			}
+		} else if isInBlockquote(node) {
 			w.WriteByte('\n')
 		} else {
 			w.WriteString("\n\n")
@@ -184,6 +208,8 @@ func (r *tgHTMLRenderer) renderParagraph(w util.BufWriter, _ []byte, node ast.No
 
 func (r *tgHTMLRenderer) renderTextBlock(w util.BufWriter, _ []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
 	if !entering && node.NextSibling() != nil {
+		// TextBlock is used in tight lists. When followed by a sibling
+		// (e.g. a nested list), add a newline to separate them.
 		w.WriteByte('\n')
 	}
 	return ast.WalkContinue, nil
@@ -327,6 +353,19 @@ func isInList(node ast.Node) bool {
 func isInBlockquote(node ast.Node) bool {
 	for p := node.Parent(); p != nil; p = p.Parent() {
 		if p.Kind() == ast.KindBlockquote {
+			return true
+		}
+	}
+	return false
+}
+
+// isLooseListItem returns true if a ListItem node belongs to a "loose" list
+// (one where items are separated by blank lines in Markdown). In goldmark's
+// AST, loose list items contain Paragraph children, while tight list items
+// contain TextBlock children.
+func isLooseListItem(node ast.Node) bool {
+	for c := node.FirstChild(); c != nil; c = c.NextSibling() {
+		if c.Kind() == ast.KindParagraph {
 			return true
 		}
 	}

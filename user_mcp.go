@@ -180,27 +180,30 @@ func (m *UserToolManager) RestoreAll() {
 		if err != nil || cfg == nil || len(cfg.MCPServers) == 0 {
 			continue
 		}
-		if err := m.connectUser(uid, cfg); err != nil {
-			log.Printf("[user-mcp] restore user %d failed: %v", uid, err)
-		} else {
-			log.Printf("[user-mcp] restored user %d (%d servers)", uid, len(cfg.MCPServers))
+		failures := m.connectUser(uid, cfg)
+		if len(failures) > 0 {
+			for name, ferr := range failures {
+				log.Printf("[user-mcp] restore user %d: server %q failed: %v", uid, name, ferr)
+			}
 		}
+		log.Printf("[user-mcp] restored user %d (%d servers, %d failed)", uid, len(cfg.MCPServers), len(failures))
 	}
 }
 
 // connectUser creates connections for a user's MCP config.
 // Must be called with m.mu held or before concurrent access begins.
-func (m *UserToolManager) connectUser(userID int64, cfg *MCPConfig) error {
+// Returns a map of server name → error for servers that failed to connect.
+func (m *UserToolManager) connectUser(userID int64, cfg *MCPConfig) map[string]error {
 	// Close existing connections if any.
 	m.disconnectUserLocked(userID)
 
 	registry := NewToolRegistry()
 	manager := NewMCPClientManager()
-	manager.ConnectAll(cfg, registry)
+	failures := manager.ConnectAll(cfg, registry)
 
 	m.registries[userID] = registry
 	m.clients[userID] = manager
-	return nil
+	return failures
 }
 
 // disconnectUserLocked closes existing connections for a user.
@@ -213,26 +216,64 @@ func (m *UserToolManager) disconnectUserLocked(userID int64) {
 	delete(m.registries, userID)
 }
 
-// AddServers adds new MCP servers for a user, persists to DB, and connects.
-// Returns the list of server names added.
-func (m *UserToolManager) AddServers(userID int64, incoming map[string]MCPServerConfig) ([]string, error) {
-	names, err := m.store.AddServers(userID, incoming)
+// MCPAddResult holds the outcome of an AddServers operation.
+type MCPAddResult struct {
+	Succeeded []string          // server names that connected successfully
+	Failed    map[string]string // server name → error message for failures
+}
+
+// AddServers adds new MCP servers for a user, validates connectivity,
+// and persists only the servers that connect successfully.
+// Servers that fail to connect are rolled back from the DB.
+func (m *UserToolManager) AddServers(userID int64, incoming map[string]MCPServerConfig) (*MCPAddResult, error) {
+	result := &MCPAddResult{}
+
+	// First, persist all incoming servers.
+	_, err := m.store.AddServers(userID, incoming)
 	if err != nil {
 		return nil, err
 	}
 
-	// Reload all connections for this user from the updated config.
+	// Reload and reconnect all servers for this user.
 	cfg, err := m.store.Get(userID)
 	if err != nil {
-		return names, fmt.Errorf("added but failed to reload: %w", err)
+		return nil, fmt.Errorf("added but failed to reload: %w", err)
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.connectUser(userID, cfg); err != nil {
-		return names, fmt.Errorf("added but connect error: %w", err)
+
+	failures := m.connectUser(userID, cfg)
+
+	// Classify newly-added servers into succeeded vs. failed.
+	for name := range incoming {
+		if ferr, ok := failures[name]; ok {
+			if result.Failed == nil {
+				result.Failed = make(map[string]string)
+			}
+			result.Failed[name] = ferr.Error()
+		} else {
+			result.Succeeded = append(result.Succeeded, name)
+		}
 	}
-	return names, nil
+
+	// Roll back failed servers from the DB so they don't linger.
+	if len(result.Failed) > 0 {
+		for name := range result.Failed {
+			if _, err := m.store.RemoveServer(userID, name); err != nil {
+				log.Printf("[user-mcp] rollback server %q for user %d failed: %v", name, userID, err)
+			}
+		}
+		// Reconnect without the failed servers.
+		updatedCfg, err := m.store.Get(userID)
+		if err == nil && updatedCfg != nil && len(updatedCfg.MCPServers) > 0 {
+			m.connectUser(userID, updatedCfg)
+		} else if err == nil {
+			m.disconnectUserLocked(userID)
+		}
+	}
+
+	return result, nil
 }
 
 // RemoveServer removes a single named MCP server from a user's config,
@@ -256,8 +297,13 @@ func (m *UserToolManager) RemoveServer(userID int64, serverName string) (bool, e
 		m.disconnectUserLocked(userID)
 		return true, nil
 	}
-	if err := m.connectUser(userID, cfg); err != nil {
-		return true, fmt.Errorf("removed but reconnect error: %w", err)
+	failures := m.connectUser(userID, cfg)
+	if len(failures) > 0 {
+		var errNames []string
+		for name := range failures {
+			errNames = append(errNames, name)
+		}
+		return true, fmt.Errorf("removed but some servers failed to reconnect: %s", strings.Join(errNames, ", "))
 	}
 	return true, nil
 }
@@ -410,6 +456,15 @@ func TryParseMCPConfig(text string) (*MCPConfig, bool) {
 	if len(cfg.MCPServers) == 0 {
 		return nil, false
 	}
+	// Remove disabled servers (Claude Desktop compat).
+	for name, srv := range cfg.MCPServers {
+		if srv.Disabled {
+			delete(cfg.MCPServers, name)
+		}
+	}
+	if len(cfg.MCPServers) == 0 {
+		return nil, false
+	}
 	// Auto-infer transport type when omitted.
 	for name, srv := range cfg.MCPServers {
 		if srv.Type == "" {
@@ -441,4 +496,52 @@ func FormatServerList(servers []ServerInfo) string {
 		sb.WriteString("\n")
 	}
 	return sb.String()
+}
+
+// formatMCPAddResult builds a human-readable message from an MCPAddResult,
+// reporting which servers succeeded and which failed (with error details).
+func formatMCPAddResult(r *MCPAddResult) string {
+	var sb strings.Builder
+	if len(r.Succeeded) > 0 {
+		sb.WriteString(fmt.Sprintf("✅ Added MCP servers: %s\n", strings.Join(r.Succeeded, ", ")))
+	}
+	if len(r.Failed) > 0 {
+		sb.WriteString("\n❌ Failed to connect:\n")
+		for name, errMsg := range r.Failed {
+			sb.WriteString(fmt.Sprintf("  • %s: %s\n", name, errMsg))
+		}
+		sb.WriteString("\nFailed servers were not saved.")
+	}
+	if len(r.Succeeded) > 0 {
+		sb.WriteString("\n\nUse /mcp_list to see all your servers.")
+	}
+	if len(r.Succeeded) == 0 && len(r.Failed) == 0 {
+		sb.WriteString("⚠️ No servers to add.")
+	}
+	return sb.String()
+}
+
+// IsCommandMCP returns true if the server config uses a command-based
+// (stdio) transport — i.e. it executes a local process.
+func IsCommandMCP(srv MCPServerConfig) bool {
+	switch strings.ToLower(InferTransportType(&srv)) {
+	case "stdio":
+		return true
+	default:
+		return false
+	}
+}
+
+// filterCommandMCPs removes any command-based (stdio) servers from the config
+// in-place and returns the names of the removed entries. If no command-based
+// servers are found, the returned slice is nil.
+func filterCommandMCPs(cfg *MCPConfig) []string {
+	var rejected []string
+	for name, srv := range cfg.MCPServers {
+		if IsCommandMCP(srv) {
+			rejected = append(rejected, name)
+			delete(cfg.MCPServers, name)
+		}
+	}
+	return rejected
 }

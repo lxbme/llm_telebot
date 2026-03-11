@@ -13,20 +13,31 @@ import (
 
 // ─── Summary Store ───────────────────────────────────────────────────────────
 
-// SummaryStore keeps per-chat conversation summaries in memory.
-// When the sliding window overflows, older messages are compressed into a
-// running summary so the LLM retains long-term memory.
+// SummaryStore keeps per-chat conversation summaries backed by an optional
+// persistent ChatDB. When the sliding window overflows, older messages are
+// compressed into a running summary so the LLM retains long-term memory.
 type SummaryStore struct {
 	mu          sync.RWMutex
 	summaries   map[int64]string // chatID → summary text
 	summarizing sync.Map         // chatID → bool (prevent concurrent summarisations)
+	db          *ChatDB          // optional persistent backend
 }
 
-// NewSummaryStore creates an empty in-memory summary store.
-func NewSummaryStore() *SummaryStore {
-	return &SummaryStore{
+// NewSummaryStore creates a summary store, optionally restoring persisted data.
+func NewSummaryStore(db *ChatDB) *SummaryStore {
+	s := &SummaryStore{
 		summaries: make(map[int64]string),
+		db:        db,
 	}
+	if db != nil {
+		for chatID, summary := range db.LoadAllSummaries() {
+			s.summaries[chatID] = summary
+		}
+		if len(s.summaries) > 0 {
+			log.Printf("[chat-db] restored summaries for %d chat(s)", len(s.summaries))
+		}
+	}
+	return s
 }
 
 // Get returns the current summary for a chat (empty string if none).
@@ -41,6 +52,9 @@ func (s *SummaryStore) Set(chatID int64, summary string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.summaries[chatID] = summary
+	if s.db != nil {
+		s.db.SaveSummary(chatID, summary)
+	}
 }
 
 // Clear removes the summary for a chat.
@@ -48,6 +62,9 @@ func (s *SummaryStore) Clear(chatID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.summaries, chatID)
+	if s.db != nil {
+		s.db.DeleteSummary(chatID)
+	}
 }
 
 // MarkSummarizing acquires a per-chat lock to prevent duplicate goroutines.
