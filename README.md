@@ -173,14 +173,6 @@ docker run --env-file .env -v llm-telebot-data:/app/data ghcr.io/lxbme/llm_teleb
 
 启用后，LLM 可自主判断是否需要调用注册的工具，并根据工具返回结果生成最终回复。
 
-#### 内置工具
-
-| 工具 | 说明 |
-|---|---|
-| `get_current_time` | 获取指定时区的当前时间 |
-| `random_number` | 生成指定范围内的随机数 |
-| `calculator` | 算术表达式计算器 |
-
 #### 全局 MCP 配置
 
 通过 JSON 配置文件接入远程 MCP 服务器，所有用户共享这些工具。
