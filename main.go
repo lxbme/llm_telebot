@@ -73,6 +73,16 @@ type Config struct {
 	// Admin settings.
 	AdminIDs map[int64]bool // user IDs allowed to add command-based (stdio) MCP servers
 	AdminAll bool           // when true, all users are treated as admin (ADMIN_ID=*)
+
+	// Volcengine TTS settings.
+	VolcengineTTSAppID       string
+	VolcengineTTSAccessKey   string
+	VolcengineTTSResourceID  string
+	VolcengineTTSSpeaker     string
+	VolcengineTTSAudioFormat string
+	VolcengineTTSSampleRate  int
+	VolcengineTTSSpeechRate  int
+	VolcengineTTSSendText    bool
 }
 
 func loadConfig() Config {
@@ -112,6 +122,19 @@ func loadConfig() Config {
 		toolsMaxIter = 5
 	}
 
+	ttsSampleRate, _ := strconv.Atoi(getEnv("VOLCENGINE_TTS_SAMPLE_RATE", strconv.Itoa(defaultTTSSampleRate)))
+	if ttsSampleRate <= 0 {
+		ttsSampleRate = defaultTTSSampleRate
+	}
+
+	ttsSpeechRate, _ := strconv.Atoi(getEnv("VOLCENGINE_TTS_SPEECH_RATE", "0"))
+	if ttsSpeechRate < -50 {
+		ttsSpeechRate = -50
+	}
+	if ttsSpeechRate > 100 {
+		ttsSpeechRate = 100
+	}
+
 	allowedUsers := parseIDList(getEnv("ALLOWED_USERS", ""))
 	allowedGroups := parseIDList(getEnv("ALLOWED_GROUPS", ""))
 
@@ -131,39 +154,47 @@ func loadConfig() Config {
 	}
 
 	return Config{
-		OpenAIBase:          getEnv("OPENAI_API_BASE", ""),
-		OpenAIKey:           getEnv("OPENAI_API_KEY", ""),
-		OpenAIModel:         getEnv("OPENAI_MODEL", "gpt-4o"),
-		TelegramToken:       getEnv("TELEGRAM_BOT_TOKEN", ""),
-		SystemPrompt:        getEnv("SYSTEM_PROMPT", "You are a helpful assistant."),
-		ContextMaxMsgs:      maxMsgs,
-		MaxTokens:           maxTokens,
-		BotUsername:         getEnv("BOT_USERNAME", ""),
-		ContextMode:         contextMode,
-		AutoDetect:          autoDetect,
-		AutoDetectBase:      getEnv("AUTO_DETECT_API_BASE", ""),
-		AutoDetectKey:       getEnv("AUTO_DETECT_API_KEY", ""),
-		AutoDetectModel:     getEnv("AUTO_DETECT_MODEL", ""),
-		AllowedUsers:        allowedUsers,
-		AllowedGroups:       allowedGroups,
-		ProfileEnabled:      strings.ToLower(getEnv("PROFILE_ENABLED", "true")) == "true",
-		ProfileDBPath:       getEnv("PROFILE_DB_PATH", "./data/profiles.db"),
-		ProfileExtractEvery: profileExtractEvery,
-		ProfileBase:         getEnv("PROFILE_API_BASE", ""),
-		ProfileKey:          getEnv("PROFILE_API_KEY", ""),
-		ProfileModel:        getEnv("PROFILE_MODEL", ""),
-		SummaryEnabled:      strings.ToLower(getEnv("SUMMARY_ENABLED", "true")) == "true",
-		SummaryMinOverflow:  summaryMinOverflow,
-		SummaryBase:         getEnv("SUMMARY_API_BASE", ""),
-		SummaryKey:          getEnv("SUMMARY_API_KEY", ""),
-		SummaryModel:        getEnv("SUMMARY_MODEL", ""),
-		ChatDBPath:          getEnv("CHAT_DB_PATH", "./data/chat.db"),
-		ToolsEnabled:        strings.ToLower(getEnv("TOOLS_ENABLED", "false")) == "true",
-		ToolsMaxIterations:  toolsMaxIter,
-		MCPConfigPath:       getEnv("MCP_CONFIG_PATH", ""),
-		UserMCPDBPath:       getEnv("USER_MCP_DB_PATH", "./data/user_mcp.db"),
-		AdminIDs:            parseIDList(getEnv("ADMIN_ID", "")),
-		AdminAll:            strings.TrimSpace(getEnv("ADMIN_ID", "")) == "*",
+		OpenAIBase:               getEnv("OPENAI_API_BASE", ""),
+		OpenAIKey:                getEnv("OPENAI_API_KEY", ""),
+		OpenAIModel:              getEnv("OPENAI_MODEL", "gpt-4o"),
+		TelegramToken:            getEnv("TELEGRAM_BOT_TOKEN", ""),
+		SystemPrompt:             getEnv("SYSTEM_PROMPT", "You are a helpful assistant."),
+		ContextMaxMsgs:           maxMsgs,
+		MaxTokens:                maxTokens,
+		BotUsername:              getEnv("BOT_USERNAME", ""),
+		ContextMode:              contextMode,
+		AutoDetect:               autoDetect,
+		AutoDetectBase:           getEnv("AUTO_DETECT_API_BASE", ""),
+		AutoDetectKey:            getEnv("AUTO_DETECT_API_KEY", ""),
+		AutoDetectModel:          getEnv("AUTO_DETECT_MODEL", ""),
+		AllowedUsers:             allowedUsers,
+		AllowedGroups:            allowedGroups,
+		ProfileEnabled:           strings.ToLower(getEnv("PROFILE_ENABLED", "true")) == "true",
+		ProfileDBPath:            getEnv("PROFILE_DB_PATH", "./data/profiles.db"),
+		ProfileExtractEvery:      profileExtractEvery,
+		ProfileBase:              getEnv("PROFILE_API_BASE", ""),
+		ProfileKey:               getEnv("PROFILE_API_KEY", ""),
+		ProfileModel:             getEnv("PROFILE_MODEL", ""),
+		SummaryEnabled:           strings.ToLower(getEnv("SUMMARY_ENABLED", "true")) == "true",
+		SummaryMinOverflow:       summaryMinOverflow,
+		SummaryBase:              getEnv("SUMMARY_API_BASE", ""),
+		SummaryKey:               getEnv("SUMMARY_API_KEY", ""),
+		SummaryModel:             getEnv("SUMMARY_MODEL", ""),
+		ChatDBPath:               getEnv("CHAT_DB_PATH", "./data/chat.db"),
+		ToolsEnabled:             strings.ToLower(getEnv("TOOLS_ENABLED", "false")) == "true",
+		ToolsMaxIterations:       toolsMaxIter,
+		MCPConfigPath:            getEnv("MCP_CONFIG_PATH", ""),
+		UserMCPDBPath:            getEnv("USER_MCP_DB_PATH", "./data/user_mcp.db"),
+		AdminIDs:                 parseIDList(getEnv("ADMIN_ID", "")),
+		AdminAll:                 strings.TrimSpace(getEnv("ADMIN_ID", "")) == "*",
+		VolcengineTTSAppID:       getEnv("VOLCENGINE_TTS_APP_ID", ""),
+		VolcengineTTSAccessKey:   getEnv("VOLCENGINE_TTS_ACCESS_KEY", ""),
+		VolcengineTTSResourceID:  getEnv("VOLCENGINE_TTS_RESOURCE_ID", defaultTTSResourceID),
+		VolcengineTTSSpeaker:     getEnv("VOLCENGINE_TTS_SPEAKER", defaultTTSSpeaker),
+		VolcengineTTSAudioFormat: getEnv("VOLCENGINE_TTS_AUDIO_FORMAT", defaultTTSAudioFormat),
+		VolcengineTTSSampleRate:  ttsSampleRate,
+		VolcengineTTSSpeechRate:  ttsSpeechRate,
+		VolcengineTTSSendText:    strings.ToLower(getEnv("VOLCENGINE_TTS_SEND_TEXT", "true")) != "false",
 	}
 }
 
@@ -362,6 +393,8 @@ type Bot struct {
 	tools         *ToolRegistry     // global registered MCP tools (nil if disabled)
 	mcpClients    *MCPClientManager // global remote MCP server connections (nil if none)
 	userTools     *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
+	speechModes   *SpeechModeStore
+	tts           *VolcengineTTSClient
 	tg            *tele.Bot
 }
 
@@ -508,6 +541,12 @@ func NewBot(cfg Config) (*Bot, error) {
 		log.Printf("Per-user dynamic MCP enabled (db: %s)", cfg.UserMCPDBPath)
 	}
 
+	ttsClient := NewVolcengineTTSClient(cfg)
+	if ttsClient != nil {
+		log.Printf("Volcengine TTS enabled (resource: %s, speaker: %s, format: %s)",
+			ttsClient.resourceID, ttsClient.speaker, ttsClient.audioFormat)
+	}
+
 	return &Bot{
 		cfg:           cfg,
 		ai:            aiClient,
@@ -524,6 +563,8 @@ func NewBot(cfg Config) (*Bot, error) {
 		tools:         toolRegistry,
 		mcpClients:    mcpManager,
 		userTools:     userToolMgr,
+		speechModes:   NewSpeechModeStore(),
+		tts:           ttsClient,
 		tg:            tgBot,
 	}, nil
 }
@@ -574,6 +615,8 @@ func (b *Bot) Run() {
 	b.tg.Handle("/start", b.handleStart)
 	b.tg.Handle("/clear", b.handleClear)
 	b.tg.Handle("/summary", b.handleSummary)
+	b.tg.Handle("/speach", b.handleSpeechMode)
+	b.tg.Handle("/speech", b.handleSpeechMode)
 	b.tg.Handle("/clearp", b.handleClearProfile)
 	b.tg.Handle("/displayp", b.handleDisplayProfile)
 	b.tg.Handle("/mcp_list", b.handleMCPList)
@@ -721,6 +764,46 @@ func (b *Bot) handleSummary(c tele.Context) error {
 		reply = string(runes[:4093]) + "…"
 	}
 	return c.Reply(reply)
+}
+
+func (b *Bot) handleSpeechMode(c tele.Context) error {
+	if !b.isAllowed(c) {
+		return nil
+	}
+	if c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
+		return c.Reply("🚫 Only admins can use /speach。")
+	}
+	if b.tts == nil {
+		return c.Reply("⚠️ TTS is not configured, please set the `VOLCENGINE_TTS_*` environment variables。")
+	}
+
+	chatID := c.Chat().ID
+	arg := strings.ToLower(strings.TrimSpace(c.Message().Payload))
+	current := b.speechModes.Enabled(chatID)
+	next := current
+
+	switch arg {
+	case "", "toggle", "status", "状态":
+		if arg == "status" || arg == "状态" {
+			if current {
+				return c.Reply("🔊 The /speach mode is currently enabled for this chat。")
+			}
+			return c.Reply("🔇 The /speach mode is currently disabled for this chat。")
+		}
+		next = !current
+	case "on", "enable", "start", "true", "1", "开启", "开":
+		next = true
+	case "off", "disable", "stop", "false", "0", "关闭", "关":
+		next = false
+	default:
+		return c.Reply("Usage: `/speach [on|off|toggle|status]`\nWithout arguments, the mode will be toggled automatically。")
+	}
+
+	b.speechModes.Set(chatID, next)
+	if next {
+		return c.Reply("✅ The /speach mode is currently enabled for this chat。")
+	}
+	return c.Reply("✅ The /speach mode is currently disabled for this chat。")
 }
 
 func (b *Bot) handleClearProfile(c tele.Context) error {
@@ -935,7 +1018,7 @@ func (b *Bot) handleText(c tele.Context) error {
 
 	// Inject user profiles of conversation participants into the system prompt.
 	profileSection := b.buildProfileSection(append(history, userMsg))
-	systemPrompt := b.cfg.SystemPrompt + profileSection
+	systemPrompt := b.cfg.SystemPrompt + b.speechInstruction(chatID) + profileSection
 
 	// Inject conversation summary (compressed history beyond the sliding window).
 	if b.cfg.SummaryEnabled {
@@ -1051,7 +1134,7 @@ func (b *Bot) streamReply(
 	if finalText == "" {
 		return // error already reported by doStream
 	}
-	b.postReply(chatID, userMsg, finalText, sender)
+	b.postReply(chatID, userMsg, finalText, sender, placeholder.Chat, placeholder)
 }
 
 // doStream performs the streaming LLM call and returns the final text.
@@ -1063,6 +1146,11 @@ func (b *Bot) doStream(
 	placeholder *tele.Message,
 	toolView *MergedToolView,
 ) string {
+	showText := true
+	if placeholder != nil && placeholder.Chat != nil {
+		showText = b.shouldSendSpeechText(placeholder.Chat.ID)
+	}
+
 	req := openai.ChatCompletionRequest{
 		Model:     b.cfg.OpenAIModel,
 		Messages:  messages,
@@ -1105,7 +1193,7 @@ func (b *Bot) doStream(
 				mu.Lock()
 				current := fullResponse.String()
 				mu.Unlock()
-				if current != lastSent && current != "" {
+				if showText && current != lastSent && current != "" {
 					b.editOrLog(placeholder, current+"▌")
 					lastSent = current
 				}
@@ -1154,8 +1242,12 @@ func (b *Bot) doStream(
 		finalText = "⚠️ The model returned an empty response."
 	}
 
-	// One final edit with the complete text, rendered as Telegram HTML.
-	b.editFinalResponse(placeholder, finalText)
+	if showText {
+		// One final edit with the complete text, rendered as Telegram HTML.
+		b.editFinalResponse(placeholder, finalText)
+	} else {
+		b.editOrLog(placeholder, "🔊 正在发送语音…")
+	}
 	return finalText
 }
 
@@ -1166,6 +1258,8 @@ func (b *Bot) postReply(
 	userMsg openai.ChatCompletionMessage,
 	finalText string,
 	sender *tele.User,
+	chat *tele.Chat,
+	placeholder *tele.Message,
 ) {
 	// Atomically persist the user message and assistant reply as a pair
 	// so concurrent requests never interleave between them.
@@ -1187,6 +1281,8 @@ func (b *Bot) postReply(
 			go b.extractProfile(sender.Username, displayName, allMsgs)
 		}
 	}
+
+	b.finalizeSpeechReply(chatID, chat, sender, finalText, placeholder)
 }
 
 // truncate shortens a string for logging purposes.
