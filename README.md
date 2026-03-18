@@ -42,17 +42,17 @@
 git clone https://github.com/lxbme/llm_telebot.git
 cd llm_telebot
 
-# 复制并编辑 YAML 主配置
-cp config.yaml.example config.yaml
-# 复制贴纸规则示例（如需贴纸能力）
-cp sticker_rules.json.example sticker_rules.json
+# 统一使用 data 目录存放可持久化配置
+mkdir -p data
+cp config.yaml.example ./data/config.yaml
+cp sticker_rules.json.example ./data/sticker_rules.json
 
 # 复制并编辑环境变量覆盖（建议只放密钥）
 cp .env.example .env
-# 编辑 config.yaml / sticker_rules.json / .env
+# 编辑 ./data/config.yaml / ./data/sticker_rules.json / .env
 
 # 运行
-go run .
+CONFIG_FILE=./data/config.yaml go run .
 ```
 
 ### 使用预构建镜像部署（推荐）
@@ -114,6 +114,7 @@ docker run --env-file .env -v "$(pwd)/data:/app/data" llm-telebot
 ```bash
 mkdir -p data
 cp config.yaml.example ./data/config.yaml
+cp sticker_rules.json.example ./data/sticker_rules.json
 cp .env.example .env
 
 podman pull ghcr.io/lxbme/llm_telebot:latest
@@ -123,32 +124,32 @@ podman run --env-file .env -v "$(pwd)/data:/app/data" ghcr.io/lxbme/llm_telebot:
 
 ## 配置说明
 
-默认使用 `config.yaml` 作为主配置文件，环境变量（包括 `.env` 加载进来的变量）会覆盖同名项。
+本文档统一推荐使用 `./data/config.yaml` 作为主配置文件，环境变量（包括 `.env` 加载进来的变量）会覆盖同名项。
 
 配置优先级：
 
 ```text
-config.yaml -> 环境变量覆盖
+./data/config.yaml -> 环境变量覆盖
 ```
 
 推荐做法：
 
-- 将大部分业务配置写在 `config.yaml`
+- 将大部分业务配置写在 `./data/config.yaml`
 - 将 API Key、Token、容器路径覆盖等写在 `.env`
-- 如果某个键同时出现在 `config.yaml` 和环境变量中，启动时会以环境变量为准
-- `/admin` 会把修改写回 `config.yaml`；若该项仍被环境变量覆盖，则重启后会恢复为环境变量的值
+- 如果某个键同时出现在 `./data/config.yaml` 和环境变量中，启动时会以环境变量为准
+- `/admin` 会把修改写回当前 `CONFIG_FILE` 指向的文件；若该项仍被环境变量覆盖，则重启后会恢复为环境变量的值
 
 ### 配置文件位置
 
-- 本地直接运行时，默认配置文件路径为 `./config.yaml`
+- 本地直接运行时，若未设置 `CONFIG_FILE`，默认配置文件路径为 `./data/config.yaml`（代码常量：`DefaultConfigFilePath`，定义于 `config_file.go`）
 - 容器镜像内默认配置文件路径为 `/app/data/config.yaml`
-- 可通过环境变量 `CONFIG_FILE` 自定义配置文件路径
+- 推荐通过环境变量 `CONFIG_FILE=./data/config.yaml` 统一本地与容器路径
 
 ### `/admin` 热修改说明
 
 - 仅管理员私聊可用
 - 发送 `/admin` 后，bot 会列出全部配置项及编号
-- 回复编号后进入编辑态，再回复新值即可立即生效并写回 `config.yaml`
+- 回复编号后进入编辑态，再回复新值即可立即生效并写回 `CONFIG_FILE` 指向的配置文件
 - 两步消息都带 `cancel` 按钮，可返回上一步或退出
 - 输入 `<empty>` 可清空字符串或列表配置
 - `TELEGRAM_BOT_TOKEN` 修改后会写入运行时与配置文件，但建议重启进程后再确认轮询连接状态
@@ -161,7 +162,7 @@ config.yaml -> 环境变量覆盖
 | `OPENAI_API_KEY` | **是** | — | API 密钥 |
 | `OPENAI_MODEL` | 否 | `gpt-4o` | 模型名称 |
 | `TELEGRAM_BOT_TOKEN` | **是** | — | Telegram Bot Token |
-| `CONFIG_FILE` | 否 | `./config.yaml` | YAML 主配置文件路径；容器镜像中默认是 `/app/data/config.yaml` |
+| `CONFIG_FILE` | 否 | `DefaultConfigFilePath`（`./data/config.yaml`） | YAML 主配置文件路径；容器镜像中默认是 `/app/data/config.yaml` |
 | `BOT_USERNAME` | 否 | 自动获取 | 机器人用户名（带 @ 前缀），用于群聊中检测 @提及 |
 | `SYSTEM_PROMPT` | 否 | `You are a helpful assistant.` | 系统提示词 |
 | `CONTEXT_MAX_MESSAGES` | 否 | `20` | 每个对话保留的最大消息数（滑动窗口） |
@@ -193,7 +194,7 @@ config.yaml -> 环境变量覆盖
 | `STICKER_ENABLED` | `false` | 是否启用贴纸策略 |
 | `STICKER_MODE` | `append` | 贴纸模式：`off` / `append` / `replace` / `command_only` |
 | `STICKER_PACK_NAME` | `""` | 贴纸包业务别名（预留字段） |
-| `STICKER_RULES_PATH` | `./sticker_rules.json` | 贴纸规则文件路径（JSON） |
+| `STICKER_RULES_PATH` | `./data/sticker_rules.json` | 贴纸规则文件路径（JSON） |
 | `STICKER_SEND_PROBABILITY` | `0.25` | 自动贴纸触发概率，范围 `0~1` |
 | `STICKER_MAX_PER_REPLY` | `1` | 每次回复最多发送贴纸数量 |
 | `STICKER_WITH_SPEECH` | `true` | 语音模式开启时是否仍允许发贴纸 |
@@ -212,7 +213,7 @@ config.yaml -> 环境变量覆盖
 
 ### 贴纸规则文件格式
 
-默认使用 `sticker_rules.json`（容器中通常建议放在 `./data/sticker_rules.json`，并在 `STICKER_RULES_PATH` 指向该路径）。
+默认值为 `./data/sticker_rules.json`，容器化场景可直接挂载 `./data` 目录复用同一路径。
 
 示例：
 

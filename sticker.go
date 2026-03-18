@@ -39,7 +39,7 @@ type StickerEngine struct {
 func NewStickerEngine(path string) (*StickerEngine, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
-		path = "./sticker_rules.json"
+		path = "./data/sticker_rules.json"
 	}
 	engine := &StickerEngine{path: path}
 	if err := engine.ensureRulesFile(); err != nil {

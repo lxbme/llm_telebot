@@ -236,7 +236,7 @@ func loadConfig() Config {
 		StickerEnabled:           strings.ToLower(get("STICKER_ENABLED", "false")) == "true",
 		StickerMode:              stickerMode,
 		StickerPackName:          get("STICKER_PACK_NAME", ""),
-		StickerRulesPath:         get("STICKER_RULES_PATH", "./sticker_rules.json"),
+		StickerRulesPath:         get("STICKER_RULES_PATH", "./data/sticker_rules.json"),
 		StickerSendProbability:   stickerSendProbability,
 		StickerMaxPerReply:       stickerMaxPerReply,
 		StickerWithSpeech:        strings.ToLower(get("STICKER_WITH_SPEECH", "true")) != "false",

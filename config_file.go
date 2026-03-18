@@ -13,7 +13,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const defaultConfigFilePath = "config.yaml"
+const (
+	// DefaultConfigFilePath is the built-in fallback for CONFIG_FILE.
+	DefaultConfigFilePath = "./data/config.yaml"
+)
 
 type configValueSource struct {
 	filePath string
@@ -27,7 +30,7 @@ func loadConfigValues() configValueSource {
 
 	filePath := strings.TrimSpace(os.Getenv("CONFIG_FILE"))
 	if filePath == "" {
-		filePath = defaultConfigFilePath
+		filePath = DefaultConfigFilePath
 	}
 
 	values, err := loadYAMLConfigValues(filePath)
@@ -115,7 +118,7 @@ func ensureConfigFileExists(cfg Config) error {
 func effectiveConfigFilePath(cfg Config) string {
 	path := strings.TrimSpace(cfg.ConfigFilePath)
 	if path == "" {
-		return defaultConfigFilePath
+		return DefaultConfigFilePath
 	}
 	return path
 }
