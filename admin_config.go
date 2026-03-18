@@ -72,6 +72,8 @@ type runtimeSnapshot struct {
 	profileModel  string
 	summaryAI     *openai.Client
 	summaryModel  string
+	stickerAI     *openai.Client
+	stickerModel  string
 	chatDB        *ChatDB
 	store         *HistoryStore
 	summaries     *SummaryStore
@@ -81,6 +83,7 @@ type runtimeSnapshot struct {
 	userTools     *UserToolManager
 	speechModes   *SpeechModeStore
 	tts           *VolcengineTTSClient
+	stickers      *StickerEngine
 	tg            *tele.Bot
 }
 
@@ -96,6 +99,8 @@ func (b *Bot) snapshot() runtimeSnapshot {
 		profileModel:  b.profileModel,
 		summaryAI:     b.summaryAI,
 		summaryModel:  b.summaryModel,
+		stickerAI:     b.stickerAI,
+		stickerModel:  b.stickerModel,
 		chatDB:        b.chatDB,
 		store:         b.store,
 		summaries:     b.summaries,
@@ -105,6 +110,7 @@ func (b *Bot) snapshot() runtimeSnapshot {
 		userTools:     b.userTools,
 		speechModes:   b.speechModes,
 		tts:           b.tts,
+		stickers:      b.stickers,
 		tg:            b.tg,
 	}
 }
@@ -311,13 +317,79 @@ func allConfigOptions() []configOption {
 		boolOption(40, "VOLCENGINE_TTS_SEND_TEXT", "Whether speech mode should also send the text reply.", false,
 			func(cfg Config) bool { return cfg.VolcengineTTSSendText },
 			func(cfg *Config, v bool) { cfg.VolcengineTTSSendText = v }),
+		boolOption(41, "STICKER_ENABLED", "Enable Telegram sticker strategy after replies.", false,
+			func(cfg Config) bool { return cfg.StickerEnabled },
+			func(cfg *Config, v bool) { cfg.StickerEnabled = v }),
+		enumOption(42, "STICKER_MODE", "Sticker mode: off, append, replace, command_only.", false,
+			func(cfg Config) string { return cfg.StickerMode },
+			func(cfg *Config, v string) { cfg.StickerMode = v },
+			map[string]string{
+				"off":          "off",
+				"append":       "append",
+				"replace":      "replace",
+				"command_only": "command_only",
+			}),
+		stringOption(43, "STICKER_PACK_NAME", "Optional sticker pack alias for business semantics.", false,
+			func(cfg Config) string { return cfg.StickerPackName },
+			func(cfg *Config, v string) { cfg.StickerPackName = v }),
+		stringOption(44, "STICKER_RULES_PATH", "Path to sticker rules JSON file.", false,
+			func(cfg Config) string { return cfg.StickerRulesPath },
+			func(cfg *Config, v string) { cfg.StickerRulesPath = v }),
+		customOption(45, "STICKER_SEND_PROBABILITY", "Probability (0~1) for auto sticker send in append/replace mode.", false,
+			func(cfg Config) string { return strconv.FormatFloat(cfg.StickerSendProbability, 'f', -1, 64) },
+			func(input string, cfg *Config) error {
+				value := normalizeConfigTextInput(input)
+				p, err := strconv.ParseFloat(value, 64)
+				if err != nil {
+					return fmt.Errorf("please enter a decimal number between 0 and 1")
+				}
+				if p < 0 || p > 1 {
+					return fmt.Errorf("must be between 0 and 1")
+				}
+				cfg.StickerSendProbability = p
+				return nil
+			}),
+		intOption(46, "STICKER_MAX_PER_REPLY", "Maximum stickers sent per reply. Must be greater than 0.", false,
+			func(cfg Config) int { return cfg.StickerMaxPerReply },
+			func(cfg *Config, v int) { cfg.StickerMaxPerReply = v },
+			func(v int) error {
+				if v <= 0 {
+					return fmt.Errorf("must be greater than 0")
+				}
+				return nil
+			}),
+		boolOption(47, "STICKER_WITH_SPEECH", "Allow stickers when speech mode is enabled for this chat.", false,
+			func(cfg Config) bool { return cfg.StickerWithSpeech },
+			func(cfg *Config, v bool) { cfg.StickerWithSpeech = v }),
+		customOption(48, "STICKER_ALLOWED_CHATS", "Comma-separated chat IDs allowed to use sticker strategy. Use <empty> to allow all chats.", false,
+			func(cfg Config) string { return formatIDSet(cfg.StickerAllowedChats) },
+			func(input string, cfg *Config) error {
+				ids, err := parseIDListStrict(strings.TrimSpace(input))
+				if err != nil {
+					return err
+				}
+				cfg.StickerAllowedChats = ids
+				return nil
+			}),
+		boolOption(49, "STICKER_MODEL_ENABLED", "Enable model-assisted sticker label selection when rule matching misses.", false,
+			func(cfg Config) bool { return cfg.StickerModelEnabled },
+			func(cfg *Config, v bool) { cfg.StickerModelEnabled = v }),
+		stringOption(50, "STICKER_MODEL_BASE", "Base URL for sticker strategy model. Leave empty to fall back to primary config.", false,
+			func(cfg Config) string { return cfg.StickerModelBase },
+			func(cfg *Config, v string) { cfg.StickerModelBase = v }),
+		stringOption(51, "STICKER_MODEL_KEY", "API key for sticker strategy model. Leave empty to fall back to primary config.", true,
+			func(cfg Config) string { return cfg.StickerModelKey },
+			func(cfg *Config, v string) { cfg.StickerModelKey = v }),
+		stringOption(52, "STICKER_MODEL", "Model name for sticker strategy. Leave empty to fall back to primary model.", false,
+			func(cfg Config) string { return cfg.StickerModel },
+			func(cfg *Config, v string) { cfg.StickerModel = v }),
 	}
 }
 
 func stringOption(number int, envKey, desc string, sensitive bool, getter func(Config) string, setter func(*Config, string)) configOption {
 	return customOption(number, envKey, desc, sensitive, getter, func(input string, cfg *Config) error {
 		value := normalizeConfigTextInput(input)
-		if envKey == "OPENAI_API_KEY" || envKey == "OPENAI_MODEL" || envKey == "CHAT_DB_PATH" || envKey == "USER_MCP_DB_PATH" {
+		if envKey == "OPENAI_API_KEY" || envKey == "OPENAI_MODEL" || envKey == "CHAT_DB_PATH" || envKey == "USER_MCP_DB_PATH" || envKey == "STICKER_RULES_PATH" {
 			if value == "" {
 				return fmt.Errorf("cannot be empty")
 			}
@@ -730,7 +802,7 @@ func buildOpenAIClient(apiKey, baseURL string) (*openai.Client, error) {
 	return openai.NewClientWithConfig(cfg), nil
 }
 
-func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI *openai.Client, detectorModel, profileModel, summaryModel string, err error) {
+func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI, stickerAI *openai.Client, detectorModel, profileModel, summaryModel, stickerModel string, err error) {
 	if strings.TrimSpace(cfg.OpenAIModel) == "" {
 		err = fmt.Errorf("OPENAI_MODEL cannot be empty")
 		return
@@ -772,6 +844,17 @@ func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI *ope
 			return
 		}
 		summaryModel = firstNonEmpty(cfg.SummaryModel, cfg.OpenAIModel)
+	}
+
+	stickerAI = mainAI
+	stickerModel = cfg.OpenAIModel
+	if cfg.StickerModelKey != "" || cfg.StickerModelBase != "" || cfg.StickerModel != "" {
+		stickerAI, err = buildOpenAIClient(firstNonEmpty(cfg.StickerModelKey, cfg.OpenAIKey), firstNonEmpty(cfg.StickerModelBase, cfg.OpenAIBase))
+		if err != nil {
+			err = fmt.Errorf("STICKER_MODEL configuration is invalid: %w", err)
+			return
+		}
+		stickerModel = firstNonEmpty(cfg.StickerModel, cfg.OpenAIModel)
 	}
 
 	return
@@ -867,7 +950,7 @@ func (b *Bot) persistRuntimeChatState(db *ChatDB) {
 func (b *Bot) applyRuntimeConfig(next Config) error {
 	current := b.snapshot()
 
-	mainAI, detectorAI, profileAI, summaryAI, detectorModel, profileModel, summaryModel, err := buildAIResources(next)
+	mainAI, detectorAI, profileAI, summaryAI, stickerAI, detectorModel, profileModel, summaryModel, stickerModel, err := buildAIResources(next)
 	if err != nil {
 		return err
 	}
@@ -928,6 +1011,16 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	}
 
 	newTTS := NewVolcengineTTSClient(next)
+	newStickerEngine, err := NewStickerEngine(next.StickerRulesPath)
+	if err != nil {
+		if newProfiles != nil && profilesChanged {
+			_ = newProfiles.Close()
+		}
+		if newChatDB != nil && chatDBChanged {
+			_ = newChatDB.Close()
+		}
+		return fmt.Errorf("failed to load STICKER_RULES_PATH: %w", err)
+	}
 
 	b.mu.Lock()
 	oldChatDB := b.chatDB
@@ -943,7 +1036,10 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	b.profileModel = profileModel
 	b.summaryAI = summaryAI
 	b.summaryModel = summaryModel
+	b.stickerAI = stickerAI
+	b.stickerModel = stickerModel
 	b.tts = newTTS
+	b.stickers = newStickerEngine
 
 	if chatDBChanged {
 		b.chatDB = newChatDB

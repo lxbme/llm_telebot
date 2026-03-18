@@ -1,0 +1,36 @@
+{
+  "label_stickers": {
+    "celebrate": [
+      "CAACAgIAAxkBAAFFH6lpusexPFalHZqGR2P7sXNrwRUvdgACPQADJHFiGmptpaX1U366OgQ"
+    ],
+    "agree": [
+      "CAACAgIAAxkBAAFFH6Vpuseb8R_DEfMVP3cPhr0Qx5S2mQACTQADJHFiGj9If4Mjut6dOgQ"
+    ],
+    "comfort": [
+      "CAACAgIAAxkBAAFFH5dpusdqtf2SVW5q8LXTeFidPR_d4gACQwADJHFiGg0pc5OW40-tOgQ"
+    ],
+    "confused": [
+      "CAACAgIAAxkBAAFFH5FpusdYcGdXC11uAqTnFpni2szovwACRAADJHFiGij_hkATuBouOgQ"
+    ],
+    "cute": [
+      "CAACAgIAAxkBAAFEF2FprB-04zbubwK96NZLKQABqQePHlQAAg0AA8A2TxOk-eH01HiNUzoE"
+    ]
+  },
+  "keyword_to_label": {
+    "恭喜": "celebrate",
+    "好耶": "celebrate",
+    "收到": "agree",
+    "赞同": "agree",
+    "抱歉": "comfort",
+    "无语": "confused",
+    "可爱": "cute",
+    "meow": "cute",
+    "萌": "cute"
+  },
+  "command_to_label": {
+    "yay": "celebrate",
+    "ok": "agree",
+    "sorry": "comfort",
+    "confused": "confused"
+  }
+}

@@ -83,6 +83,20 @@ type Config struct {
 	VolcengineTTSSampleRate  int
 	VolcengineTTSSpeechRate  int
 	VolcengineTTSSendText    bool
+
+	// Sticker settings.
+	StickerEnabled         bool
+	StickerMode            string // off | append | replace | command_only
+	StickerPackName        string
+	StickerRulesPath       string
+	StickerSendProbability float64
+	StickerMaxPerReply     int
+	StickerWithSpeech      bool
+	StickerAllowedChats    map[int64]bool
+	StickerModelEnabled    bool
+	StickerModelBase       string
+	StickerModelKey        string
+	StickerModel           string
 }
 
 func loadConfig() Config {
@@ -134,8 +148,32 @@ func loadConfig() Config {
 		ttsSpeechRate = 100
 	}
 
+	stickerMode := strings.ToLower(strings.TrimSpace(get("STICKER_MODE", "append")))
+	switch stickerMode {
+	case "off", "append", "replace", "command_only":
+	default:
+		stickerMode = "append"
+	}
+
+	stickerSendProbability, err := strconv.ParseFloat(strings.TrimSpace(get("STICKER_SEND_PROBABILITY", "0.25")), 64)
+	if err != nil {
+		stickerSendProbability = 0.25
+	}
+	if stickerSendProbability < 0 {
+		stickerSendProbability = 0
+	}
+	if stickerSendProbability > 1 {
+		stickerSendProbability = 1
+	}
+
+	stickerMaxPerReply, err := strconv.Atoi(get("STICKER_MAX_PER_REPLY", "1"))
+	if err != nil || stickerMaxPerReply <= 0 {
+		stickerMaxPerReply = 1
+	}
+
 	allowedUsers := parseIDList(get("ALLOWED_USERS", ""))
 	allowedGroups := parseIDList(get("ALLOWED_GROUPS", ""))
+	stickerAllowedChats := parseIDList(get("STICKER_ALLOWED_CHATS", ""))
 
 	if len(allowedUsers) > 0 {
 		ids := make([]string, 0, len(allowedUsers))
@@ -195,6 +233,18 @@ func loadConfig() Config {
 		VolcengineTTSSampleRate:  ttsSampleRate,
 		VolcengineTTSSpeechRate:  ttsSpeechRate,
 		VolcengineTTSSendText:    strings.ToLower(get("VOLCENGINE_TTS_SEND_TEXT", "true")) != "false",
+		StickerEnabled:           strings.ToLower(get("STICKER_ENABLED", "false")) == "true",
+		StickerMode:              stickerMode,
+		StickerPackName:          get("STICKER_PACK_NAME", ""),
+		StickerRulesPath:         get("STICKER_RULES_PATH", "./sticker_rules.json"),
+		StickerSendProbability:   stickerSendProbability,
+		StickerMaxPerReply:       stickerMaxPerReply,
+		StickerWithSpeech:        strings.ToLower(get("STICKER_WITH_SPEECH", "true")) != "false",
+		StickerAllowedChats:      stickerAllowedChats,
+		StickerModelEnabled:      strings.ToLower(get("STICKER_MODEL_ENABLED", "false")) == "true",
+		StickerModelBase:         get("STICKER_MODEL_BASE", ""),
+		StickerModelKey:          get("STICKER_MODEL_KEY", ""),
+		StickerModel:             get("STICKER_MODEL", ""),
 	}
 	if err := ensureConfigFileExists(cfg); err != nil {
 		log.Printf("Warning: failed to bootstrap config file %s: %v", effectiveConfigFilePath(cfg), err)
@@ -384,6 +434,8 @@ type Bot struct {
 	profileModel  string         // model name for profile extraction
 	summaryAI     *openai.Client // LLM client for conversation summarisation (may equal ai)
 	summaryModel  string         // model name for conversation summarisation
+	stickerAI     *openai.Client // LLM client for sticker strategy (may equal ai)
+	stickerModel  string         // model name for sticker strategy
 	chatDB        *ChatDB        // persistent chat storage (nil-safe)
 	store         *HistoryStore
 	summaries     *SummaryStore     // per-chat conversation summaries
@@ -394,6 +446,7 @@ type Bot struct {
 	speechModes   *SpeechModeStore
 	adminSessions *AdminConfigSessionStore
 	tts           *VolcengineTTSClient
+	stickers      *StickerEngine
 	tg            *tele.Bot
 }
 
@@ -405,33 +458,10 @@ func NewBot(cfg Config) (*Bot, error) {
 		return nil, fmt.Errorf("OPENAI_API_KEY is not set")
 	}
 
-	// Build OpenAI client with optional custom base URL.
-	aiCfg := openai.DefaultConfig(cfg.OpenAIKey)
-	if cfg.OpenAIBase != "" {
-		aiCfg.BaseURL = cfg.OpenAIBase
-	}
-	aiClient := openai.NewClientWithConfig(aiCfg)
-
-	// Build detector client – falls back to main client if not configured.
-	detectorClient := aiClient
-	detectorModel := cfg.OpenAIModel
-	if cfg.AutoDetectKey != "" || cfg.AutoDetectBase != "" || cfg.AutoDetectModel != "" {
-		detKey := cfg.AutoDetectKey
-		if detKey == "" {
-			detKey = cfg.OpenAIKey
-		}
-		detCfg := openai.DefaultConfig(detKey)
-		detBase := cfg.AutoDetectBase
-		if detBase == "" {
-			detBase = cfg.OpenAIBase
-		}
-		if detBase != "" {
-			detCfg.BaseURL = detBase
-		}
-		detectorClient = openai.NewClientWithConfig(detCfg)
-		if cfg.AutoDetectModel != "" {
-			detectorModel = cfg.AutoDetectModel
-		}
+	aiClient, detectorClient, profileClient, summaryClient, stickerClient,
+		detectorModel, profileModel, summaryModel, stickerModel, err := buildAIResources(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	// Build Telegram bot.
@@ -444,33 +474,12 @@ func NewBot(cfg Config) (*Bot, error) {
 		return nil, fmt.Errorf("failed to create Telegram bot: %w", err)
 	}
 
-	// Optionally initialise user-profile store and its LLM client.
+	// Optionally initialise user-profile store.
 	var profiles *ProfileStore
-	profileClient := aiClient
-	profileModel := cfg.OpenAIModel
 	if cfg.ProfileEnabled {
 		profiles, err = NewProfileStore(cfg.ProfileDBPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to init profile store: %w", err)
-		}
-		// Build profile-extraction LLM client – falls back to main client.
-		if cfg.ProfileKey != "" || cfg.ProfileBase != "" || cfg.ProfileModel != "" {
-			pKey := cfg.ProfileKey
-			if pKey == "" {
-				pKey = cfg.OpenAIKey
-			}
-			pCfg := openai.DefaultConfig(pKey)
-			pBase := cfg.ProfileBase
-			if pBase == "" {
-				pBase = cfg.OpenAIBase
-			}
-			if pBase != "" {
-				pCfg.BaseURL = pBase
-			}
-			profileClient = openai.NewClientWithConfig(pCfg)
-			if cfg.ProfileModel != "" {
-				profileModel = cfg.ProfileModel
-			}
 		}
 		log.Printf("User profile extraction enabled (db: %s, every %d msgs, model: %s)",
 			cfg.ProfileDBPath, cfg.ProfileExtractEvery, profileModel)
@@ -483,28 +492,7 @@ func NewBot(cfg Config) (*Bot, error) {
 	}
 	log.Printf("Persistent chat storage enabled (db: %s)", cfg.ChatDBPath)
 
-	// Build summary LLM client – falls back to main client if not configured.
-	summaryClient := aiClient
-	summaryModel := cfg.OpenAIModel
 	if cfg.SummaryEnabled {
-		if cfg.SummaryKey != "" || cfg.SummaryBase != "" || cfg.SummaryModel != "" {
-			sKey := cfg.SummaryKey
-			if sKey == "" {
-				sKey = cfg.OpenAIKey
-			}
-			sCfg := openai.DefaultConfig(sKey)
-			sBase := cfg.SummaryBase
-			if sBase == "" {
-				sBase = cfg.OpenAIBase
-			}
-			if sBase != "" {
-				sCfg.BaseURL = sBase
-			}
-			summaryClient = openai.NewClientWithConfig(sCfg)
-			if cfg.SummaryModel != "" {
-				summaryModel = cfg.SummaryModel
-			}
-		}
 		log.Printf("Summary enabled (min_overflow: %d, model: %s)", cfg.SummaryMinOverflow, summaryModel)
 	}
 
@@ -546,6 +534,15 @@ func NewBot(cfg Config) (*Bot, error) {
 			ttsClient.resourceID, ttsClient.speaker, ttsClient.audioFormat)
 	}
 
+	stickerEngine, err := NewStickerEngine(cfg.StickerRulesPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init sticker rules: %w", err)
+	}
+	if cfg.StickerEnabled {
+		log.Printf("Sticker strategy enabled (mode: %s, rules: %s, model: %s)",
+			cfg.StickerMode, cfg.StickerRulesPath, stickerModel)
+	}
+
 	return &Bot{
 		cfg:           cfg,
 		ai:            aiClient,
@@ -555,6 +552,8 @@ func NewBot(cfg Config) (*Bot, error) {
 		profileModel:  profileModel,
 		summaryAI:     summaryClient,
 		summaryModel:  summaryModel,
+		stickerAI:     stickerClient,
+		stickerModel:  stickerModel,
 		chatDB:        chatDB,
 		store:         NewHistoryStore(chatDB),
 		summaries:     NewSummaryStore(chatDB),
@@ -565,6 +564,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		speechModes:   NewSpeechModeStore(),
 		adminSessions: NewAdminConfigSessionStore(),
 		tts:           ttsClient,
+		stickers:      stickerEngine,
 		tg:            tgBot,
 	}, nil
 }
@@ -619,6 +619,7 @@ func (b *Bot) Run() {
 	b.tg.Handle("/summary", b.handleSummary)
 	b.tg.Handle("/speach", b.handleSpeechMode)
 	b.tg.Handle("/speech", b.handleSpeechMode)
+	b.tg.Handle("/sticker", b.handleStickerCommand)
 	b.tg.Handle("/clearp", b.handleClearProfile)
 	b.tg.Handle("/displayp", b.handleDisplayProfile)
 	b.tg.Handle("/mcp_list", b.handleMCPList)
@@ -1307,6 +1308,7 @@ func (b *Bot) postReply(
 	}
 
 	b.finalizeSpeechReply(chatID, chat, sender, finalText, placeholder)
+	b.finalizeStickerReply(chatID, chat, userMsg, finalText, placeholder)
 }
 
 // truncate shortens a string for logging purposes.
