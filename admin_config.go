@@ -561,7 +561,7 @@ func (b *Bot) buildAdminListText(cfg Config) string {
 
 func (b *Bot) buildAdminEditPrompt(option configOption, cfg Config) string {
 	return fmt.Sprintf(
-		"✏️ Editing `%s`\n\n📌 Current value: %s\nℹ️ Description: %s\n\n📝 Send the new value directly.\n🧹 To clear a string or list, send `%s`.\n↩️ Tap cancel to go back to the list.",
+		"✏️ Editing: %s\n\n📌 Current value: %s\nℹ️ Description: %s\n\n📝 Send the new value directly.\n🧹 To clear a string or list, send %s.\n↩️ Tap cancel to go back to the list.",
 		option.EnvKey,
 		previewConfigValue(option, cfg),
 		option.Desc,
@@ -644,7 +644,12 @@ func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error)
 	if !ok {
 		return false, nil
 	}
-	defer b.deleteAdminInputMessage(c.Message())
+	shouldDeleteInput := false
+	defer func() {
+		if shouldDeleteInput {
+			b.deleteAdminInputMessage(c.Message())
+		}
+	}()
 
 	switch session.Step {
 	case "select":
@@ -653,6 +658,7 @@ func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error)
 			rendered, renderErr := b.renderAdminPanel(c, session, "🔢 Please send a config item number.\n\n"+b.buildAdminListText(b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
 			if renderErr == nil {
 				b.adminSessions.Set(c.Sender().ID, rendered)
+				shouldDeleteInput = true
 			}
 			return true, renderErr
 		}
@@ -661,14 +667,16 @@ func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error)
 			rendered, renderErr := b.renderAdminPanel(c, session, "❓ Unknown config item number. Please try again.\n\n"+b.buildAdminListText(b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
 			if renderErr == nil {
 				b.adminSessions.Set(c.Sender().ID, rendered)
+				shouldDeleteInput = true
 			}
 			return true, renderErr
 		}
 		session.Step = "edit"
 		session.Selection = number
-		rendered, renderErr := b.renderAdminPanel(c, session, b.buildAdminEditPrompt(option, b.currentConfig()), b.adminSendOptions(tele.ModeMarkdown))
+		rendered, renderErr := b.renderAdminPanel(c, session, b.buildAdminEditPrompt(option, b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
 		if renderErr == nil {
 			b.adminSessions.Set(c.Sender().ID, rendered)
+			shouldDeleteInput = true
 		}
 		return true, renderErr
 
@@ -680,22 +688,25 @@ func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error)
 			rendered, renderErr := b.renderAdminPanel(c, session, "⚠️ That config item no longer exists. Back to the list.\n\n"+b.buildAdminListText(b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
 			if renderErr == nil {
 				b.adminSessions.Set(c.Sender().ID, rendered)
+				shouldDeleteInput = true
 			}
 			return true, renderErr
 		}
 
 		next := b.currentConfig()
 		if err := option.Apply(text, &next); err != nil {
-			rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("❌ Invalid input: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminSendOptions(tele.ModeMarkdown))
+			rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("❌ Invalid input: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminSendOptions(tele.ModeDefault))
 			if renderErr == nil {
 				b.adminSessions.Set(c.Sender().ID, rendered)
+				shouldDeleteInput = true
 			}
 			return true, renderErr
 		}
 		if err := b.applyAndPersistConfig(next); err != nil {
-			rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("❌ Failed to apply config: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminSendOptions(tele.ModeMarkdown))
+			rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("❌ Failed to apply config: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminSendOptions(tele.ModeDefault))
 			if renderErr == nil {
 				b.adminSessions.Set(c.Sender().ID, rendered)
+				shouldDeleteInput = true
 			}
 			return true, renderErr
 		}
@@ -703,9 +714,10 @@ func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error)
 		updated := b.currentConfig()
 		session.Step = "select"
 		session.Selection = 0
-		rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("✅ Updated `%s`\n📌 Current value: %s%s\n\n%s", option.EnvKey, previewConfigValue(option, updated), configOverrideNotice(option.EnvKey), b.buildAdminListText(updated)), b.adminSendOptions(tele.ModeMarkdown))
+		rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("✅ Updated: %s\n📌 Current value: %s%s\n\n%s", option.EnvKey, previewConfigValue(option, updated), configOverrideNotice(option.EnvKey), b.buildAdminListText(updated)), b.adminSendOptions(tele.ModeDefault))
 		if renderErr == nil {
 			b.adminSessions.Set(c.Sender().ID, rendered)
+			shouldDeleteInput = true
 		}
 		return true, renderErr
 	}
