@@ -11,7 +11,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/llm_telebot .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/llm_telebot ./cmd/llm_telebot
 
 # ─── Stage 2: Runtime ─────────────────────────────────────────────────────────
 # Use Node.js base so npx/node-based MCP servers work out of the box.

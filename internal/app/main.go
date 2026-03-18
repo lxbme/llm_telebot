@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -1338,7 +1338,7 @@ func (b *Bot) editOrLog(msg *tele.Message, text string) {
 
 // ─── Entry Point ──────────────────────────────────────────────────────────────
 
-func main() {
+func Run() {
 	cfg := loadConfig()
 
 	bot, err := NewBot(cfg)

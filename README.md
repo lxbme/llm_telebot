@@ -52,7 +52,7 @@ cp .env.example .env
 # 编辑 ./data/config.yaml / ./data/sticker_rules.json / .env
 
 # 运行
-CONFIG_FILE=./data/config.yaml go run .
+CONFIG_FILE=./data/config.yaml go run ./cmd/llm_telebot
 ```
 
 ### 使用预构建镜像部署（推荐）
@@ -141,7 +141,7 @@ podman run --env-file .env -v "$(pwd)/data:/app/data" ghcr.io/lxbme/llm_telebot:
 
 ### 配置文件位置
 
-- 本地直接运行时，若未设置 `CONFIG_FILE`，默认配置文件路径为 `./data/config.yaml`（代码常量：`DefaultConfigFilePath`，定义于 `config_file.go`）
+- 本地直接运行时，若未设置 `CONFIG_FILE`，默认配置文件路径为 `./data/config.yaml`（代码常量：`DefaultConfigFilePath`，定义于 `internal/app/config_file.go`）
 - 容器镜像内默认配置文件路径为 `/app/data/config.yaml`
 - 推荐通过环境变量 `CONFIG_FILE=./data/config.yaml` 统一本地与容器路径
 

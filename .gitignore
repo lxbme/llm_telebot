@@ -1,5 +1,5 @@
 .env
 config.yaml
-llm_telebot
+/llm_telebot
 data
 mcp_config.json
