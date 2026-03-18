@@ -25,6 +25,7 @@ RUN apk add --no-cache ca-certificates tzdata ffmpeg \
 
 # Ensure pipx bin dir is in PATH
 ENV PATH="/root/.local/bin:${PATH}"
+ENV CONFIG_FILE=/app/data/config.yaml
 
 WORKDIR /app
 

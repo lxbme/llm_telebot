@@ -5,13 +5,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/joho/godotenv"
 	openai "github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
 )
@@ -19,6 +17,8 @@ import (
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 type Config struct {
+	ConfigFilePath string
+
 	OpenAIBase     string
 	OpenAIKey      string
 	OpenAIModel    string
@@ -86,48 +86,47 @@ type Config struct {
 }
 
 func loadConfig() Config {
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, reading from environment")
-	}
+	source := loadConfigValues()
+	get := source.Get
 
-	maxMsgs, err := strconv.Atoi(getEnv("CONTEXT_MAX_MESSAGES", "20"))
+	maxMsgs, err := strconv.Atoi(get("CONTEXT_MAX_MESSAGES", "20"))
 	if err != nil || maxMsgs <= 0 {
 		maxMsgs = 20
 	}
 
-	maxTokens, err := strconv.Atoi(getEnv("MAX_TOKENS", "0"))
+	maxTokens, err := strconv.Atoi(get("MAX_TOKENS", "0"))
 	if err != nil || maxTokens < 0 {
 		maxTokens = 0
 	}
 
-	contextMode := strings.ToLower(getEnv("CONTEXT_MODE", "at"))
+	contextMode := strings.ToLower(get("CONTEXT_MODE", "at"))
 	if contextMode != "at" && contextMode != "global" {
 		contextMode = "at"
 	}
 
-	autoDetect := strings.ToLower(getEnv("AUTO_DETECT", "false")) == "true"
+	autoDetect := strings.ToLower(get("AUTO_DETECT", "false")) == "true"
 
-	profileExtractEvery, _ := strconv.Atoi(getEnv("PROFILE_EXTRACT_EVERY", "3"))
+	profileExtractEvery, _ := strconv.Atoi(get("PROFILE_EXTRACT_EVERY", "3"))
 	if profileExtractEvery <= 0 {
 		profileExtractEvery = 3
 	}
 
-	summaryMinOverflow, _ := strconv.Atoi(getEnv("SUMMARY_MIN_OVERFLOW", "6"))
+	summaryMinOverflow, _ := strconv.Atoi(get("SUMMARY_MIN_OVERFLOW", "6"))
 	if summaryMinOverflow <= 0 {
 		summaryMinOverflow = 6
 	}
 
-	toolsMaxIter, _ := strconv.Atoi(getEnv("TOOLS_MAX_ITERATIONS", "5"))
+	toolsMaxIter, _ := strconv.Atoi(get("TOOLS_MAX_ITERATIONS", "5"))
 	if toolsMaxIter <= 0 {
 		toolsMaxIter = 5
 	}
 
-	ttsSampleRate, _ := strconv.Atoi(getEnv("VOLCENGINE_TTS_SAMPLE_RATE", strconv.Itoa(defaultTTSSampleRate)))
+	ttsSampleRate, _ := strconv.Atoi(get("VOLCENGINE_TTS_SAMPLE_RATE", strconv.Itoa(defaultTTSSampleRate)))
 	if ttsSampleRate <= 0 {
 		ttsSampleRate = defaultTTSSampleRate
 	}
 
-	ttsSpeechRate, _ := strconv.Atoi(getEnv("VOLCENGINE_TTS_SPEECH_RATE", "0"))
+	ttsSpeechRate, _ := strconv.Atoi(get("VOLCENGINE_TTS_SPEECH_RATE", "0"))
 	if ttsSpeechRate < -50 {
 		ttsSpeechRate = -50
 	}
@@ -135,8 +134,8 @@ func loadConfig() Config {
 		ttsSpeechRate = 100
 	}
 
-	allowedUsers := parseIDList(getEnv("ALLOWED_USERS", ""))
-	allowedGroups := parseIDList(getEnv("ALLOWED_GROUPS", ""))
+	allowedUsers := parseIDList(get("ALLOWED_USERS", ""))
+	allowedGroups := parseIDList(get("ALLOWED_GROUPS", ""))
 
 	if len(allowedUsers) > 0 {
 		ids := make([]string, 0, len(allowedUsers))
@@ -153,56 +152,54 @@ func loadConfig() Config {
 		log.Printf("Access control: ALLOWED_GROUPS = %v", ids)
 	}
 
-	return Config{
-		OpenAIBase:               getEnv("OPENAI_API_BASE", ""),
-		OpenAIKey:                getEnv("OPENAI_API_KEY", ""),
-		OpenAIModel:              getEnv("OPENAI_MODEL", "gpt-4o"),
-		TelegramToken:            getEnv("TELEGRAM_BOT_TOKEN", ""),
-		SystemPrompt:             getEnv("SYSTEM_PROMPT", "You are a helpful assistant."),
+	cfg := Config{
+		ConfigFilePath:           source.filePath,
+		OpenAIBase:               get("OPENAI_API_BASE", ""),
+		OpenAIKey:                get("OPENAI_API_KEY", ""),
+		OpenAIModel:              get("OPENAI_MODEL", "gpt-4o"),
+		TelegramToken:            get("TELEGRAM_BOT_TOKEN", ""),
+		SystemPrompt:             get("SYSTEM_PROMPT", "You are a helpful assistant."),
 		ContextMaxMsgs:           maxMsgs,
 		MaxTokens:                maxTokens,
-		BotUsername:              getEnv("BOT_USERNAME", ""),
+		BotUsername:              get("BOT_USERNAME", ""),
 		ContextMode:              contextMode,
 		AutoDetect:               autoDetect,
-		AutoDetectBase:           getEnv("AUTO_DETECT_API_BASE", ""),
-		AutoDetectKey:            getEnv("AUTO_DETECT_API_KEY", ""),
-		AutoDetectModel:          getEnv("AUTO_DETECT_MODEL", ""),
+		AutoDetectBase:           get("AUTO_DETECT_API_BASE", ""),
+		AutoDetectKey:            get("AUTO_DETECT_API_KEY", ""),
+		AutoDetectModel:          get("AUTO_DETECT_MODEL", ""),
 		AllowedUsers:             allowedUsers,
 		AllowedGroups:            allowedGroups,
-		ProfileEnabled:           strings.ToLower(getEnv("PROFILE_ENABLED", "true")) == "true",
-		ProfileDBPath:            getEnv("PROFILE_DB_PATH", "./data/profiles.db"),
+		ProfileEnabled:           strings.ToLower(get("PROFILE_ENABLED", "true")) == "true",
+		ProfileDBPath:            get("PROFILE_DB_PATH", "./data/profiles.db"),
 		ProfileExtractEvery:      profileExtractEvery,
-		ProfileBase:              getEnv("PROFILE_API_BASE", ""),
-		ProfileKey:               getEnv("PROFILE_API_KEY", ""),
-		ProfileModel:             getEnv("PROFILE_MODEL", ""),
-		SummaryEnabled:           strings.ToLower(getEnv("SUMMARY_ENABLED", "true")) == "true",
+		ProfileBase:              get("PROFILE_API_BASE", ""),
+		ProfileKey:               get("PROFILE_API_KEY", ""),
+		ProfileModel:             get("PROFILE_MODEL", ""),
+		SummaryEnabled:           strings.ToLower(get("SUMMARY_ENABLED", "true")) == "true",
 		SummaryMinOverflow:       summaryMinOverflow,
-		SummaryBase:              getEnv("SUMMARY_API_BASE", ""),
-		SummaryKey:               getEnv("SUMMARY_API_KEY", ""),
-		SummaryModel:             getEnv("SUMMARY_MODEL", ""),
-		ChatDBPath:               getEnv("CHAT_DB_PATH", "./data/chat.db"),
-		ToolsEnabled:             strings.ToLower(getEnv("TOOLS_ENABLED", "false")) == "true",
+		SummaryBase:              get("SUMMARY_API_BASE", ""),
+		SummaryKey:               get("SUMMARY_API_KEY", ""),
+		SummaryModel:             get("SUMMARY_MODEL", ""),
+		ChatDBPath:               get("CHAT_DB_PATH", "./data/chat.db"),
+		ToolsEnabled:             strings.ToLower(get("TOOLS_ENABLED", "false")) == "true",
 		ToolsMaxIterations:       toolsMaxIter,
-		MCPConfigPath:            getEnv("MCP_CONFIG_PATH", ""),
-		UserMCPDBPath:            getEnv("USER_MCP_DB_PATH", "./data/user_mcp.db"),
-		AdminIDs:                 parseIDList(getEnv("ADMIN_ID", "")),
-		AdminAll:                 strings.TrimSpace(getEnv("ADMIN_ID", "")) == "*",
-		VolcengineTTSAppID:       getEnv("VOLCENGINE_TTS_APP_ID", ""),
-		VolcengineTTSAccessKey:   getEnv("VOLCENGINE_TTS_ACCESS_KEY", ""),
-		VolcengineTTSResourceID:  getEnv("VOLCENGINE_TTS_RESOURCE_ID", defaultTTSResourceID),
-		VolcengineTTSSpeaker:     getEnv("VOLCENGINE_TTS_SPEAKER", defaultTTSSpeaker),
-		VolcengineTTSAudioFormat: getEnv("VOLCENGINE_TTS_AUDIO_FORMAT", defaultTTSAudioFormat),
+		MCPConfigPath:            get("MCP_CONFIG_PATH", ""),
+		UserMCPDBPath:            get("USER_MCP_DB_PATH", "./data/user_mcp.db"),
+		AdminIDs:                 parseIDList(get("ADMIN_ID", "")),
+		AdminAll:                 strings.TrimSpace(get("ADMIN_ID", "")) == "*",
+		VolcengineTTSAppID:       get("VOLCENGINE_TTS_APP_ID", ""),
+		VolcengineTTSAccessKey:   get("VOLCENGINE_TTS_ACCESS_KEY", ""),
+		VolcengineTTSResourceID:  get("VOLCENGINE_TTS_RESOURCE_ID", defaultTTSResourceID),
+		VolcengineTTSSpeaker:     get("VOLCENGINE_TTS_SPEAKER", defaultTTSSpeaker),
+		VolcengineTTSAudioFormat: get("VOLCENGINE_TTS_AUDIO_FORMAT", defaultTTSAudioFormat),
 		VolcengineTTSSampleRate:  ttsSampleRate,
 		VolcengineTTSSpeechRate:  ttsSpeechRate,
-		VolcengineTTSSendText:    strings.ToLower(getEnv("VOLCENGINE_TTS_SEND_TEXT", "true")) != "false",
+		VolcengineTTSSendText:    strings.ToLower(get("VOLCENGINE_TTS_SEND_TEXT", "true")) != "false",
 	}
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if err := ensureConfigFileExists(cfg); err != nil {
+		log.Printf("Warning: failed to bootstrap config file %s: %v", effectiveConfigFilePath(cfg), err)
 	}
-	return fallback
+	return cfg
 }
 
 // parseIDList parses a comma-separated string of int64 IDs into a set.

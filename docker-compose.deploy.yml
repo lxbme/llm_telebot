@@ -9,6 +9,7 @@ services:
       - ./data:/app/data
       - ./mcp_config.json:/app/mcp_config.json:ro
     environment:
+      CONFIG_FILE: /app/data/config.yaml
       CHAT_DB_PATH: /app/data/chat.db
       PROFILE_DB_PATH: /app/data/profiles.db
       USER_MCP_DB_PATH: /app/data/user_mcp.db

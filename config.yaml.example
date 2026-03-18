@@ -1,0 +1,65 @@
+# 主配置文件示例。
+# 推荐将大部分可热修改配置放在这里，通过 /admin 修改时也会写回本文件。
+# 启动时环境变量会覆盖同名配置，因此 .env 更适合只放密钥或临时 override。
+
+# ── OpenAI / Compatible API ───────────────────────────────────────────────────
+OPENAI_API_BASE: https://api.openai.com/v1
+OPENAI_API_KEY: sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_MODEL: gpt-4o
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN: 1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+BOT_USERNAME: "@mybot"
+
+# ── Behaviour ─────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT: |
+  You are a helpful, concise, and friendly AI assistant.
+CONTEXT_MAX_MESSAGES: 20
+MAX_TOKENS: 0
+CONTEXT_MODE: at
+AUTO_DETECT: false
+
+# ── Auto-Detect Model (optional) ──────────────────────────────────────────────
+AUTO_DETECT_API_BASE: ""
+AUTO_DETECT_API_KEY: ""
+AUTO_DETECT_MODEL: ""
+
+# ── Access Control ────────────────────────────────────────────────────────────
+# 逗号分隔的 Telegram ID；留空表示不限制。
+ALLOWED_USERS: ""
+ALLOWED_GROUPS: ""
+ADMIN_ID: ""
+
+# ── User Profile Extraction ───────────────────────────────────────────────────
+PROFILE_ENABLED: true
+PROFILE_DB_PATH: ./data/profiles.db
+PROFILE_EXTRACT_EVERY: 3
+PROFILE_API_BASE: ""
+PROFILE_API_KEY: ""
+PROFILE_MODEL: ""
+
+# ── Conversation Summary ──────────────────────────────────────────────────────
+SUMMARY_ENABLED: true
+SUMMARY_MIN_OVERFLOW: 6
+SUMMARY_API_BASE: ""
+SUMMARY_API_KEY: ""
+SUMMARY_MODEL: ""
+
+# ── Tool Calling (MCP) ────────────────────────────────────────────────────────
+TOOLS_ENABLED: false
+TOOLS_MAX_ITERATIONS: 5
+MCP_CONFIG_PATH: ./mcp_config.json
+USER_MCP_DB_PATH: ./data/user_mcp.db
+
+# ── Persistent Chat Storage ───────────────────────────────────────────────────
+CHAT_DB_PATH: ./data/chat.db
+
+# ── Volcengine TTS ────────────────────────────────────────────────────────────
+VOLCENGINE_TTS_APP_ID: ""
+VOLCENGINE_TTS_ACCESS_KEY: ""
+VOLCENGINE_TTS_RESOURCE_ID: seed-tts-1.0
+VOLCENGINE_TTS_SPEAKER: zh_female_shuangkuaisisi_moon_bigtts
+VOLCENGINE_TTS_AUDIO_FORMAT: mp3
+VOLCENGINE_TTS_SAMPLE_RATE: 24000
+VOLCENGINE_TTS_SPEECH_RATE: 0
+VOLCENGINE_TTS_SEND_TEXT: true

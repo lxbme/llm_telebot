@@ -113,59 +113,59 @@ func (b *Bot) currentConfig() Config {
 
 func allConfigOptions() []configOption {
 	return []configOption{
-		stringOption(1, "OPENAI_API_BASE", "主 OpenAI Base URL，留空表示官方默认地址。", false,
+		stringOption(1, "OPENAI_API_BASE", "Primary OpenAI-compatible base URL. Leave empty to use the official default.", false,
 			func(cfg Config) string { return cfg.OpenAIBase },
 			func(cfg *Config, v string) { cfg.OpenAIBase = v }),
-		stringOption(2, "OPENAI_API_KEY", "主 OpenAI API Key。", true,
+		stringOption(2, "OPENAI_API_KEY", "Primary OpenAI API key.", true,
 			func(cfg Config) string { return cfg.OpenAIKey },
 			func(cfg *Config, v string) { cfg.OpenAIKey = v }),
-		stringOption(3, "OPENAI_MODEL", "主对话模型名称。", false,
+		stringOption(3, "OPENAI_MODEL", "Primary chat model name.", false,
 			func(cfg Config) string { return cfg.OpenAIModel },
 			func(cfg *Config, v string) { cfg.OpenAIModel = v }),
-		stringOption(4, "TELEGRAM_BOT_TOKEN", "Telegram Bot Token。更新后会写入运行时配置，但轮询连接仍建议手动重启进程后完全生效。", true,
+		stringOption(4, "TELEGRAM_BOT_TOKEN", "Telegram bot token. Runtime config is updated immediately, but a process restart is still recommended for polling to fully rebind.", true,
 			func(cfg Config) string { return cfg.TelegramToken },
 			func(cfg *Config, v string) { cfg.TelegramToken = v }),
-		stringOption(5, "SYSTEM_PROMPT", "主系统提示词，可多行。", false,
+		stringOption(5, "SYSTEM_PROMPT", "Main system prompt. Multiline input is supported.", false,
 			func(cfg Config) string { return cfg.SystemPrompt },
 			func(cfg *Config, v string) { cfg.SystemPrompt = v }),
-		intOption(6, "CONTEXT_MAX_MESSAGES", "上下文窗口保留的消息数，必须大于 0。", false,
+		intOption(6, "CONTEXT_MAX_MESSAGES", "How many messages the sliding context window keeps. Must be greater than 0.", false,
 			func(cfg Config) int { return cfg.ContextMaxMsgs },
 			func(cfg *Config, v int) { cfg.ContextMaxMsgs = v },
 			func(v int) error {
 				if v <= 0 {
-					return fmt.Errorf("必须大于 0")
+					return fmt.Errorf("must be greater than 0")
 				}
 				return nil
 			}),
-		intOption(7, "MAX_TOKENS", "OpenAI 最大输出 token，0 表示不限制。", false,
+		intOption(7, "MAX_TOKENS", "Maximum output tokens for OpenAI requests. Use 0 for no limit.", false,
 			func(cfg Config) int { return cfg.MaxTokens },
 			func(cfg *Config, v int) { cfg.MaxTokens = v },
 			func(v int) error {
 				if v < 0 {
-					return fmt.Errorf("不能小于 0")
+					return fmt.Errorf("cannot be less than 0")
 				}
 				return nil
 			}),
-		stringOption(8, "BOT_USERNAME", "机器人用户名，通常带 @。留空时自动使用当前 Bot 用户名。", false,
+		stringOption(8, "BOT_USERNAME", "Bot username, usually with @. Leave empty to auto-use the current Telegram bot username.", false,
 			func(cfg Config) string { return cfg.BotUsername },
 			func(cfg *Config, v string) { cfg.BotUsername = v }),
-		enumOption(9, "CONTEXT_MODE", "群聊上下文模式：at 或 global。", false,
+		enumOption(9, "CONTEXT_MODE", "Group context mode: at or global.", false,
 			func(cfg Config) string { return cfg.ContextMode },
 			func(cfg *Config, v string) { cfg.ContextMode = v },
 			map[string]string{"at": "at", "global": "global"}),
-		boolOption(10, "AUTO_DETECT", "是否启用群聊自动相关性判断。可输入 true/false、on/off、1/0。", false,
+		boolOption(10, "AUTO_DETECT", "Enable automatic relevance detection in groups. Accepts true/false, on/off, or 1/0.", false,
 			func(cfg Config) bool { return cfg.AutoDetect },
 			func(cfg *Config, v bool) { cfg.AutoDetect = v }),
-		stringOption(11, "AUTO_DETECT_API_BASE", "自动判定模型的 Base URL，留空则回退到主配置。", false,
+		stringOption(11, "AUTO_DETECT_API_BASE", "Base URL for the auto-detect model. Leave empty to fall back to the primary config.", false,
 			func(cfg Config) string { return cfg.AutoDetectBase },
 			func(cfg *Config, v string) { cfg.AutoDetectBase = v }),
-		stringOption(12, "AUTO_DETECT_API_KEY", "自动判定模型的 API Key，留空则回退到主配置。", true,
+		stringOption(12, "AUTO_DETECT_API_KEY", "API key for the auto-detect model. Leave empty to fall back to the primary config.", true,
 			func(cfg Config) string { return cfg.AutoDetectKey },
 			func(cfg *Config, v string) { cfg.AutoDetectKey = v }),
-		stringOption(13, "AUTO_DETECT_MODEL", "自动判定模型名称，留空则回退到主模型。", false,
+		stringOption(13, "AUTO_DETECT_MODEL", "Model name for auto-detect. Leave empty to fall back to the primary model.", false,
 			func(cfg Config) string { return cfg.AutoDetectModel },
 			func(cfg *Config, v string) { cfg.AutoDetectModel = v }),
-		customOption(14, "ALLOWED_USERS", "允许私聊访问机器人的用户 ID 列表，逗号分隔；可用 <empty> 清空。", false,
+		customOption(14, "ALLOWED_USERS", "Comma-separated Telegram user IDs allowed to access the bot in private chats. Use <empty> to clear.", false,
 			func(cfg Config) string { return formatIDSet(cfg.AllowedUsers) },
 			func(input string, cfg *Config) error {
 				ids, err := parseIDListStrict(strings.TrimSpace(input))
@@ -175,7 +175,7 @@ func allConfigOptions() []configOption {
 				cfg.AllowedUsers = ids
 				return nil
 			}),
-		customOption(15, "ALLOWED_GROUPS", "允许群聊访问机器人的群组 ID 列表，逗号分隔；可用 <empty> 清空。", false,
+		customOption(15, "ALLOWED_GROUPS", "Comma-separated Telegram group IDs allowed to access the bot. Use <empty> to clear.", false,
 			func(cfg Config) string { return formatIDSet(cfg.AllowedGroups) },
 			func(input string, cfg *Config) error {
 				ids, err := parseIDListStrict(strings.TrimSpace(input))
@@ -185,73 +185,73 @@ func allConfigOptions() []configOption {
 				cfg.AllowedGroups = ids
 				return nil
 			}),
-		boolOption(16, "PROFILE_ENABLED", "是否启用用户画像抽取。", false,
+		boolOption(16, "PROFILE_ENABLED", "Enable user profile extraction.", false,
 			func(cfg Config) bool { return cfg.ProfileEnabled },
 			func(cfg *Config, v bool) { cfg.ProfileEnabled = v }),
-		stringOption(17, "PROFILE_DB_PATH", "用户画像数据库路径。", false,
+		stringOption(17, "PROFILE_DB_PATH", "Path to the user profile database.", false,
 			func(cfg Config) string { return cfg.ProfileDBPath },
 			func(cfg *Config, v string) { cfg.ProfileDBPath = v }),
-		intOption(18, "PROFILE_EXTRACT_EVERY", "每 N 次回复触发一次画像抽取，必须大于 0。", false,
+		intOption(18, "PROFILE_EXTRACT_EVERY", "Run profile extraction every N bot replies. Must be greater than 0.", false,
 			func(cfg Config) int { return cfg.ProfileExtractEvery },
 			func(cfg *Config, v int) { cfg.ProfileExtractEvery = v },
 			func(v int) error {
 				if v <= 0 {
-					return fmt.Errorf("必须大于 0")
+					return fmt.Errorf("must be greater than 0")
 				}
 				return nil
 			}),
-		stringOption(19, "PROFILE_API_BASE", "画像抽取模型的 Base URL，留空则回退到主配置。", false,
+		stringOption(19, "PROFILE_API_BASE", "Base URL for the profile model. Leave empty to fall back to the primary config.", false,
 			func(cfg Config) string { return cfg.ProfileBase },
 			func(cfg *Config, v string) { cfg.ProfileBase = v }),
-		stringOption(20, "PROFILE_API_KEY", "画像抽取模型的 API Key，留空则回退到主配置。", true,
+		stringOption(20, "PROFILE_API_KEY", "API key for the profile model. Leave empty to fall back to the primary config.", true,
 			func(cfg Config) string { return cfg.ProfileKey },
 			func(cfg *Config, v string) { cfg.ProfileKey = v }),
-		stringOption(21, "PROFILE_MODEL", "画像抽取模型名称，留空则回退到主模型。", false,
+		stringOption(21, "PROFILE_MODEL", "Model name for profile extraction. Leave empty to fall back to the primary model.", false,
 			func(cfg Config) string { return cfg.ProfileModel },
 			func(cfg *Config, v string) { cfg.ProfileModel = v }),
-		boolOption(22, "SUMMARY_ENABLED", "是否启用对话摘要。", false,
+		boolOption(22, "SUMMARY_ENABLED", "Enable conversation summaries.", false,
 			func(cfg Config) bool { return cfg.SummaryEnabled },
 			func(cfg *Config, v bool) { cfg.SummaryEnabled = v }),
-		intOption(23, "SUMMARY_MIN_OVERFLOW", "累计多少条溢出消息后触发摘要，必须大于 0。", false,
+		intOption(23, "SUMMARY_MIN_OVERFLOW", "How many overflow messages must accumulate before summarization runs. Must be greater than 0.", false,
 			func(cfg Config) int { return cfg.SummaryMinOverflow },
 			func(cfg *Config, v int) { cfg.SummaryMinOverflow = v },
 			func(v int) error {
 				if v <= 0 {
-					return fmt.Errorf("必须大于 0")
+					return fmt.Errorf("must be greater than 0")
 				}
 				return nil
 			}),
-		stringOption(24, "SUMMARY_API_BASE", "摘要模型的 Base URL，留空则回退到主配置。", false,
+		stringOption(24, "SUMMARY_API_BASE", "Base URL for the summary model. Leave empty to fall back to the primary config.", false,
 			func(cfg Config) string { return cfg.SummaryBase },
 			func(cfg *Config, v string) { cfg.SummaryBase = v }),
-		stringOption(25, "SUMMARY_API_KEY", "摘要模型的 API Key，留空则回退到主配置。", true,
+		stringOption(25, "SUMMARY_API_KEY", "API key for the summary model. Leave empty to fall back to the primary config.", true,
 			func(cfg Config) string { return cfg.SummaryKey },
 			func(cfg *Config, v string) { cfg.SummaryKey = v }),
-		stringOption(26, "SUMMARY_MODEL", "摘要模型名称，留空则回退到主模型。", false,
+		stringOption(26, "SUMMARY_MODEL", "Model name for summarization. Leave empty to fall back to the primary model.", false,
 			func(cfg Config) string { return cfg.SummaryModel },
 			func(cfg *Config, v string) { cfg.SummaryModel = v }),
-		stringOption(27, "CHAT_DB_PATH", "聊天历史与摘要数据库路径。", false,
+		stringOption(27, "CHAT_DB_PATH", "Path to the persistent chat database.", false,
 			func(cfg Config) string { return cfg.ChatDBPath },
 			func(cfg *Config, v string) { cfg.ChatDBPath = v }),
-		boolOption(28, "TOOLS_ENABLED", "是否启用 MCP/Tool Calling。", false,
+		boolOption(28, "TOOLS_ENABLED", "Enable MCP / tool calling.", false,
 			func(cfg Config) bool { return cfg.ToolsEnabled },
 			func(cfg *Config, v bool) { cfg.ToolsEnabled = v }),
-		intOption(29, "TOOLS_MAX_ITERATIONS", "单次请求最大工具调用轮数，必须大于 0。", false,
+		intOption(29, "TOOLS_MAX_ITERATIONS", "Maximum tool-call rounds per request. Must be greater than 0.", false,
 			func(cfg Config) int { return cfg.ToolsMaxIterations },
 			func(cfg *Config, v int) { cfg.ToolsMaxIterations = v },
 			func(v int) error {
 				if v <= 0 {
-					return fmt.Errorf("必须大于 0")
+					return fmt.Errorf("must be greater than 0")
 				}
 				return nil
 			}),
-		stringOption(30, "MCP_CONFIG_PATH", "全局 MCP 配置文件路径，可用 <empty> 清空。", false,
+		stringOption(30, "MCP_CONFIG_PATH", "Path to the global MCP config file. Use <empty> to clear it.", false,
 			func(cfg Config) string { return cfg.MCPConfigPath },
 			func(cfg *Config, v string) { cfg.MCPConfigPath = v }),
-		stringOption(31, "USER_MCP_DB_PATH", "用户个人 MCP 配置数据库路径。", false,
+		stringOption(31, "USER_MCP_DB_PATH", "Path to the per-user MCP database.", false,
 			func(cfg Config) string { return cfg.UserMCPDBPath },
 			func(cfg *Config, v string) { cfg.UserMCPDBPath = v }),
-		customOption(32, "ADMIN_ID", "管理员用户 ID 列表，逗号分隔；输入 * 表示所有人；可用 <empty> 清空。", false,
+		customOption(32, "ADMIN_ID", "Comma-separated admin Telegram user IDs. Use * to allow everyone, or <empty> to clear.", false,
 			func(cfg Config) string {
 				if cfg.AdminAll {
 					return "*"
@@ -272,41 +272,41 @@ func allConfigOptions() []configOption {
 				cfg.AdminIDs = ids
 				return nil
 			}),
-		stringOption(33, "VOLCENGINE_TTS_APP_ID", "火山 TTS App ID。", false,
+		stringOption(33, "VOLCENGINE_TTS_APP_ID", "Volcengine TTS App ID.", false,
 			func(cfg Config) string { return cfg.VolcengineTTSAppID },
 			func(cfg *Config, v string) { cfg.VolcengineTTSAppID = v }),
-		stringOption(34, "VOLCENGINE_TTS_ACCESS_KEY", "火山 TTS Access Key。", true,
+		stringOption(34, "VOLCENGINE_TTS_ACCESS_KEY", "Volcengine TTS access key.", true,
 			func(cfg Config) string { return cfg.VolcengineTTSAccessKey },
 			func(cfg *Config, v string) { cfg.VolcengineTTSAccessKey = v }),
-		stringOption(35, "VOLCENGINE_TTS_RESOURCE_ID", "火山 TTS Resource ID。", false,
+		stringOption(35, "VOLCENGINE_TTS_RESOURCE_ID", "Volcengine TTS resource ID.", false,
 			func(cfg Config) string { return cfg.VolcengineTTSResourceID },
 			func(cfg *Config, v string) { cfg.VolcengineTTSResourceID = v }),
-		stringOption(36, "VOLCENGINE_TTS_SPEAKER", "火山 TTS 音色。", false,
+		stringOption(36, "VOLCENGINE_TTS_SPEAKER", "Volcengine TTS speaker/voice ID.", false,
 			func(cfg Config) string { return cfg.VolcengineTTSSpeaker },
 			func(cfg *Config, v string) { cfg.VolcengineTTSSpeaker = v }),
-		enumOption(37, "VOLCENGINE_TTS_AUDIO_FORMAT", "火山 TTS 音频格式：mp3、wav、aac。", false,
+		enumOption(37, "VOLCENGINE_TTS_AUDIO_FORMAT", "Volcengine TTS audio format: mp3, wav, or aac.", false,
 			func(cfg Config) string { return cfg.VolcengineTTSAudioFormat },
 			func(cfg *Config, v string) { cfg.VolcengineTTSAudioFormat = v },
 			map[string]string{"mp3": "mp3", "wav": "wav", "aac": "aac"}),
-		intOption(38, "VOLCENGINE_TTS_SAMPLE_RATE", "火山 TTS 采样率，必须大于 0。", false,
+		intOption(38, "VOLCENGINE_TTS_SAMPLE_RATE", "Volcengine TTS sample rate. Must be greater than 0.", false,
 			func(cfg Config) int { return cfg.VolcengineTTSSampleRate },
 			func(cfg *Config, v int) { cfg.VolcengineTTSSampleRate = v },
 			func(v int) error {
 				if v <= 0 {
-					return fmt.Errorf("必须大于 0")
+					return fmt.Errorf("must be greater than 0")
 				}
 				return nil
 			}),
-		intOption(39, "VOLCENGINE_TTS_SPEECH_RATE", "火山 TTS 语速，范围 -50 到 100。", false,
+		intOption(39, "VOLCENGINE_TTS_SPEECH_RATE", "Volcengine TTS speech rate. Must be between -50 and 100.", false,
 			func(cfg Config) int { return cfg.VolcengineTTSSpeechRate },
 			func(cfg *Config, v int) { cfg.VolcengineTTSSpeechRate = v },
 			func(v int) error {
 				if v < -50 || v > 100 {
-					return fmt.Errorf("必须在 -50 到 100 之间")
+					return fmt.Errorf("must be between -50 and 100")
 				}
 				return nil
 			}),
-		boolOption(40, "VOLCENGINE_TTS_SEND_TEXT", "语音模式下是否同时发送文本。", false,
+		boolOption(40, "VOLCENGINE_TTS_SEND_TEXT", "Whether speech mode should also send the text reply.", false,
 			func(cfg Config) bool { return cfg.VolcengineTTSSendText },
 			func(cfg *Config, v bool) { cfg.VolcengineTTSSendText = v }),
 	}
@@ -317,11 +317,11 @@ func stringOption(number int, envKey, desc string, sensitive bool, getter func(C
 		value := normalizeConfigTextInput(input)
 		if envKey == "OPENAI_API_KEY" || envKey == "OPENAI_MODEL" || envKey == "CHAT_DB_PATH" || envKey == "USER_MCP_DB_PATH" {
 			if value == "" {
-				return fmt.Errorf("不能为空")
+				return fmt.Errorf("cannot be empty")
 			}
 		}
 		if envKey == "PROFILE_DB_PATH" && cfg.ProfileEnabled && value == "" {
-			return fmt.Errorf("不能为空")
+			return fmt.Errorf("cannot be empty")
 		}
 		setter(cfg, value)
 		return nil
@@ -348,7 +348,7 @@ func intOption(number int, envKey, desc string, sensitive bool, getter func(Conf
 			value := normalizeConfigTextInput(input)
 			n, err := strconv.Atoi(value)
 			if err != nil {
-				return fmt.Errorf("请输入整数")
+				return fmt.Errorf("please enter an integer")
 			}
 			if err := validate(n); err != nil {
 				return err
@@ -368,7 +368,7 @@ func enumOption(number int, envKey, desc string, sensitive bool, getter func(Con
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
-			return fmt.Errorf("仅支持：%s", strings.Join(keys, ", "))
+			return fmt.Errorf("allowed values: %s", strings.Join(keys, ", "))
 		}
 		setter(cfg, normalized)
 		return nil
@@ -403,11 +403,11 @@ func parseIDListStrict(raw string) (map[int64]bool, error) {
 	for _, part := range strings.Split(raw, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
-			return nil, fmt.Errorf("ID 列表中不能出现空项")
+			return nil, fmt.Errorf("the ID list cannot contain empty items")
 		}
 		id, err := strconv.ParseInt(part, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("无效 ID: %q", part)
+			return nil, fmt.Errorf("invalid ID: %q", part)
 		}
 		set[id] = true
 	}
@@ -421,7 +421,7 @@ func parseFlexibleBool(raw string) (bool, error) {
 	case "0", "false", "off", "no", "n", "disable", "disabled", "关闭", "关":
 		return false, nil
 	default:
-		return false, fmt.Errorf("请输入 true/false、on/off 或 1/0")
+		return false, fmt.Errorf("please enter true/false, on/off, or 1/0")
 	}
 }
 
@@ -486,9 +486,11 @@ func (b *Bot) adminCancelMarkup() *tele.ReplyMarkup {
 
 func (b *Bot) buildAdminListText(cfg Config) string {
 	var sb strings.Builder
-	sb.WriteString("管理员配置界面\n\n")
-	sb.WriteString("请回复配置项编号开始修改。\n")
-	sb.WriteString("如需退出，点击下方 cancel。\n\n")
+	sb.WriteString("🔧 Admin Config Panel\n\n")
+	sb.WriteString(fmt.Sprintf("💾 Config file: %s\n", effectiveConfigFilePath(cfg)))
+	sb.WriteString("🧭 Load order: config.yaml -> environment overrides\n\n")
+	sb.WriteString("🔢 Reply with an item number to edit it.\n")
+	sb.WriteString("↩️ Tap cancel to exit.\n\n")
 	for _, option := range allConfigOptions() {
 		sb.WriteString(fmt.Sprintf("%02d. %s = %s\n", option.Number, option.EnvKey, previewConfigValue(option, cfg)))
 	}
@@ -497,7 +499,7 @@ func (b *Bot) buildAdminListText(cfg Config) string {
 
 func (b *Bot) buildAdminEditPrompt(option configOption, cfg Config) string {
 	return fmt.Sprintf(
-		"正在修改 `%s`\n\n当前值：%s\n说明：%s\n\n请直接回复新的配置值。\n如需清空字符串或列表，请输入 `%s`。\n点击下方 cancel 返回配置列表。",
+		"✏️ Editing `%s`\n\n📌 Current value: %s\nℹ️ Description: %s\n\n📝 Send the new value directly.\n🧹 To clear a string or list, send `%s`.\n↩️ Tap cancel to go back to the list.",
 		option.EnvKey,
 		previewConfigValue(option, cfg),
 		option.Desc,
@@ -507,10 +509,10 @@ func (b *Bot) buildAdminEditPrompt(option configOption, cfg Config) string {
 
 func (b *Bot) ensureAdminPrivateChat(c tele.Context) error {
 	if c.Chat() == nil || c.Chat().Type != tele.ChatPrivate {
-		return c.Reply("`/admin` 只能在管理员私聊中使用。")
+		return c.Reply("🔒 `/admin` is only available in a private admin chat.")
 	}
 	if c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
-		return c.Reply("只有管理员可以使用该功能。")
+		return c.Reply("⛔ Only admins can use this feature.")
 	}
 	return nil
 }
@@ -533,7 +535,7 @@ func (b *Bot) handleAdminCancel(c tele.Context) error {
 	}
 	session, ok := b.adminSessions.Get(c.Sender().ID)
 	if !ok {
-		return c.EditOrReply("当前没有活动的配置修改会话。")
+		return c.EditOrReply("ℹ️ No active config session.")
 	}
 	if session.Step == "edit" {
 		cfg := b.currentConfig()
@@ -541,7 +543,7 @@ func (b *Bot) handleAdminCancel(c tele.Context) error {
 		return c.EditOrReply(b.buildAdminListText(cfg), b.adminCancelMarkup())
 	}
 	b.adminSessions.Clear(c.Sender().ID)
-	return c.EditOrReply("已退出管理员配置界面。")
+	return c.EditOrReply("👋 Exited the admin config panel.")
 }
 
 func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error) {
@@ -557,11 +559,11 @@ func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error)
 	case "select":
 		number, err := strconv.Atoi(strings.TrimSpace(text))
 		if err != nil {
-			return true, c.Reply("请输入配置项编号。", b.adminCancelMarkup())
+			return true, c.Reply("🔢 Please send a config item number.", b.adminCancelMarkup())
 		}
 		option, found := findConfigOption(number)
 		if !found {
-			return true, c.Reply("配置项编号不存在，请重新输入。", b.adminCancelMarkup())
+			return true, c.Reply("❓ Unknown config item number. Please try again.", b.adminCancelMarkup())
 		}
 		b.adminSessions.Set(c.Sender().ID, adminConfigSession{Step: "edit", Selection: number})
 		return true, c.Reply(b.buildAdminEditPrompt(option, b.currentConfig()), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
@@ -570,20 +572,20 @@ func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error)
 		option, found := findConfigOption(session.Selection)
 		if !found {
 			b.adminSessions.Set(c.Sender().ID, adminConfigSession{Step: "select"})
-			return true, c.Reply("配置项不存在，已返回列表，请重新输入编号。", b.adminCancelMarkup())
+			return true, c.Reply("⚠️ That config item no longer exists. Back to the list.", b.adminCancelMarkup())
 		}
 
 		next := b.currentConfig()
 		if err := option.Apply(text, &next); err != nil {
-			return true, c.Reply(fmt.Sprintf("输入无效：%v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			return true, c.Reply(fmt.Sprintf("❌ Invalid input: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		}
-		if err := b.applyRuntimeConfig(next); err != nil {
-			return true, c.Reply(fmt.Sprintf("应用配置失败：%v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		if err := b.applyAndPersistConfig(next); err != nil {
+			return true, c.Reply(fmt.Sprintf("❌ Failed to apply config: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 		}
 
 		updated := b.currentConfig()
 		b.adminSessions.Set(c.Sender().ID, adminConfigSession{Step: "select"})
-		return true, c.Reply(fmt.Sprintf("已更新 `%s`，当前值：%s\n\n%s", option.EnvKey, previewConfigValue(option, updated), b.buildAdminListText(updated)), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		return true, c.Reply(fmt.Sprintf("✅ Updated `%s`\n📌 Current value: %s%s\n\n%s", option.EnvKey, previewConfigValue(option, updated), configOverrideNotice(option.EnvKey), b.buildAdminListText(updated)), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
 	}
 
 	return false, nil
@@ -591,7 +593,7 @@ func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error)
 
 func buildOpenAIClient(apiKey, baseURL string) (*openai.Client, error) {
 	if strings.TrimSpace(apiKey) == "" {
-		return nil, fmt.Errorf("OPENAI_API_KEY 不能为空")
+		return nil, fmt.Errorf("OPENAI_API_KEY cannot be empty")
 	}
 	cfg := openai.DefaultConfig(apiKey)
 	if strings.TrimSpace(baseURL) != "" {
@@ -602,7 +604,7 @@ func buildOpenAIClient(apiKey, baseURL string) (*openai.Client, error) {
 
 func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI *openai.Client, detectorModel, profileModel, summaryModel string, err error) {
 	if strings.TrimSpace(cfg.OpenAIModel) == "" {
-		err = fmt.Errorf("OPENAI_MODEL 不能为空")
+		err = fmt.Errorf("OPENAI_MODEL cannot be empty")
 		return
 	}
 
@@ -616,7 +618,7 @@ func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI *ope
 	if cfg.AutoDetectKey != "" || cfg.AutoDetectBase != "" || cfg.AutoDetectModel != "" {
 		detectorAI, err = buildOpenAIClient(firstNonEmpty(cfg.AutoDetectKey, cfg.OpenAIKey), firstNonEmpty(cfg.AutoDetectBase, cfg.OpenAIBase))
 		if err != nil {
-			err = fmt.Errorf("AUTO_DETECT 配置无效: %w", err)
+			err = fmt.Errorf("AUTO_DETECT configuration is invalid: %w", err)
 			return
 		}
 		detectorModel = firstNonEmpty(cfg.AutoDetectModel, cfg.OpenAIModel)
@@ -627,7 +629,7 @@ func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI *ope
 	if cfg.ProfileKey != "" || cfg.ProfileBase != "" || cfg.ProfileModel != "" {
 		profileAI, err = buildOpenAIClient(firstNonEmpty(cfg.ProfileKey, cfg.OpenAIKey), firstNonEmpty(cfg.ProfileBase, cfg.OpenAIBase))
 		if err != nil {
-			err = fmt.Errorf("PROFILE 配置无效: %w", err)
+			err = fmt.Errorf("PROFILE configuration is invalid: %w", err)
 			return
 		}
 		profileModel = firstNonEmpty(cfg.ProfileModel, cfg.OpenAIModel)
@@ -638,7 +640,7 @@ func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI *ope
 	if cfg.SummaryKey != "" || cfg.SummaryBase != "" || cfg.SummaryModel != "" {
 		summaryAI, err = buildOpenAIClient(firstNonEmpty(cfg.SummaryKey, cfg.OpenAIKey), firstNonEmpty(cfg.SummaryBase, cfg.OpenAIBase))
 		if err != nil {
-			err = fmt.Errorf("SUMMARY 配置无效: %w", err)
+			err = fmt.Errorf("SUMMARY configuration is invalid: %w", err)
 			return
 		}
 		summaryModel = firstNonEmpty(cfg.SummaryModel, cfg.OpenAIModel)
@@ -661,7 +663,7 @@ func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserTool
 		return nil, nil, nil, nil
 	}
 	if strings.TrimSpace(cfg.UserMCPDBPath) == "" {
-		return nil, nil, nil, fmt.Errorf("USER_MCP_DB_PATH 不能为空")
+		return nil, nil, nil, fmt.Errorf("USER_MCP_DB_PATH cannot be empty")
 	}
 
 	registry := NewToolRegistry()
@@ -669,7 +671,7 @@ func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserTool
 	if strings.TrimSpace(cfg.MCPConfigPath) != "" {
 		mcpCfg, err := LoadMCPConfig(cfg.MCPConfigPath)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("加载 MCP_CONFIG_PATH 失败: %w", err)
+			return nil, nil, nil, fmt.Errorf("failed to load MCP_CONFIG_PATH: %w", err)
 		}
 		mcpManager = NewMCPClientManager()
 		failures := mcpManager.ConnectAll(mcpCfg, registry)
@@ -683,7 +685,7 @@ func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserTool
 		if mcpManager != nil {
 			mcpManager.Close()
 		}
-		return nil, nil, nil, fmt.Errorf("初始化 USER_MCP_DB_PATH 失败: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to initialize USER_MCP_DB_PATH: %w", err)
 	}
 	userTools := NewUserToolManager(store)
 	userTools.RestoreAll()
@@ -745,12 +747,12 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	var newChatDB *ChatDB
 	chatDBChanged := strings.TrimSpace(next.ChatDBPath) != strings.TrimSpace(current.cfg.ChatDBPath)
 	if strings.TrimSpace(next.ChatDBPath) == "" {
-		return fmt.Errorf("CHAT_DB_PATH 不能为空")
+		return fmt.Errorf("CHAT_DB_PATH cannot be empty")
 	}
 	if chatDBChanged {
 		newChatDB, err = OpenChatDB(next.ChatDBPath)
 		if err != nil {
-			return fmt.Errorf("打开 CHAT_DB_PATH 失败: %w", err)
+			return fmt.Errorf("failed to open CHAT_DB_PATH: %w", err)
 		}
 	} else {
 		newChatDB = current.chatDB
@@ -763,7 +765,7 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 			if newChatDB != nil && chatDBChanged {
 				_ = newChatDB.Close()
 			}
-			return fmt.Errorf("PROFILE_DB_PATH 不能为空")
+			return fmt.Errorf("PROFILE_DB_PATH cannot be empty")
 		}
 		if profilesChanged {
 			newProfiles, err = NewProfileStore(next.ProfileDBPath)
@@ -771,7 +773,7 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 				if newChatDB != nil && chatDBChanged {
 					_ = newChatDB.Close()
 				}
-				return fmt.Errorf("打开 PROFILE_DB_PATH 失败: %w", err)
+				return fmt.Errorf("failed to open PROFILE_DB_PATH: %w", err)
 			}
 		} else {
 			newProfiles = current.profiles

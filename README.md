@@ -20,6 +20,7 @@
 - **远程 MCP 服务器** — 通过 JSON 配置文件接入远程 MCP 服务器，支持 Streamable HTTP、SSE、Stdio 三种传输方式
 - **动态 per-user MCP** — 每个用户可在聊天中通过发送 JSON 导入自己专属的 MCP 服务器，持久化存储、重启不丢失，通过命令管理
 - **可选 TTS 语音播报** — 管理员可按聊天开启 `/speach` 模式，机器人会自动缩短回复并额外发送火山引擎合成音频
+- **管理员热修改配置** — 管理员可在私聊中通过 `/admin` 查看、修改并持久化保存全部配置项，支持 `cancel` 返回上一步
 - **并发安全** — 快照 + 原子追加机制，多个并发请求不会导致上下文错乱
 - **白名单 / 权限控制** — 通过 `ALLOWED_USERS` 和 `ALLOWED_GROUPS` 限制 bot 的使用范围
 - **OpenAI 兼容** — 支持任何 OpenAI 兼容 API（如 DeepSeek、通义千问、Ollama 等）
@@ -40,9 +41,12 @@
 git clone <your-repo-url>
 cd llm_telebot
 
-# 复制并编辑配置
+# 复制并编辑 YAML 主配置
+cp config.yaml.example config.yaml
+
+# 复制并编辑环境变量覆盖（建议只放密钥）
 cp .env.example .env
-# 编辑 .env 填入你的 API Key 和 Bot Token
+# 编辑 config.yaml 与 .env
 
 # 运行
 go run .
@@ -52,13 +56,14 @@ go run .
 
 ```bash
 curl -o docker-compose.yml https://raw.githubusercontent.com/lxbme/llm_telebot/refs/heads/main/docker-compose.deploy.yml
-cp .env.example .env
-# 编辑 .env 填入你的 API Key 和 Bot Token
-
-# 如需 MCP 工具，编辑 ./mcp_config.json（可选）
 
 # 准备数据目录
 mkdir -p data
+cp config.yaml.example ./data/config.yaml
+cp .env.example .env
+# 编辑 ./data/config.yaml 与 .env
+
+# 如需 MCP 工具，编辑 ./mcp_config.json（可选）
 
 # 使用预构建镜像一键启动
 podman compose up -d
@@ -76,6 +81,10 @@ podman compose pull && podman compose up -d --force-recreate
 如需在本地自行构建镜像，可继续使用项目根目录下的 `docker-compose.yml`：
 
 ```bash
+mkdir -p data
+cp config.yaml.example ./data/config.yaml
+cp .env.example .env
+
 docker compose up -d
 docker compose logs -f
 docker compose down
@@ -84,8 +93,12 @@ docker compose down
 ### 手动 Docker 构建
 
 ```bash
+mkdir -p data
+cp config.yaml.example ./data/config.yaml
+cp .env.example .env
+
 docker build -t llm-telebot .
-docker run --env-file .env -v llm-telebot-data:/app/data llm-telebot
+docker run --env-file .env -v "$(pwd)/data:/app/data" llm-telebot
 ```
 
 ### 直接拉取镜像运行
@@ -93,6 +106,10 @@ docker run --env-file .env -v llm-telebot-data:/app/data llm-telebot
 每次 push 会自动构建并发布镜像到 GitHub Container Registry：
 
 ```bash
+mkdir -p data
+cp config.yaml.example ./data/config.yaml
+cp .env.example .env
+
 podman pull ghcr.io/lxbme/llm_telebot:latest
 podman run --env-file .env -v "$(pwd)/data:/app/data" ghcr.io/lxbme/llm_telebot:latest
 ```
@@ -100,7 +117,35 @@ podman run --env-file .env -v "$(pwd)/data:/app/data" ghcr.io/lxbme/llm_telebot:
 
 ## 配置说明
 
-所有配置通过环境变量或 `.env` 文件设置。
+默认使用 `config.yaml` 作为主配置文件，环境变量（包括 `.env` 加载进来的变量）会覆盖同名项。
+
+配置优先级：
+
+```text
+config.yaml -> 环境变量覆盖
+```
+
+推荐做法：
+
+- 将大部分业务配置写在 `config.yaml`
+- 将 API Key、Token、容器路径覆盖等写在 `.env`
+- 如果某个键同时出现在 `config.yaml` 和环境变量中，启动时会以环境变量为准
+- `/admin` 会把修改写回 `config.yaml`；若该项仍被环境变量覆盖，则重启后会恢复为环境变量的值
+
+### 配置文件位置
+
+- 本地直接运行时，默认配置文件路径为 `./config.yaml`
+- 容器镜像内默认配置文件路径为 `/app/data/config.yaml`
+- 可通过环境变量 `CONFIG_FILE` 自定义配置文件路径
+
+### `/admin` 热修改说明
+
+- 仅管理员私聊可用
+- 发送 `/admin` 后，bot 会列出全部配置项及编号
+- 回复编号后进入编辑态，再回复新值即可立即生效并写回 `config.yaml`
+- 两步消息都带 `cancel` 按钮，可返回上一步或退出
+- 输入 `<empty>` 可清空字符串或列表配置
+- `TELEGRAM_BOT_TOKEN` 修改后会写入运行时与配置文件，但建议重启进程后再确认轮询连接状态
 
 ### 核心配置
 
@@ -110,6 +155,7 @@ podman run --env-file .env -v "$(pwd)/data:/app/data" ghcr.io/lxbme/llm_telebot:
 | `OPENAI_API_KEY` | **是** | — | API 密钥 |
 | `OPENAI_MODEL` | 否 | `gpt-4o` | 模型名称 |
 | `TELEGRAM_BOT_TOKEN` | **是** | — | Telegram Bot Token |
+| `CONFIG_FILE` | 否 | `./config.yaml` | YAML 主配置文件路径；容器镜像中默认是 `/app/data/config.yaml` |
 | `BOT_USERNAME` | 否 | 自动获取 | 机器人用户名（带 @ 前缀），用于群聊中检测 @提及 |
 | `SYSTEM_PROMPT` | 否 | `You are a helpful assistant.` | 系统提示词 |
 | `CONTEXT_MAX_MESSAGES` | 否 | `20` | 每个对话保留的最大消息数（滑动窗口） |
