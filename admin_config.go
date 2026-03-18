@@ -569,28 +569,25 @@ func (b *Bot) buildAdminEditPrompt(option configOption, cfg Config) string {
 	)
 }
 
-func (b *Bot) ensureAdminPrivateChat(c tele.Context) error {
+func (b *Bot) ensureAdminPrivateChat(c tele.Context) (bool, error) {
 	if !b.isAllowed(c) {
 		if c.Sender() != nil && c.Chat() != nil {
 			log.Printf("Access denied for /admin: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
 		}
-		return nil
+		return false, nil
 	}
 	if c.Chat() == nil || c.Chat().Type != tele.ChatPrivate {
-		return c.Reply("🔒 `/admin` is only available in a private admin chat.")
+		return false, c.Reply("🔒 `/admin` is only available in a private admin chat.")
 	}
 	if c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
-		return c.Reply("⛔ Only admins can use this feature.")
+		return false, c.Reply("⛔ Only admins can use this feature.")
 	}
-	return nil
+	return true, nil
 }
 
 func (b *Bot) handleAdminCommand(c tele.Context) error {
-	if err := b.ensureAdminPrivateChat(c); err != nil {
+	if ok, err := b.ensureAdminPrivateChat(c); !ok || err != nil {
 		return err
-	}
-	if !b.isAllowed(c) {
-		return nil
 	}
 	cfg := b.currentConfig()
 	session, _ := b.adminSessions.Get(c.Sender().ID)
@@ -608,11 +605,8 @@ func (b *Bot) handleAdminCancel(c tele.Context) error {
 	if cb := c.Callback(); cb != nil {
 		_ = c.Respond()
 	}
-	if err := b.ensureAdminPrivateChat(c); err != nil {
+	if ok, err := b.ensureAdminPrivateChat(c); !ok || err != nil {
 		return err
-	}
-	if !b.isAllowed(c) {
-		return nil
 	}
 	session, ok := b.adminSessions.Get(c.Sender().ID)
 	if !ok {
