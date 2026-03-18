@@ -27,8 +27,10 @@ type configOption struct {
 }
 
 type adminConfigSession struct {
-	Step      string
-	Selection int
+	Step           string
+	Selection      int
+	PanelChatID    int64
+	PanelMessageID int
 }
 
 type AdminConfigSessionStore struct {
@@ -484,6 +486,66 @@ func (b *Bot) adminCancelMarkup() *tele.ReplyMarkup {
 	return menu
 }
 
+func (b *Bot) adminSendOptions(parseMode tele.ParseMode) *tele.SendOptions {
+	return &tele.SendOptions{
+		ReplyMarkup: b.adminCancelMarkup(),
+		ParseMode:   parseMode,
+	}
+}
+
+func (b *Bot) adminMessageRef(session adminConfigSession) *tele.Message {
+	if session.PanelChatID == 0 || session.PanelMessageID == 0 {
+		return nil
+	}
+	return &tele.Message{
+		ID:   session.PanelMessageID,
+		Chat: &tele.Chat{ID: session.PanelChatID, Type: tele.ChatPrivate},
+	}
+}
+
+func (b *Bot) renderAdminPanel(c tele.Context, session adminConfigSession, text string, opts *tele.SendOptions) (adminConfigSession, error) {
+	if opts == nil {
+		opts = &tele.SendOptions{}
+	}
+
+	snap := b.snapshot()
+	if msgRef := b.adminMessageRef(session); msgRef != nil {
+		msg, err := snap.tg.Edit(msgRef, text, opts)
+		if err == nil {
+			if msg != nil {
+				session.PanelMessageID = msg.ID
+				if msg.Chat != nil {
+					session.PanelChatID = msg.Chat.ID
+				}
+			}
+			return session, nil
+		}
+		log.Printf("[admin] edit panel failed, sending a new one: %v", err)
+	}
+
+	msg, err := snap.tg.Send(c.Chat(), text, opts)
+	if err != nil {
+		return session, err
+	}
+	session.PanelMessageID = msg.ID
+	if msg.Chat != nil {
+		session.PanelChatID = msg.Chat.ID
+	} else if c.Chat() != nil {
+		session.PanelChatID = c.Chat().ID
+	}
+	return session, nil
+}
+
+func (b *Bot) deleteAdminInputMessage(msg *tele.Message) {
+	if msg == nil {
+		return
+	}
+	snap := b.snapshot()
+	if err := snap.tg.Delete(msg); err != nil {
+		log.Printf("[admin] failed to delete input message %d: %v", msg.ID, err)
+	}
+}
+
 func (b *Bot) buildAdminListText(cfg Config) string {
 	var sb strings.Builder
 	sb.WriteString("🔧 Admin Config Panel\n\n")
@@ -508,6 +570,12 @@ func (b *Bot) buildAdminEditPrompt(option configOption, cfg Config) string {
 }
 
 func (b *Bot) ensureAdminPrivateChat(c tele.Context) error {
+	if !b.isAllowed(c) {
+		if c.Sender() != nil && c.Chat() != nil {
+			log.Printf("Access denied for /admin: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		}
+		return nil
+	}
 	if c.Chat() == nil || c.Chat().Type != tele.ChatPrivate {
 		return c.Reply("🔒 `/admin` is only available in a private admin chat.")
 	}
@@ -521,9 +589,19 @@ func (b *Bot) handleAdminCommand(c tele.Context) error {
 	if err := b.ensureAdminPrivateChat(c); err != nil {
 		return err
 	}
+	if !b.isAllowed(c) {
+		return nil
+	}
 	cfg := b.currentConfig()
-	b.adminSessions.Set(c.Sender().ID, adminConfigSession{Step: "select"})
-	return c.Reply(b.buildAdminListText(cfg), b.adminCancelMarkup())
+	session, _ := b.adminSessions.Get(c.Sender().ID)
+	session.Step = "select"
+	session.Selection = 0
+	rendered, err := b.renderAdminPanel(c, session, b.buildAdminListText(cfg), b.adminSendOptions(tele.ModeDefault))
+	if err != nil {
+		return err
+	}
+	b.adminSessions.Set(c.Sender().ID, rendered)
+	return nil
 }
 
 func (b *Bot) handleAdminCancel(c tele.Context) error {
@@ -533,59 +611,103 @@ func (b *Bot) handleAdminCancel(c tele.Context) error {
 	if err := b.ensureAdminPrivateChat(c); err != nil {
 		return err
 	}
+	if !b.isAllowed(c) {
+		return nil
+	}
 	session, ok := b.adminSessions.Get(c.Sender().ID)
 	if !ok {
 		return c.EditOrReply("ℹ️ No active config session.")
 	}
 	if session.Step == "edit" {
 		cfg := b.currentConfig()
-		b.adminSessions.Set(c.Sender().ID, adminConfigSession{Step: "select"})
-		return c.EditOrReply(b.buildAdminListText(cfg), b.adminCancelMarkup())
+		session.Step = "select"
+		session.Selection = 0
+		rendered, err := b.renderAdminPanel(c, session, b.buildAdminListText(cfg), b.adminSendOptions(tele.ModeDefault))
+		if err != nil {
+			return err
+		}
+		b.adminSessions.Set(c.Sender().ID, rendered)
+		return nil
 	}
 	b.adminSessions.Clear(c.Sender().ID)
-	return c.EditOrReply("👋 Exited the admin config panel.")
+	if _, err := b.renderAdminPanel(c, session, "👋 Exited the admin config panel.", &tele.SendOptions{}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error) {
-	if c.Chat() == nil || c.Chat().Type != tele.ChatPrivate || c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
+	if !b.isAllowed(c) || c.Chat() == nil || c.Chat().Type != tele.ChatPrivate || c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
 		return false, nil
 	}
 	session, ok := b.adminSessions.Get(c.Sender().ID)
 	if !ok {
 		return false, nil
 	}
+	defer b.deleteAdminInputMessage(c.Message())
 
 	switch session.Step {
 	case "select":
 		number, err := strconv.Atoi(strings.TrimSpace(text))
 		if err != nil {
-			return true, c.Reply("🔢 Please send a config item number.", b.adminCancelMarkup())
+			rendered, renderErr := b.renderAdminPanel(c, session, "🔢 Please send a config item number.\n\n"+b.buildAdminListText(b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
+			if renderErr == nil {
+				b.adminSessions.Set(c.Sender().ID, rendered)
+			}
+			return true, renderErr
 		}
 		option, found := findConfigOption(number)
 		if !found {
-			return true, c.Reply("❓ Unknown config item number. Please try again.", b.adminCancelMarkup())
+			rendered, renderErr := b.renderAdminPanel(c, session, "❓ Unknown config item number. Please try again.\n\n"+b.buildAdminListText(b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
+			if renderErr == nil {
+				b.adminSessions.Set(c.Sender().ID, rendered)
+			}
+			return true, renderErr
 		}
-		b.adminSessions.Set(c.Sender().ID, adminConfigSession{Step: "edit", Selection: number})
-		return true, c.Reply(b.buildAdminEditPrompt(option, b.currentConfig()), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		session.Step = "edit"
+		session.Selection = number
+		rendered, renderErr := b.renderAdminPanel(c, session, b.buildAdminEditPrompt(option, b.currentConfig()), b.adminSendOptions(tele.ModeMarkdown))
+		if renderErr == nil {
+			b.adminSessions.Set(c.Sender().ID, rendered)
+		}
+		return true, renderErr
 
 	case "edit":
 		option, found := findConfigOption(session.Selection)
 		if !found {
-			b.adminSessions.Set(c.Sender().ID, adminConfigSession{Step: "select"})
-			return true, c.Reply("⚠️ That config item no longer exists. Back to the list.", b.adminCancelMarkup())
+			session.Step = "select"
+			session.Selection = 0
+			rendered, renderErr := b.renderAdminPanel(c, session, "⚠️ That config item no longer exists. Back to the list.\n\n"+b.buildAdminListText(b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
+			if renderErr == nil {
+				b.adminSessions.Set(c.Sender().ID, rendered)
+			}
+			return true, renderErr
 		}
 
 		next := b.currentConfig()
 		if err := option.Apply(text, &next); err != nil {
-			return true, c.Reply(fmt.Sprintf("❌ Invalid input: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("❌ Invalid input: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminSendOptions(tele.ModeMarkdown))
+			if renderErr == nil {
+				b.adminSessions.Set(c.Sender().ID, rendered)
+			}
+			return true, renderErr
 		}
 		if err := b.applyAndPersistConfig(next); err != nil {
-			return true, c.Reply(fmt.Sprintf("❌ Failed to apply config: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+			rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("❌ Failed to apply config: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminSendOptions(tele.ModeMarkdown))
+			if renderErr == nil {
+				b.adminSessions.Set(c.Sender().ID, rendered)
+			}
+			return true, renderErr
 		}
 
 		updated := b.currentConfig()
-		b.adminSessions.Set(c.Sender().ID, adminConfigSession{Step: "select"})
-		return true, c.Reply(fmt.Sprintf("✅ Updated `%s`\n📌 Current value: %s%s\n\n%s", option.EnvKey, previewConfigValue(option, updated), configOverrideNotice(option.EnvKey), b.buildAdminListText(updated)), b.adminCancelMarkup(), &tele.SendOptions{ParseMode: tele.ModeMarkdown})
+		session.Step = "select"
+		session.Selection = 0
+		rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("✅ Updated `%s`\n📌 Current value: %s%s\n\n%s", option.EnvKey, previewConfigValue(option, updated), configOverrideNotice(option.EnvKey), b.buildAdminListText(updated)), b.adminSendOptions(tele.ModeMarkdown))
+		if renderErr == nil {
+			b.adminSessions.Set(c.Sender().ID, rendered)
+		}
+		return true, renderErr
 	}
 
 	return false, nil
