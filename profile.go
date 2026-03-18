@@ -36,18 +36,19 @@ If nothing new, return the existing tags unchanged. If nothing at all, return: [
 // extractProfile runs a background LLM call to extract/update the user's
 // profile from the recent conversation. Safe to call from a goroutine.
 func (b *Bot) extractProfile(username, displayName string, conversation []openai.ChatCompletionMessage) {
-	if username == "" || b.profiles == nil {
+	snap := b.snapshot()
+	if username == "" || snap.profiles == nil {
 		return
 	}
 
 	// Acquire per-user lock.
-	if !b.profiles.MarkExtracting(username) {
+	if !snap.profiles.MarkExtracting(username) {
 		return // another goroutine is already extracting
 	}
-	defer b.profiles.DoneExtracting(username)
+	defer snap.profiles.DoneExtracting(username)
 
 	// Load existing profile facts.
-	existing, err := b.profiles.Get(username)
+	existing, err := snap.profiles.Get(username)
 	if err != nil {
 		log.Printf("[profile] read error for @%s: %v", username, err)
 		return
@@ -81,8 +82,8 @@ func (b *Bot) extractProfile(username, displayName string, conversation []openai
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	resp, err := b.profileAI.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: b.profileModel,
+	resp, err := snap.profileAI.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: snap.profileModel,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleSystem, Content: sysPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: convBuf.String()},
@@ -115,7 +116,7 @@ func (b *Bot) extractProfile(username, displayName string, conversation []openai
 		Facts:       facts,
 		UpdatedAt:   time.Now(),
 	}
-	if err := b.profiles.Save(profile); err != nil {
+	if err := snap.profiles.Save(profile); err != nil {
 		log.Printf("[profile] save error for @%s: %v", username, err)
 		return
 	}
@@ -146,7 +147,8 @@ func parseJSONArray(s string) ([]string, error) {
 // who appear in the given message history. It is appended to the system prompt
 // so the LLM knows who the participants are.
 func (b *Bot) buildProfileSection(history []openai.ChatCompletionMessage) string {
-	if b.profiles == nil {
+	snap := b.snapshot()
+	if snap.profiles == nil {
 		return ""
 	}
 
@@ -164,7 +166,7 @@ func (b *Bot) buildProfileSection(history []openai.ChatCompletionMessage) string
 	var sb strings.Builder
 	count := 0
 	for uname := range usernames {
-		profile, err := b.profiles.Get(uname)
+		profile, err := snap.profiles.Get(uname)
 		if err != nil || profile == nil || len(profile.Facts) == 0 {
 			continue
 		}

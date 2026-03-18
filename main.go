@@ -378,6 +378,7 @@ func (s *HistoryStore) persistChat(chatID int64) {
 // ─── Bot ──────────────────────────────────────────────────────────────────────
 
 type Bot struct {
+	mu            sync.RWMutex
 	cfg           Config
 	ai            *openai.Client // main LLM client
 	detectorAI    *openai.Client // lighter model for relevance detection (may equal ai)
@@ -394,6 +395,7 @@ type Bot struct {
 	mcpClients    *MCPClientManager // global remote MCP server connections (nil if none)
 	userTools     *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
 	speechModes   *SpeechModeStore
+	adminSessions *AdminConfigSessionStore
 	tts           *VolcengineTTSClient
 	tg            *tele.Bot
 }
@@ -564,6 +566,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		mcpClients:    mcpManager,
 		userTools:     userToolMgr,
 		speechModes:   NewSpeechModeStore(),
+		adminSessions: NewAdminConfigSessionStore(),
 		tts:           ttsClient,
 		tg:            tgBot,
 	}, nil
@@ -572,8 +575,9 @@ func NewBot(cfg Config) (*Bot, error) {
 // isAllowed checks whether a message from the given chat/user is permitted.
 // When no whitelist is configured (both maps nil), everything is allowed.
 func (b *Bot) isAllowed(c tele.Context) bool {
+	cfg := b.currentConfig()
 	// No whitelist configured → open to everyone.
-	if b.cfg.AllowedUsers == nil && b.cfg.AllowedGroups == nil {
+	if cfg.AllowedUsers == nil && cfg.AllowedGroups == nil {
 		return true
 	}
 
@@ -585,16 +589,16 @@ func (b *Bot) isAllowed(c tele.Context) bool {
 	switch chat.Type {
 	case tele.ChatPrivate:
 		// Private chat: check user ID.
-		if b.cfg.AllowedUsers != nil && b.cfg.AllowedUsers[c.Sender().ID] {
+		if cfg.AllowedUsers != nil && cfg.AllowedUsers[c.Sender().ID] {
 			return true
 		}
 	default:
 		// Group / supergroup / channel: check group ID.
-		if b.cfg.AllowedGroups != nil && b.cfg.AllowedGroups[chat.ID] {
+		if cfg.AllowedGroups != nil && cfg.AllowedGroups[chat.ID] {
 			return true
 		}
 		// Also allow if the sender is individually whitelisted.
-		if b.cfg.AllowedUsers != nil && c.Sender() != nil && b.cfg.AllowedUsers[c.Sender().ID] {
+		if cfg.AllowedUsers != nil && c.Sender() != nil && cfg.AllowedUsers[c.Sender().ID] {
 			return true
 		}
 	}
@@ -605,10 +609,11 @@ func (b *Bot) isAllowed(c tele.Context) bool {
 // isAdmin checks whether the given user ID is in the ADMIN_ID list.
 // When ADMIN_ID is set to "*", all users are considered admins.
 func (b *Bot) isAdmin(userID int64) bool {
-	if b.cfg.AdminAll {
+	cfg := b.currentConfig()
+	if cfg.AdminAll {
 		return true
 	}
-	return len(b.cfg.AdminIDs) > 0 && b.cfg.AdminIDs[userID]
+	return len(cfg.AdminIDs) > 0 && cfg.AdminIDs[userID]
 }
 
 func (b *Bot) Run() {
@@ -622,6 +627,9 @@ func (b *Bot) Run() {
 	b.tg.Handle("/mcp_list", b.handleMCPList)
 	b.tg.Handle("/mcp_del", b.handleMCPDel)
 	b.tg.Handle("/mcp_clear", b.handleMCPClear)
+	b.tg.Handle("/admin", b.handleAdminCommand)
+	adminCancelBtn := &tele.Btn{Unique: adminCancelButtonUnique}
+	b.tg.Handle(adminCancelBtn, b.handleAdminCancel)
 	b.tg.Handle(tele.OnText, b.handleText)
 
 	log.Printf("Bot @%s is running…", b.tg.Me.Username)
@@ -651,15 +659,16 @@ Reply NO if the message is clearly directed at another human, is casual chatter 
 // isRelevant uses a cheap, low-token LLM call to decide whether an
 // un-mentioned group message is relevant to this bot and should trigger a reply.
 func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
+	snap := b.snapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	botName := b.cfg.BotUsername
+	botName := snap.cfg.BotUsername
 	if botName == "" {
-		botName = "@" + b.tg.Me.Username
+		botName = "@" + snap.tg.Me.Username
 	}
 
-	systemPrompt := fmt.Sprintf(relevancePromptTpl, botName, b.cfg.SystemPrompt)
+	systemPrompt := fmt.Sprintf(relevancePromptTpl, botName, snap.cfg.SystemPrompt)
 
 	// Build a minimal prompt: classifier system + recent context + new message.
 	msgs := []openai.ChatCompletionMessage{
@@ -667,7 +676,7 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 	}
 
 	// Include up to 5 recent history messages for context (keep it cheap).
-	history := b.store.Get(chatID)
+	history := snap.store.Get(chatID)
 	if len(history) > 5 {
 		history = history[len(history)-5:]
 	}
@@ -684,7 +693,7 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 	})
 
 	req := openai.ChatCompletionRequest{
-		Model:     b.detectorModel,
+		Model:     snap.detectorModel,
 		Messages:  msgs,
 		MaxTokens: 100,
 	}
@@ -693,7 +702,7 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 	var resp openai.ChatCompletionResponse
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err = b.detectorAI.CreateChatCompletion(ctx, req)
+		resp, err = snap.detectorAI.CreateChatCompletion(ctx, req)
 		if err == nil {
 			break
 		}
@@ -738,9 +747,10 @@ func (b *Bot) handleClear(c tele.Context) error {
 		return nil
 	}
 	chatID := c.Chat().ID
-	b.store.Clear(chatID)
-	if b.cfg.SummaryEnabled {
-		b.summaries.Clear(chatID)
+	snap := b.snapshot()
+	snap.store.Clear(chatID)
+	if snap.cfg.SummaryEnabled {
+		snap.summaries.Clear(chatID)
 	}
 	return c.Reply("✅ Conversation history and summary cleared.")
 }
@@ -750,11 +760,12 @@ func (b *Bot) handleSummary(c tele.Context) error {
 		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
 		return nil
 	}
-	if !b.cfg.SummaryEnabled {
+	snap := b.snapshot()
+	if !snap.cfg.SummaryEnabled {
 		return c.Reply("⚠️ Conversation summary is disabled.")
 	}
 	chatID := c.Chat().ID
-	summary := b.summaries.Get(chatID)
+	summary := snap.summaries.Get(chatID)
 	if summary == "" {
 		return c.Reply("📭 No conversation summary yet. A summary will be generated automatically when the context window overflows.")
 	}
@@ -773,13 +784,14 @@ func (b *Bot) handleSpeechMode(c tele.Context) error {
 	if c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
 		return c.Reply("🚫 Only admins can use /speach。")
 	}
-	if b.tts == nil {
+	snap := b.snapshot()
+	if snap.tts == nil {
 		return c.Reply("⚠️ TTS is not configured, please set the `VOLCENGINE_TTS_*` environment variables。")
 	}
 
 	chatID := c.Chat().ID
 	arg := strings.ToLower(strings.TrimSpace(c.Message().Payload))
-	current := b.speechModes.Enabled(chatID)
+	current := snap.speechModes.Enabled(chatID)
 	next := current
 
 	switch arg {
@@ -799,7 +811,7 @@ func (b *Bot) handleSpeechMode(c tele.Context) error {
 		return c.Reply("Usage: `/speach [on|off|toggle|status]`\nWithout arguments, the mode will be toggled automatically。")
 	}
 
-	b.speechModes.Set(chatID, next)
+	snap.speechModes.Set(chatID, next)
 	if next {
 		return c.Reply("✅ The /speach mode is currently enabled for this chat。")
 	}
@@ -815,10 +827,11 @@ func (b *Bot) handleClearProfile(c tele.Context) error {
 	if username == "" {
 		return c.Reply("⚠️ You don't have a Telegram username set, so no profile is stored.")
 	}
-	if b.profiles == nil {
+	snap := b.snapshot()
+	if snap.profiles == nil {
 		return c.Reply("⚠️ Profile extraction is disabled.")
 	}
-	if err := b.profiles.Delete(username); err != nil {
+	if err := snap.profiles.Delete(username); err != nil {
 		log.Printf("[profile] delete error for @%s: %v", username, err)
 		return c.Reply("❌ Failed to clear profile.")
 	}
@@ -834,10 +847,11 @@ func (b *Bot) handleDisplayProfile(c tele.Context) error {
 	if username == "" {
 		return c.Reply("⚠️ You don't have a Telegram username set, so no profile is stored.")
 	}
-	if b.profiles == nil {
+	snap := b.snapshot()
+	if snap.profiles == nil {
 		return c.Reply("⚠️ Profile extraction is disabled.")
 	}
-	profile, err := b.profiles.Get(username)
+	profile, err := snap.profiles.Get(username)
 	if err != nil {
 		log.Printf("[profile] read error for @%s: %v", username, err)
 		return c.Reply("❌ Failed to read profile.")
@@ -860,11 +874,12 @@ func (b *Bot) handleMCPList(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
 	}
-	if b.userTools == nil {
+	snap := b.snapshot()
+	if snap.userTools == nil {
 		return c.Reply("⚠️ Tool calling is disabled.")
 	}
 	userID := c.Sender().ID
-	servers, err := b.userTools.ListServers(userID)
+	servers, err := snap.userTools.ListServers(userID)
 	if err != nil {
 		log.Printf("[user-mcp] list error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to list MCP servers.")
@@ -876,7 +891,8 @@ func (b *Bot) handleMCPDel(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
 	}
-	if b.userTools == nil {
+	snap := b.snapshot()
+	if snap.userTools == nil {
 		return c.Reply("⚠️ Tool calling is disabled.")
 	}
 	name := strings.TrimSpace(c.Message().Payload)
@@ -884,7 +900,7 @@ func (b *Bot) handleMCPDel(c tele.Context) error {
 		return c.Reply("Usage: /mcp_del <server_name>\n\nUse /mcp_list to see your servers.")
 	}
 	userID := c.Sender().ID
-	found, err := b.userTools.RemoveServer(userID, name)
+	found, err := snap.userTools.RemoveServer(userID, name)
 	if err != nil {
 		log.Printf("[user-mcp] remove error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to remove MCP server.")
@@ -899,11 +915,12 @@ func (b *Bot) handleMCPClear(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
 	}
-	if b.userTools == nil {
+	snap := b.snapshot()
+	if snap.userTools == nil {
 		return c.Reply("⚠️ Tool calling is disabled.")
 	}
 	userID := c.Sender().ID
-	if err := b.userTools.ClearAll(userID); err != nil {
+	if err := snap.userTools.ClearAll(userID); err != nil {
 		log.Printf("[user-mcp] clear error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to clear MCP servers.")
 	}
@@ -911,17 +928,21 @@ func (b *Bot) handleMCPClear(c tele.Context) error {
 }
 
 func (b *Bot) handleText(c tele.Context) error {
-	if !b.isAllowed(c) {
-		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
-		return nil
-	}
-
 	msg := c.Message()
 	if msg == nil {
 		return nil
 	}
 
 	text := strings.TrimSpace(msg.Text)
+
+	if handled, err := b.handleAdminTextIfNeeded(c, text); handled {
+		return err
+	}
+
+	if !b.isAllowed(c) {
+		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
 
 	// ── Skip bot commands ────────────────────────────────────────────────────
 	// Commands like /mcp_list should be handled by their own handlers, not by
@@ -935,7 +956,8 @@ func (b *Bot) handleText(c tele.Context) error {
 	// import command rather than a normal chat message.
 	if strings.HasPrefix(text, "{") {
 		if mcpCfg, ok := TryParseMCPConfig(text); ok {
-			if b.userTools == nil {
+			snap := b.snapshot()
+			if snap.userTools == nil {
 				return c.Reply("⚠️ Tool calling is disabled. Cannot import MCP servers.")
 			}
 			userID := c.Sender().ID
@@ -945,7 +967,7 @@ func (b *Bot) handleText(c tele.Context) error {
 					return c.Reply(fmt.Sprintf("🚫 Only admins can add command-based (stdio) MCP servers.\nRejected: %s", strings.Join(rejected, ", ")))
 				}
 			}
-			result, err := b.userTools.AddServers(userID, mcpCfg.MCPServers)
+			result, err := snap.userTools.AddServers(userID, mcpCfg.MCPServers)
 			if err != nil {
 				log.Printf("[user-mcp] add error for user %d: %v", userID, err)
 				return c.Reply(fmt.Sprintf("❌ Failed to add MCP servers: %v", err))
@@ -957,25 +979,26 @@ func (b *Bot) handleText(c tele.Context) error {
 	// ── Group logic: only respond when mentioned ──────────────────────────────
 	mentioned := false
 	if msg.Chat.Type != tele.ChatPrivate {
-		mention := b.cfg.BotUsername
+		snap := b.snapshot()
+		mention := snap.cfg.BotUsername
 		if mention == "" {
-			mention = "@" + b.tg.Me.Username
+			mention = "@" + snap.tg.Me.Username
 		}
 		// normalise casing for comparison
 		mentioned = strings.Contains(strings.ToLower(text), strings.ToLower(mention))
 
 		if !mentioned {
 			// In global mode, store every group message as context even if bot is not mentioned.
-			if b.cfg.ContextMode == "global" && text != "" {
-				b.store.Append(c.Chat().ID, openai.ChatCompletionMessage{
+			if snap.cfg.ContextMode == "global" && text != "" {
+				snap.store.Append(c.Chat().ID, openai.ChatCompletionMessage{
 					Role:    openai.ChatMessageRoleUser,
 					Name:    sanitizeName(msg.Sender.ID),
 					Content: buildUserContent(msg.Sender, text),
-				}, b.cfg.ContextMaxMsgs)
+				}, snap.cfg.ContextMaxMsgs)
 			}
 
 			// AUTO_DETECT: ask LLM whether this message is relevant to the bot.
-			if b.cfg.AutoDetect && text != "" {
+			if snap.cfg.AutoDetect && text != "" {
 				if b.isRelevant(c.Chat().ID, msg.Sender, text) {
 					// Treat as if the bot was mentioned – fall through to reply.
 					mentioned = true
@@ -1014,15 +1037,16 @@ func (b *Bot) handleText(c tele.Context) error {
 	}
 
 	// Snapshot current history and build the prompt.
-	history := b.store.Get(chatID)
+	snap := b.snapshot()
+	history := snap.store.Get(chatID)
 
 	// Inject user profiles of conversation participants into the system prompt.
 	profileSection := b.buildProfileSection(append(history, userMsg))
-	systemPrompt := b.cfg.SystemPrompt + b.speechInstruction(chatID) + profileSection
+	systemPrompt := snap.cfg.SystemPrompt + b.speechInstruction(chatID) + profileSection
 
 	// Inject conversation summary (compressed history beyond the sliding window).
-	if b.cfg.SummaryEnabled {
-		if summary := b.summaries.Get(chatID); summary != "" {
+	if snap.cfg.SummaryEnabled {
+		if summary := snap.summaries.Get(chatID); summary != "" {
 			systemPrompt += "\n\n=== Previous Conversation Summary ===\n" + summary
 		}
 	}
@@ -1034,7 +1058,7 @@ func (b *Bot) handleText(c tele.Context) error {
 	messages = append(messages, userMsg)
 
 	// Send the initial placeholder message.
-	placeholder, err := b.tg.Send(c.Chat(), "⏳ Thinking…")
+	placeholder, err := snap.tg.Send(c.Chat(), "⏳ Thinking…")
 	if err != nil {
 		return fmt.Errorf("failed to send placeholder: %w", err)
 	}
@@ -1054,17 +1078,18 @@ func (b *Bot) streamReply(
 	placeholder *tele.Message,
 	sender *tele.User,
 ) {
+	snap := b.snapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	// Build a merged tool view: global tools + this user's personal tools.
 	var toolView *MergedToolView
-	if b.tools != nil {
+	if snap.tools != nil {
 		var userReg *ToolRegistry
-		if b.userTools != nil && sender != nil {
-			userReg = b.userTools.GetRegistry(sender.ID)
+		if snap.userTools != nil && sender != nil {
+			userReg = snap.userTools.GetRegistry(sender.ID)
 		}
-		toolView = NewMergedToolView(b.tools, userReg)
+		toolView = NewMergedToolView(snap.tools, userReg)
 	}
 
 	// ── Tool-call loop ──────────────────────────────────────────────────
@@ -1073,16 +1098,16 @@ func (b *Bot) streamReply(
 	// conversation (including tool results) is sent to the streaming path
 	// so the LLM can summarise/present the results fluently.
 	if toolView != nil && toolView.Count() > 0 {
-		maxIter := b.cfg.ToolsMaxIterations
+		maxIter := snap.cfg.ToolsMaxIterations
 		for i := 0; i < maxIter; i++ {
 			req := openai.ChatCompletionRequest{
-				Model:     b.cfg.OpenAIModel,
+				Model:     snap.cfg.OpenAIModel,
 				Messages:  messages,
 				Tools:     toolView.OpenAITools(),
-				MaxTokens: b.cfg.MaxTokens,
+				MaxTokens: snap.cfg.MaxTokens,
 			}
 
-			resp, err := b.ai.CreateChatCompletion(ctx, req)
+			resp, err := snap.ai.CreateChatCompletion(ctx, req)
 			if err != nil {
 				b.editOrLog(placeholder, fmt.Sprintf("\u274c Error: %v", err))
 				return
@@ -1146,16 +1171,17 @@ func (b *Bot) doStream(
 	placeholder *tele.Message,
 	toolView *MergedToolView,
 ) string {
+	snap := b.snapshot()
 	showText := true
 	if placeholder != nil && placeholder.Chat != nil {
 		showText = b.shouldSendSpeechText(placeholder.Chat.ID)
 	}
 
 	req := openai.ChatCompletionRequest{
-		Model:     b.cfg.OpenAIModel,
+		Model:     snap.cfg.OpenAIModel,
 		Messages:  messages,
 		Stream:    true,
-		MaxTokens: b.cfg.MaxTokens,
+		MaxTokens: snap.cfg.MaxTokens,
 	}
 
 	// If tools are available, include them so the model knows about them
@@ -1164,7 +1190,7 @@ func (b *Bot) doStream(
 		req.Tools = toolView.OpenAITools()
 	}
 
-	stream, err := b.ai.CreateChatCompletionStream(ctx, req)
+	stream, err := snap.ai.CreateChatCompletionStream(ctx, req)
 	if err != nil {
 		b.editOrLog(placeholder, fmt.Sprintf("❌ Error starting stream: %v", err))
 		return ""
@@ -1261,22 +1287,23 @@ func (b *Bot) postReply(
 	chat *tele.Chat,
 	placeholder *tele.Message,
 ) {
+	snap := b.snapshot()
 	// Atomically persist the user message and assistant reply as a pair
 	// so concurrent requests never interleave between them.
-	b.store.AppendBatch(chatID, []openai.ChatCompletionMessage{
+	snap.store.AppendBatch(chatID, []openai.ChatCompletionMessage{
 		userMsg,
 		{Role: openai.ChatMessageRoleAssistant, Content: finalText},
-	}, b.cfg.ContextMaxMsgs)
+	}, snap.cfg.ContextMaxMsgs)
 
 	// Trigger background summarisation when enough overflow has accumulated.
-	if b.cfg.SummaryEnabled && b.store.OverflowCount(chatID) >= b.cfg.SummaryMinOverflow {
+	if snap.cfg.SummaryEnabled && snap.store.OverflowCount(chatID) >= snap.cfg.SummaryMinOverflow {
 		go b.summarizeOverflow(chatID)
 	}
 
 	// Trigger background user-profile extraction if due.
-	if b.profiles != nil && sender != nil && sender.Username != "" {
-		if b.profiles.ShouldExtract(sender.Username, b.cfg.ProfileExtractEvery, 2*time.Minute) {
-			allMsgs := b.store.Get(chatID)
+	if snap.profiles != nil && sender != nil && sender.Username != "" {
+		if snap.profiles.ShouldExtract(sender.Username, snap.cfg.ProfileExtractEvery, 2*time.Minute) {
+			allMsgs := snap.store.Get(chatID)
 			displayName := strings.TrimSpace(sender.FirstName + " " + sender.LastName)
 			go b.extractProfile(sender.Username, displayName, allMsgs)
 		}
@@ -1301,7 +1328,8 @@ func (b *Bot) editOrLog(msg *tele.Message, text string) {
 		runes := []rune(text)
 		text = string(runes[:4093]) + "…"
 	}
-	if _, err := b.tg.Edit(msg, text); err != nil {
+	tg := b.snapshot().tg
+	if _, err := tg.Edit(msg, text); err != nil {
 		// Ignore "message not modified" – it's benign.
 		if !strings.Contains(err.Error(), "message is not modified") {
 			log.Printf("editOrLog error: %v", err)

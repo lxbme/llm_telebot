@@ -96,19 +96,20 @@ Rules:
 // sliding window) into the existing summary via a background LLM call.
 // Safe to call from a goroutine.
 func (b *Bot) summarizeOverflow(chatID int64) {
+	snap := b.snapshot()
 	// Acquire per-chat lock.
-	if !b.summaries.MarkSummarizing(chatID) {
+	if !snap.summaries.MarkSummarizing(chatID) {
 		return // another goroutine is already summarizing this chat
 	}
-	defer b.summaries.DoneSummarizing(chatID)
+	defer snap.summaries.DoneSummarizing(chatID)
 
 	// Drain accumulated overflow.
-	overflow := b.store.DrainOverflow(chatID)
+	overflow := snap.store.DrainOverflow(chatID)
 	if len(overflow) == 0 {
 		return
 	}
 
-	existing := b.summaries.Get(chatID)
+	existing := snap.summaries.Get(chatID)
 
 	// Build the user prompt with existing summary + overflow messages.
 	var userPrompt strings.Builder
@@ -136,8 +137,8 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	resp, err := b.summaryAI.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: b.summaryModel,
+	resp, err := snap.summaryAI.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: snap.summaryModel,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleSystem, Content: summaryExtractSystemPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: userPrompt.String()},
@@ -159,6 +160,6 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 		return
 	}
 
-	b.summaries.Set(chatID, summary)
+	snap.summaries.Set(chatID, summary)
 	log.Printf("[summary] updated chat %d (%d chars)", chatID, len(summary))
 }
