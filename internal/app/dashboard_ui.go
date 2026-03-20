@@ -54,7 +54,9 @@ type dashboardModel struct {
 	tabIndex int
 	tabs     []string
 
-	overview DashboardOverview
+	overview            DashboardOverview
+	overviewWindowIndex int
+	overviewWindows     []dashboardOverviewWindowOption
 
 	users          []DashboardUserSummary
 	selectedUser   int
@@ -79,6 +81,11 @@ type dashboardMetricCard struct {
 	Value string
 	Hint  string
 	Tone  lipgloss.Color
+}
+
+type dashboardOverviewWindowOption struct {
+	Label  string
+	Window time.Duration
 }
 
 type dashboardTheme struct {
@@ -107,11 +114,21 @@ type dashboardTheme struct {
 
 func newDashboardModel(service *DashboardService, renderer *lipgloss.Renderer, width, height int) dashboardModel {
 	m := dashboardModel{
-		service:  service,
-		renderer: renderer,
-		width:    width,
-		height:   height,
-		tabs:     []string{"Overview", "Users", "Schedules", "Logs"},
+		service:             service,
+		renderer:            renderer,
+		width:               width,
+		height:              height,
+		tabs:                []string{"Overview", "Users", "Schedules", "Logs"},
+		overviewWindowIndex: 1,
+		overviewWindows: []dashboardOverviewWindowOption{
+			{Label: "5m", Window: 5 * time.Minute},
+			{Label: "20m", Window: 20 * time.Minute},
+			{Label: "1h", Window: time.Hour},
+			{Label: "6h", Window: 6 * time.Hour},
+			{Label: "12h", Window: 12 * time.Hour},
+			{Label: "1d", Window: 24 * time.Hour},
+			{Label: "1w", Window: 7 * 24 * time.Hour},
+		},
 	}
 	m.detailViewport = viewport.New(max(20, width/2), max(8, height-6))
 	m.logViewport = viewport.New(max(20, width-4), max(8, height-6))
@@ -144,7 +161,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastErr = msg.err
 		if msg.err == nil {
 			m.overview = msg.overview
-			m.status = fmt.Sprintf("overview updated %s", time.Now().Format("15:04:05"))
+			m.status = fmt.Sprintf("overview %s updated %s", m.currentOverviewWindow().Label, time.Now().Format("15:04:05"))
 		}
 		return m, nil
 	case dashboardUsersMsg:
@@ -208,6 +225,27 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
+		case "[", "{":
+			if m.tabIndex == 0 {
+				m.overviewWindowIndex = (m.overviewWindowIndex - 1 + len(m.overviewWindows)) % len(m.overviewWindows)
+				m.status = "overview window -> " + m.currentOverviewWindow().Label
+				return m, m.refreshActiveTab()
+			}
+		case "]", "}":
+			if m.tabIndex == 0 {
+				m.overviewWindowIndex = (m.overviewWindowIndex + 1) % len(m.overviewWindows)
+				m.status = "overview window -> " + m.currentOverviewWindow().Label
+				return m, m.refreshActiveTab()
+			}
+		case "1", "2", "3", "4", "5", "6", "7":
+			if m.tabIndex == 0 {
+				nextIndex := int(msg.String()[0] - '1')
+				if nextIndex >= 0 && nextIndex < len(m.overviewWindows) && nextIndex != m.overviewWindowIndex {
+					m.overviewWindowIndex = nextIndex
+					m.status = "overview window -> " + m.currentOverviewWindow().Label
+					return m, m.refreshActiveTab()
+				}
+			}
 		case "tab", "l", "right":
 			m.tabIndex = (m.tabIndex + 1) % len(m.tabs)
 			return m, m.refreshActiveTab()
@@ -299,7 +337,7 @@ func (m dashboardModel) View() string {
 func (m dashboardModel) refreshActiveTab() tea.Cmd {
 	switch m.tabIndex {
 	case 0:
-		return loadDashboardOverviewCmd(m.service)
+		return loadDashboardOverviewCmd(m.service, m.currentOverviewWindow().Window)
 	case 1:
 		return loadDashboardUsersCmd(m.service)
 	case 2:
@@ -416,6 +454,9 @@ func (m dashboardModel) renderFooter() string {
 	help := "Tab/h/l 切换  j/k 选择  PgUp/PgDn 滚动  r 刷新  q 退出"
 	scope := "概览聚焦整体负载"
 	switch m.tabIndex {
+	case 0:
+		help = "Tab/h/l 切换  [/]/1-7 时间窗  r 刷新  q 退出"
+		scope = "概览聚焦整体负载，当前窗口 " + m.currentOverviewWindow().Label
 	case 1:
 		scope = "用户页查看画像、MCP 与最近事件"
 	case 2:
@@ -434,7 +475,7 @@ func (m dashboardModel) renderOverviewTab() string {
 			float64(m.overview.Metrics.SuccessCount)*100/float64(m.overview.Metrics.RequestCount))
 	}
 	cards := []dashboardMetricCard{
-		{Label: "Time Window", Value: m.overview.Window.String(), Hint: "", Tone: lipgloss.Color("63")},
+		{Label: "Time Window", Value: m.currentOverviewWindow().Label, Hint: "[ / ] or 1-7", Tone: lipgloss.Color("63")},
 		{Label: "Requests", Value: fmt.Sprintf("%d", m.overview.Metrics.RequestCount), Hint: "recent total requests", Tone: lipgloss.Color("69")},
 		{Label: "Success Rate", Value: successRate, Hint: fmt.Sprintf("%d ok / %d err", m.overview.Metrics.SuccessCount, m.overview.Metrics.ErrorCount), Tone: lipgloss.Color("35")},
 		{Label: "Avg Latency", Value: fmt.Sprintf("%d ms", avgLatencyMs(m.overview.Metrics)), Hint: "mean request latency", Tone: lipgloss.Color("111")},
@@ -710,7 +751,7 @@ func (m dashboardModel) renderLogContent() string {
 			" ",
 			m.renderEventBadge(event.Type),
 			" ",
-			theme.text.Render(truncateDashboardText(event.Summary, max(24, m.logViewport.Width-30))),
+			theme.text.Render(m.renderLogSummary(event)),
 		)
 		lines = append(lines, header)
 		if len(meta) > 0 {
@@ -718,6 +759,17 @@ func (m dashboardModel) renderLogContent() string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (m dashboardModel) renderLogSummary(event DashboardEvent) string {
+	limit := max(24, m.logViewport.Width-30)
+	switch event.Type {
+	case DashboardEventConversationFinished:
+		limit = min(limit, 96)
+	case DashboardEventConversationStarted:
+		limit = min(limit, 72)
+	}
+	return truncateDashboardText(event.Summary, limit)
 }
 
 func (m dashboardModel) renderMetricGrid(cards []dashboardMetricCard, availableWidth int) string {
@@ -933,6 +985,16 @@ func (m dashboardModel) sidebarPanelWidth() int {
 	return max(30, min(42, m.width/3))
 }
 
+func (m dashboardModel) currentOverviewWindow() dashboardOverviewWindowOption {
+	if len(m.overviewWindows) == 0 {
+		return dashboardOverviewWindowOption{Label: "15m", Window: defaultDashboardOverviewWindow}
+	}
+	if m.overviewWindowIndex < 0 || m.overviewWindowIndex >= len(m.overviewWindows) {
+		return m.overviewWindows[0]
+	}
+	return m.overviewWindows[m.overviewWindowIndex]
+}
+
 func dashboardPanelContentWidth(width int) int {
 	return max(16, width-4)
 }
@@ -983,9 +1045,9 @@ func formatRelativeTime(t time.Time) string {
 	}
 }
 
-func loadDashboardOverviewCmd(service *DashboardService) tea.Cmd {
+func loadDashboardOverviewCmd(service *DashboardService, window time.Duration) tea.Cmd {
 	return func() tea.Msg {
-		overview, err := service.GetOverview(defaultDashboardOverviewWindow, 10)
+		overview, err := service.GetOverview(window, 10)
 		return dashboardOverviewMsg{overview: overview, err: err}
 	}
 }

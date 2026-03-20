@@ -409,7 +409,7 @@ func (s *DashboardService) GetOverview(window time.Duration, topN int) (Dashboar
 	if s.events != nil {
 		cutoff := time.Now().UTC().Add(-window)
 		for _, event := range s.events.Tail(0, 512) {
-			if event.Type != DashboardEventUsageRecorded || event.Time.Before(cutoff) || event.Model == "" {
+			if event.Type != DashboardEventUsageRecorded || event.Model == "" || event.Time.Before(cutoff) {
 				continue
 			}
 			item := modelCounts[event.Model]
