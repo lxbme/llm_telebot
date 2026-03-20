@@ -54,6 +54,15 @@ USER_MCP_DB_PATH: ./data/user_mcp.db
 # ── Persistent Chat Storage ───────────────────────────────────────────────────
 CHAT_DB_PATH: ./data/chat.db
 
+# ── SSH TUI Dashboard ─────────────────────────────────────────────────────────
+# 通过 SSH 登录只读 TUI 看板。启用前请先准备 host key 和 authorized_keys。
+DASHBOARD_SSH_ENABLED: false
+DASHBOARD_SSH_LISTEN: :23234
+DASHBOARD_SSH_HOST_KEY_PATH: ./data/dashboard_ssh_ed25519
+DASHBOARD_SSH_AUTHORIZED_KEYS_PATH: ./data/dashboard_authorized_keys
+DASHBOARD_SSH_IDLE_TIMEOUT: 1h
+DASHBOARD_SSH_MAX_SESSIONS: 8
+
 # ── Volcengine TTS ────────────────────────────────────────────────────────────
 VOLCENGINE_TTS_APP_ID: ""
 VOLCENGINE_TTS_ACCESS_KEY: ""

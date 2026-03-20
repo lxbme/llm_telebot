@@ -1,12 +1,15 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -14,10 +17,13 @@ import (
 )
 
 var (
-	historyBucket  = []byte("chat_history")
-	overflowBucket = []byte("chat_overflow")
-	summaryBucket  = []byte("chat_summaries")
-	scheduleBucket = []byte("chat_schedules")
+	historyBucket     = []byte("chat_history")
+	overflowBucket    = []byte("chat_overflow")
+	summaryBucket     = []byte("chat_summaries")
+	scheduleBucket    = []byte("chat_schedules")
+	usageMinuteBucket = []byte("usage_minute")
+	usageDailyBucket  = []byte("usage_daily")
+	usageRecentBucket = []byte("usage_recent_meta")
 )
 
 // ChatDB wraps a bbolt database shared by HistoryStore and SummaryStore for
@@ -36,7 +42,15 @@ func OpenChatDB(path string) (*ChatDB, error) {
 		return nil, fmt.Errorf("open chat db: %w", err)
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{historyBucket, overflowBucket, summaryBucket, scheduleBucket} {
+		for _, b := range [][]byte{
+			historyBucket,
+			overflowBucket,
+			summaryBucket,
+			scheduleBucket,
+			usageMinuteBucket,
+			usageDailyBucket,
+			usageRecentBucket,
+		} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -275,6 +289,178 @@ func (c *ChatDB) LoadAllSchedules() map[int64][]ScheduledTask {
 		})
 	})
 	return result
+}
+
+func (c *ChatDB) MergeUsageAggregates(minuteRows, dailyRows map[string]UsageAggregate, recentRows map[string]UsageRecentMeta) error {
+	if c == nil {
+		return nil
+	}
+	return c.db.Update(func(tx *bolt.Tx) error {
+		if err := mergeUsageAggregateBucket(tx.Bucket(usageMinuteBucket), minuteRows); err != nil {
+			return err
+		}
+		if err := mergeUsageAggregateBucket(tx.Bucket(usageDailyBucket), dailyRows); err != nil {
+			return err
+		}
+		if err := mergeUsageRecentBucket(tx.Bucket(usageRecentBucket), recentRows); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func mergeUsageAggregateBucket(bucket *bolt.Bucket, rows map[string]UsageAggregate) error {
+	for key, incoming := range rows {
+		var current UsageAggregate
+		raw := bucket.Get([]byte(key))
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &current); err != nil {
+				return fmt.Errorf("decode usage aggregate %s: %w", key, err)
+			}
+		}
+		current.Merge(incoming)
+		encoded, err := json.Marshal(current)
+		if err != nil {
+			return fmt.Errorf("encode usage aggregate %s: %w", key, err)
+		}
+		if err := bucket.Put([]byte(key), encoded); err != nil {
+			return fmt.Errorf("write usage aggregate %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func mergeUsageRecentBucket(bucket *bolt.Bucket, rows map[string]UsageRecentMeta) error {
+	for key, incoming := range rows {
+		var current UsageRecentMeta
+		raw := bucket.Get([]byte(key))
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &current); err != nil {
+				return fmt.Errorf("decode usage recent meta %s: %w", key, err)
+			}
+		}
+		if current.LastSeenAt.After(incoming.LastSeenAt) {
+			continue
+		}
+		encoded, err := json.Marshal(incoming)
+		if err != nil {
+			return fmt.Errorf("encode usage recent meta %s: %w", key, err)
+		}
+		if err := bucket.Put([]byte(key), encoded); err != nil {
+			return fmt.Errorf("write usage recent meta %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func (c *ChatDB) QueryUsageAggregates(query UsageQuery) ([]UsagePoint, error) {
+	if c == nil {
+		return nil, nil
+	}
+	prefix, err := usageQueryPrefix(query.Scope, query.ChatID, query.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if query.From.IsZero() {
+		query.From = time.Unix(0, 0).UTC()
+	}
+	if query.To.IsZero() {
+		query.To = time.Now().UTC()
+	}
+
+	result := make([]UsagePoint, 0)
+	err = c.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(usageBucketName(query.Granularity))
+		cursor := bucket.Cursor()
+		prefixBytes := []byte(prefix)
+		for key, value := cursor.Seek(prefixBytes); key != nil && bytes.HasPrefix(key, prefixBytes); key, value = cursor.Next() {
+			_, _, stamp, ok := splitUsageStorageKey(string(key))
+			if !ok {
+				continue
+			}
+			pointTime, err := usageTimeFromStamp(query.Granularity, stamp)
+			if err != nil || pointTime.Before(query.From.UTC()) || pointTime.After(query.To.UTC()) {
+				continue
+			}
+			var aggregate UsageAggregate
+			if err := json.Unmarshal(value, &aggregate); err != nil {
+				return fmt.Errorf("decode usage aggregate %s: %w", string(key), err)
+			}
+			result = append(result, UsagePoint{
+				Stamp:     stamp,
+				Time:      pointTime,
+				Aggregate: aggregate,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Time.Before(result[j].Time)
+	})
+	return result, nil
+}
+
+func (c *ChatDB) LoadRecentUsageMeta(scope UsageScope, limit int) ([]UsageRecentMeta, error) {
+	if c == nil {
+		return nil, nil
+	}
+	result := make([]UsageRecentMeta, 0)
+	err := c.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(usageRecentBucket)
+		cursor := bucket.Cursor()
+		prefix := ""
+		if scope != "" {
+			prefix = string(scope) + "|"
+		}
+		prefixBytes := []byte(prefix)
+		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
+			if prefix != "" && !bytes.HasPrefix(key, prefixBytes) {
+				continue
+			}
+			var meta UsageRecentMeta
+			if err := json.Unmarshal(value, &meta); err != nil {
+				return fmt.Errorf("decode usage recent meta %s: %w", string(key), err)
+			}
+			result = append(result, meta)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].LastSeenAt.After(result[j].LastSeenAt)
+	})
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+func usageBucketName(granularity UsageGranularity) []byte {
+	if granularity == UsageGranularityDaily {
+		return usageDailyBucket
+	}
+	return usageMinuteBucket
+}
+
+func usageQueryPrefix(scope UsageScope, chatID, userID int64) (string, error) {
+	entity, ok := usageEntity(scope, chatID, userID)
+	if !ok {
+		return "", fmt.Errorf("invalid usage query scope=%s chat_id=%d user_id=%d", scope, chatID, userID)
+	}
+	return fmt.Sprintf("%s|%s|", scope, entity), nil
+}
+
+func splitUsageStorageKey(key string) (UsageScope, string, string, bool) {
+	parts := strings.SplitN(key, "|", 3)
+	if len(parts) != 3 {
+		return "", "", "", false
+	}
+	return UsageScope(parts[0]), parts[1], parts[2], true
 }
 
 // DeleteSchedules removes persisted scheduled tasks for a chat.

@@ -5,6 +5,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      - "23234:23234"
     volumes:
       - ./data:/app/data
       - ./mcp_config.json:/app/mcp_config.json:ro

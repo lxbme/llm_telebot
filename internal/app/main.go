@@ -74,6 +74,14 @@ type Config struct {
 	AdminIDs map[int64]bool // user IDs allowed to add command-based (stdio) MCP servers
 	AdminAll bool           // when true, all users are treated as admin (ADMIN_ID=*)
 
+	// Dashboard SSH settings.
+	DashboardSSHEnabled            bool
+	DashboardSSHListen             string
+	DashboardSSHHostKeyPath        string
+	DashboardSSHAuthorizedKeysPath string
+	DashboardSSHIdleTimeout        time.Duration
+	DashboardSSHMaxSessions        int
+
 	// Volcengine TTS settings.
 	VolcengineTTSAppID       string
 	VolcengineTTSAccessKey   string
@@ -135,6 +143,16 @@ func loadConfig() Config {
 		toolsMaxIter = 5
 	}
 
+	dashboardSSHIdleTimeout, err := time.ParseDuration(strings.TrimSpace(get("DASHBOARD_SSH_IDLE_TIMEOUT", "1h")))
+	if err != nil || dashboardSSHIdleTimeout <= 0 {
+		dashboardSSHIdleTimeout = time.Hour
+	}
+
+	dashboardSSHMaxSessions, err := strconv.Atoi(get("DASHBOARD_SSH_MAX_SESSIONS", "8"))
+	if err != nil || dashboardSSHMaxSessions <= 0 {
+		dashboardSSHMaxSessions = 8
+	}
+
 	ttsSampleRate, _ := strconv.Atoi(get("VOLCENGINE_TTS_SAMPLE_RATE", strconv.Itoa(defaultTTSSampleRate)))
 	if ttsSampleRate <= 0 {
 		ttsSampleRate = defaultTTSSampleRate
@@ -191,60 +209,66 @@ func loadConfig() Config {
 	}
 
 	cfg := Config{
-		ConfigFilePath:           source.filePath,
-		OpenAIBase:               get("OPENAI_API_BASE", ""),
-		OpenAIKey:                get("OPENAI_API_KEY", ""),
-		OpenAIModel:              get("OPENAI_MODEL", "gpt-4o"),
-		TelegramToken:            get("TELEGRAM_BOT_TOKEN", ""),
-		SystemPrompt:             get("SYSTEM_PROMPT", "You are a helpful assistant."),
-		ContextMaxMsgs:           maxMsgs,
-		MaxTokens:                maxTokens,
-		BotUsername:              get("BOT_USERNAME", ""),
-		ContextMode:              contextMode,
-		AutoDetect:               autoDetect,
-		AutoDetectBase:           get("AUTO_DETECT_API_BASE", ""),
-		AutoDetectKey:            get("AUTO_DETECT_API_KEY", ""),
-		AutoDetectModel:          get("AUTO_DETECT_MODEL", ""),
-		AllowedUsers:             allowedUsers,
-		AllowedGroups:            allowedGroups,
-		ProfileEnabled:           strings.ToLower(get("PROFILE_ENABLED", "true")) == "true",
-		ProfileDBPath:            get("PROFILE_DB_PATH", "./data/profiles.db"),
-		ProfileExtractEvery:      profileExtractEvery,
-		ProfileBase:              get("PROFILE_API_BASE", ""),
-		ProfileKey:               get("PROFILE_API_KEY", ""),
-		ProfileModel:             get("PROFILE_MODEL", ""),
-		SummaryEnabled:           strings.ToLower(get("SUMMARY_ENABLED", "true")) == "true",
-		SummaryMinOverflow:       summaryMinOverflow,
-		SummaryBase:              get("SUMMARY_API_BASE", ""),
-		SummaryKey:               get("SUMMARY_API_KEY", ""),
-		SummaryModel:             get("SUMMARY_MODEL", ""),
-		ChatDBPath:               get("CHAT_DB_PATH", "./data/chat.db"),
-		ToolsEnabled:             strings.ToLower(get("TOOLS_ENABLED", "false")) == "true",
-		ToolsMaxIterations:       toolsMaxIter,
-		MCPConfigPath:            get("MCP_CONFIG_PATH", ""),
-		UserMCPDBPath:            get("USER_MCP_DB_PATH", "./data/user_mcp.db"),
-		AdminIDs:                 parseIDList(get("ADMIN_ID", "")),
-		AdminAll:                 strings.TrimSpace(get("ADMIN_ID", "")) == "*",
-		VolcengineTTSAppID:       get("VOLCENGINE_TTS_APP_ID", ""),
-		VolcengineTTSAccessKey:   get("VOLCENGINE_TTS_ACCESS_KEY", ""),
-		VolcengineTTSResourceID:  get("VOLCENGINE_TTS_RESOURCE_ID", defaultTTSResourceID),
-		VolcengineTTSSpeaker:     get("VOLCENGINE_TTS_SPEAKER", defaultTTSSpeaker),
-		VolcengineTTSAudioFormat: get("VOLCENGINE_TTS_AUDIO_FORMAT", defaultTTSAudioFormat),
-		VolcengineTTSSampleRate:  ttsSampleRate,
-		VolcengineTTSSpeechRate:  ttsSpeechRate,
-		VolcengineTTSSendText:    strings.ToLower(get("VOLCENGINE_TTS_SEND_TEXT", "true")) != "false",
-		StickerEnabled:           strings.ToLower(get("STICKER_ENABLED", "false")) == "true",
-		StickerMode:              stickerMode,
-		StickerPackName:          get("STICKER_PACK_NAME", ""),
-		StickerRulesPath:         get("STICKER_RULES_PATH", "./data/sticker_rules.json"),
-		StickerSendProbability:   stickerSendProbability,
-		StickerMaxPerReply:       stickerMaxPerReply,
-		StickerWithSpeech:        strings.ToLower(get("STICKER_WITH_SPEECH", "true")) != "false",
-		StickerAllowedChats:      stickerAllowedChats,
-		StickerModelEnabled:      strings.ToLower(get("STICKER_MODEL_ENABLED", "false")) == "true",
-		StickerModelBase:         get("STICKER_MODEL_BASE", ""),
-		StickerModelKey:          get("STICKER_MODEL_KEY", ""),
-		StickerModel:             get("STICKER_MODEL", ""),
+		ConfigFilePath:                 source.filePath,
+		OpenAIBase:                     get("OPENAI_API_BASE", ""),
+		OpenAIKey:                      get("OPENAI_API_KEY", ""),
+		OpenAIModel:                    get("OPENAI_MODEL", "gpt-4o"),
+		TelegramToken:                  get("TELEGRAM_BOT_TOKEN", ""),
+		SystemPrompt:                   get("SYSTEM_PROMPT", "You are a helpful assistant."),
+		ContextMaxMsgs:                 maxMsgs,
+		MaxTokens:                      maxTokens,
+		BotUsername:                    get("BOT_USERNAME", ""),
+		ContextMode:                    contextMode,
+		AutoDetect:                     autoDetect,
+		AutoDetectBase:                 get("AUTO_DETECT_API_BASE", ""),
+		AutoDetectKey:                  get("AUTO_DETECT_API_KEY", ""),
+		AutoDetectModel:                get("AUTO_DETECT_MODEL", ""),
+		AllowedUsers:                   allowedUsers,
+		AllowedGroups:                  allowedGroups,
+		ProfileEnabled:                 strings.ToLower(get("PROFILE_ENABLED", "true")) == "true",
+		ProfileDBPath:                  get("PROFILE_DB_PATH", "./data/profiles.db"),
+		ProfileExtractEvery:            profileExtractEvery,
+		ProfileBase:                    get("PROFILE_API_BASE", ""),
+		ProfileKey:                     get("PROFILE_API_KEY", ""),
+		ProfileModel:                   get("PROFILE_MODEL", ""),
+		SummaryEnabled:                 strings.ToLower(get("SUMMARY_ENABLED", "true")) == "true",
+		SummaryMinOverflow:             summaryMinOverflow,
+		SummaryBase:                    get("SUMMARY_API_BASE", ""),
+		SummaryKey:                     get("SUMMARY_API_KEY", ""),
+		SummaryModel:                   get("SUMMARY_MODEL", ""),
+		ChatDBPath:                     get("CHAT_DB_PATH", "./data/chat.db"),
+		ToolsEnabled:                   strings.ToLower(get("TOOLS_ENABLED", "false")) == "true",
+		ToolsMaxIterations:             toolsMaxIter,
+		MCPConfigPath:                  get("MCP_CONFIG_PATH", ""),
+		UserMCPDBPath:                  get("USER_MCP_DB_PATH", "./data/user_mcp.db"),
+		AdminIDs:                       parseIDList(get("ADMIN_ID", "")),
+		AdminAll:                       strings.TrimSpace(get("ADMIN_ID", "")) == "*",
+		DashboardSSHEnabled:            strings.ToLower(get("DASHBOARD_SSH_ENABLED", "false")) == "true",
+		DashboardSSHListen:             get("DASHBOARD_SSH_LISTEN", ":23234"),
+		DashboardSSHHostKeyPath:        get("DASHBOARD_SSH_HOST_KEY_PATH", "./data/dashboard_ssh_ed25519"),
+		DashboardSSHAuthorizedKeysPath: get("DASHBOARD_SSH_AUTHORIZED_KEYS_PATH", "./data/dashboard_authorized_keys"),
+		DashboardSSHIdleTimeout:        dashboardSSHIdleTimeout,
+		DashboardSSHMaxSessions:        dashboardSSHMaxSessions,
+		VolcengineTTSAppID:             get("VOLCENGINE_TTS_APP_ID", ""),
+		VolcengineTTSAccessKey:         get("VOLCENGINE_TTS_ACCESS_KEY", ""),
+		VolcengineTTSResourceID:        get("VOLCENGINE_TTS_RESOURCE_ID", defaultTTSResourceID),
+		VolcengineTTSSpeaker:           get("VOLCENGINE_TTS_SPEAKER", defaultTTSSpeaker),
+		VolcengineTTSAudioFormat:       get("VOLCENGINE_TTS_AUDIO_FORMAT", defaultTTSAudioFormat),
+		VolcengineTTSSampleRate:        ttsSampleRate,
+		VolcengineTTSSpeechRate:        ttsSpeechRate,
+		VolcengineTTSSendText:          strings.ToLower(get("VOLCENGINE_TTS_SEND_TEXT", "true")) != "false",
+		StickerEnabled:                 strings.ToLower(get("STICKER_ENABLED", "false")) == "true",
+		StickerMode:                    stickerMode,
+		StickerPackName:                get("STICKER_PACK_NAME", ""),
+		StickerRulesPath:               get("STICKER_RULES_PATH", "./data/sticker_rules.json"),
+		StickerSendProbability:         stickerSendProbability,
+		StickerMaxPerReply:             stickerMaxPerReply,
+		StickerWithSpeech:              strings.ToLower(get("STICKER_WITH_SPEECH", "true")) != "false",
+		StickerAllowedChats:            stickerAllowedChats,
+		StickerModelEnabled:            strings.ToLower(get("STICKER_MODEL_ENABLED", "false")) == "true",
+		StickerModelBase:               get("STICKER_MODEL_BASE", ""),
+		StickerModelKey:                get("STICKER_MODEL_KEY", ""),
+		StickerModel:                   get("STICKER_MODEL", ""),
 	}
 	if err := ensureConfigFileExists(cfg); err != nil {
 		log.Printf("Warning: failed to bootstrap config file %s: %v", effectiveConfigFilePath(cfg), err)
@@ -425,32 +449,36 @@ func (s *HistoryStore) persistChat(chatID int64) {
 // ─── Bot ──────────────────────────────────────────────────────────────────────
 
 type Bot struct {
-	mu             sync.RWMutex
-	cfg            Config
-	ai             *openai.Client // main LLM client
-	detectorAI     *openai.Client // lighter model for relevance detection (may equal ai)
-	detectorModel  string         // model name for relevance detection
-	profileAI      *openai.Client // LLM client for profile extraction (may equal ai)
-	profileModel   string         // model name for profile extraction
-	summaryAI      *openai.Client // LLM client for conversation summarisation (may equal ai)
-	summaryModel   string         // model name for conversation summarisation
-	stickerAI      *openai.Client // LLM client for sticker strategy (may equal ai)
-	stickerModel   string         // model name for sticker strategy
-	chatDB         *ChatDB        // persistent chat storage (nil-safe)
-	store          *HistoryStore
-	summaries      *SummaryStore     // per-chat conversation summaries
-	profiles       *ProfileStore     // NoSQL user-profile store (nil if disabled)
-	tools          *ToolRegistry     // global registered MCP tools (nil if disabled)
-	mcpClients     *MCPClientManager // global remote MCP server connections (nil if none)
-	userTools      *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
-	tasks          *TaskStore
-	scheduler      *TaskRunner
-	scheduleWizard *ScheduleWizardStore
-	speechModes    *SpeechModeStore
-	adminSessions  *AdminConfigSessionStore
-	tts            *VolcengineTTSClient
-	stickers       *StickerEngine
-	tg             *tele.Bot
+	mu               sync.RWMutex
+	cfg              Config
+	ai               *openai.Client // main LLM client
+	detectorAI       *openai.Client // lighter model for relevance detection (may equal ai)
+	detectorModel    string         // model name for relevance detection
+	profileAI        *openai.Client // LLM client for profile extraction (may equal ai)
+	profileModel     string         // model name for profile extraction
+	summaryAI        *openai.Client // LLM client for conversation summarisation (may equal ai)
+	summaryModel     string         // model name for conversation summarisation
+	stickerAI        *openai.Client // LLM client for sticker strategy (may equal ai)
+	stickerModel     string         // model name for sticker strategy
+	chatDB           *ChatDB        // persistent chat storage (nil-safe)
+	store            *HistoryStore
+	stats            *StatsManager
+	summaries        *SummaryStore     // per-chat conversation summaries
+	profiles         *ProfileStore     // NoSQL user-profile store (nil if disabled)
+	tools            *ToolRegistry     // global registered MCP tools (nil if disabled)
+	mcpClients       *MCPClientManager // global remote MCP server connections (nil if none)
+	userTools        *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
+	tasks            *TaskStore
+	scheduler        *TaskRunner
+	scheduleWizard   *ScheduleWizardStore
+	speechModes      *SpeechModeStore
+	adminSessions    *AdminConfigSessionStore
+	tts              *VolcengineTTSClient
+	stickers         *StickerEngine
+	dashboardEvents  *DashboardEventHub
+	dashboardService *DashboardService
+	dashboardSSH     *DashboardSSHServer
+	tg               *tele.Bot
 }
 
 func NewBot(cfg Config) (*Bot, error) {
@@ -494,6 +522,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		return nil, fmt.Errorf("failed to init chat db: %w", err)
 	}
 	log.Printf("Persistent chat storage enabled (db: %s)", cfg.ChatDBPath)
+	log.Printf("Usage stats enabled (async flush: %s)", defaultStatsFlushInterval)
 
 	if cfg.SummaryEnabled {
 		log.Printf("Summary enabled (min_overflow: %d, model: %s)", cfg.SummaryMinOverflow, summaryModel)
@@ -546,33 +575,44 @@ func NewBot(cfg Config) (*Bot, error) {
 			cfg.StickerMode, cfg.StickerRulesPath, stickerModel)
 	}
 
+	dashboardEvents := NewDashboardEventHub(defaultDashboardEventBufferSize)
+
 	bot := &Bot{
-		cfg:            cfg,
-		ai:             aiClient,
-		detectorAI:     detectorClient,
-		detectorModel:  detectorModel,
-		profileAI:      profileClient,
-		profileModel:   profileModel,
-		summaryAI:      summaryClient,
-		summaryModel:   summaryModel,
-		stickerAI:      stickerClient,
-		stickerModel:   stickerModel,
-		chatDB:         chatDB,
-		store:          NewHistoryStore(chatDB),
-		summaries:      NewSummaryStore(chatDB),
-		profiles:       profiles,
-		tools:          toolRegistry,
-		mcpClients:     mcpManager,
-		userTools:      userToolMgr,
-		tasks:          NewTaskStore(chatDB),
-		scheduleWizard: NewScheduleWizardStore(),
-		speechModes:    NewSpeechModeStore(),
-		adminSessions:  NewAdminConfigSessionStore(),
-		tts:            ttsClient,
-		stickers:       stickerEngine,
-		tg:             tgBot,
+		cfg:             cfg,
+		ai:              aiClient,
+		detectorAI:      detectorClient,
+		detectorModel:   detectorModel,
+		profileAI:       profileClient,
+		profileModel:    profileModel,
+		summaryAI:       summaryClient,
+		summaryModel:    summaryModel,
+		stickerAI:       stickerClient,
+		stickerModel:    stickerModel,
+		chatDB:          chatDB,
+		store:           NewHistoryStore(chatDB),
+		stats:           NewStatsManager(chatDB),
+		summaries:       NewSummaryStore(chatDB),
+		profiles:        profiles,
+		tools:           toolRegistry,
+		mcpClients:      mcpManager,
+		userTools:       userToolMgr,
+		tasks:           NewTaskStore(chatDB),
+		scheduleWizard:  NewScheduleWizardStore(),
+		speechModes:     NewSpeechModeStore(),
+		adminSessions:   NewAdminConfigSessionStore(),
+		tts:             ttsClient,
+		stickers:        stickerEngine,
+		dashboardEvents: dashboardEvents,
+		tg:              tgBot,
 	}
 	bot.scheduler = NewTaskRunner(bot, bot.tasks)
+	bot.dashboardService = NewDashboardService(bot, dashboardEvents)
+	if cfg.DashboardSSHEnabled {
+		bot.dashboardSSH, err = NewDashboardSSHServer(bot.dashboardService, dashboardEvents, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init dashboard ssh server: %w", err)
+		}
+	}
 	return bot, nil
 }
 
@@ -648,8 +688,29 @@ func (b *Bot) Run() {
 	if b.scheduler != nil {
 		b.scheduler.Start()
 	}
+	if b.dashboardSSH != nil {
+		if err := b.dashboardSSH.Start(); err != nil {
+			log.Printf("[dashboard] failed to start SSH server: %v", err)
+		}
+	}
 	log.Printf("Bot @%s is running…", b.tg.Me.Username)
 	b.tg.Start()
+}
+
+func (b *Bot) recordUsageEvent(event UsageEvent) {
+	snap := b.snapshot()
+	if snap.stats != nil {
+		snap.stats.Record(event)
+	}
+	if b.dashboardEvents != nil {
+		b.dashboardEvents.Publish(NewDashboardEventFromUsage(event))
+	}
+}
+
+func (b *Bot) recordDashboardEvent(event DashboardEvent) {
+	if b.dashboardEvents != nil {
+		b.dashboardEvents.Publish(event)
+	}
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -678,6 +739,11 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 	snap := b.snapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	userID := int64(0)
+	if sender != nil {
+		userID = sender.ID
+	}
+	usageCtx := newUsageContext(chatID, userID, 0)
 
 	botName := snap.cfg.BotUsername
 	if botName == "" {
@@ -718,7 +784,9 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 	var resp openai.ChatCompletionResponse
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
+		started := time.Now()
 		resp, err = snap.detectorAI.CreateChatCompletion(ctx, req)
+		b.recordUsageEvent(usageEvent(usageCtx, UsageCallRelevanceCheck, firstNonEmpty(resp.Model, snap.detectorModel), false, 0, started, &resp.Usage, err == nil))
 		if err == nil {
 			break
 		}
@@ -839,16 +907,13 @@ func (b *Bot) handleClearProfile(c tele.Context) error {
 		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
 		return nil
 	}
-	username := c.Sender().Username
-	if username == "" {
-		return c.Reply("⚠️ You don't have a Telegram username set, so no profile is stored.")
-	}
+	userID := c.Sender().ID
 	snap := b.snapshot()
 	if snap.profiles == nil {
 		return c.Reply("⚠️ Profile extraction is disabled.")
 	}
-	if err := snap.profiles.Delete(username); err != nil {
-		log.Printf("[profile] delete error for @%s: %v", username, err)
+	if err := snap.profiles.Delete(userID); err != nil {
+		log.Printf("[profile] delete error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to clear profile.")
 	}
 	return c.Reply("✅ Your user profile has been cleared.")
@@ -859,26 +924,26 @@ func (b *Bot) handleDisplayProfile(c tele.Context) error {
 		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
 		return nil
 	}
-	username := c.Sender().Username
-	if username == "" {
-		return c.Reply("⚠️ You don't have a Telegram username set, so no profile is stored.")
-	}
+	userID := c.Sender().ID
 	snap := b.snapshot()
 	if snap.profiles == nil {
 		return c.Reply("⚠️ Profile extraction is disabled.")
 	}
-	profile, err := snap.profiles.Get(username)
+	profile, err := snap.profiles.Get(userID)
 	if err != nil {
-		log.Printf("[profile] read error for @%s: %v", username, err)
+		log.Printf("[profile] read error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to read profile.")
 	}
 	if profile == nil || len(profile.Facts) == 0 {
 		return c.Reply("📭 No profile data yet. Keep chatting and I'll learn about you!")
 	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("👤 Profile for @%s:\n", username))
+	sb.WriteString(fmt.Sprintf("👤 Profile for %s:\n", formatProfileIdentity(userID, profile.Username)))
 	for i, fact := range profile.Facts {
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, fact))
+	}
+	if profile.DisplayName != "" {
+		sb.WriteString(fmt.Sprintf("\n🪪 Display name: %s", profile.DisplayName))
 	}
 	sb.WriteString(fmt.Sprintf("\n🕐 Last updated: %s", profile.UpdatedAt.Format("2006-01-02 15:04 UTC")))
 	return c.Reply(sb.String())
@@ -924,6 +989,13 @@ func (b *Bot) handleMCPDel(c tele.Context) error {
 	if !found {
 		return c.Reply(fmt.Sprintf("⚠️ Server %q not found in your config.", name))
 	}
+	b.recordDashboardEvent(DashboardEvent{
+		Type:     DashboardEventMCPChanged,
+		UserID:   userID,
+		ToolName: name,
+		Summary:  "removed personal MCP server",
+		Success:  true,
+	})
 	return c.Reply(fmt.Sprintf("✅ Removed MCP server %q.", name))
 }
 
@@ -940,6 +1012,12 @@ func (b *Bot) handleMCPClear(c tele.Context) error {
 		log.Printf("[user-mcp] clear error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to clear MCP servers.")
 	}
+	b.recordDashboardEvent(DashboardEvent{
+		Type:    DashboardEventMCPChanged,
+		UserID:  userID,
+		Summary: "cleared all personal MCP servers",
+		Success: true,
+	})
 	return c.Reply("✅ All your personal MCP servers have been removed.")
 }
 
@@ -991,6 +1069,13 @@ func (b *Bot) handleText(c tele.Context) error {
 				log.Printf("[user-mcp] add error for user %d: %v", userID, err)
 				return c.Reply(fmt.Sprintf("❌ Failed to add MCP servers: %v", err))
 			}
+			b.recordDashboardEvent(DashboardEvent{
+				Type:    DashboardEventMCPChanged,
+				UserID:  userID,
+				Summary: "imported personal MCP servers",
+				Detail:  formatMCPAddResult(result),
+				Success: true,
+			})
 			return c.Reply(formatMCPAddResult(result))
 		}
 		if handled, err := b.handleScheduleMessage(c, text); handled {
@@ -1085,7 +1170,19 @@ func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.C
 		return fmt.Errorf("failed to send placeholder: %w", err)
 	}
 
-	go b.streamReply(chatID, userMsg, messages, placeholder, sender)
+	userID := int64(0)
+	if sender != nil {
+		userID = sender.ID
+	}
+	usageCtx := newUsageContext(chatID, userID, placeholder.ID)
+	b.recordDashboardEvent(DashboardEvent{
+		Type:      DashboardEventConversationStarted,
+		ChatID:    chatID,
+		UserID:    userID,
+		RequestID: usageCtx.RequestID,
+		Summary:   truncateDashboardText(userMsg.Content, 180),
+	})
+	go b.streamReply(chatID, userMsg, messages, placeholder, sender, usageCtx)
 	return nil
 }
 
@@ -1097,6 +1194,7 @@ func (b *Bot) streamReply(
 	messages []openai.ChatCompletionMessage,
 	placeholder *tele.Message,
 	sender *tele.User,
+	usageCtx UsageContext,
 ) {
 	snap := b.snapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -1127,7 +1225,9 @@ func (b *Bot) streamReply(
 				MaxTokens: snap.cfg.MaxTokens,
 			}
 
+			started := time.Now()
 			resp, err := snap.ai.CreateChatCompletion(ctx, req)
+			b.recordUsageEvent(usageEvent(usageCtx, UsageCallToolRound, firstNonEmpty(resp.Model, snap.cfg.OpenAIModel), false, i+1, started, &resp.Usage, err == nil))
 			if err != nil {
 				b.editOrLog(placeholder, fmt.Sprintf("\u274c Error: %v", err))
 				return
@@ -1154,8 +1254,26 @@ func (b *Bot) streamReply(
 				// Execute each tool call and append the results.
 				for _, tc := range choice.Message.ToolCalls {
 					log.Printf("[tools] executing %s", tc.Function.Name)
+					b.recordDashboardEvent(DashboardEvent{
+						Type:      DashboardEventToolCallStarted,
+						ChatID:    chatID,
+						UserID:    usageCtx.UserID,
+						RequestID: usageCtx.RequestID,
+						ToolName:  tc.Function.Name,
+						Summary:   "executing tool " + tc.Function.Name,
+					})
 					result := toolView.ExecuteToolCall(tc)
 					log.Printf("[tools] %s done (%d bytes)", tc.Function.Name, len(result))
+					b.recordDashboardEvent(DashboardEvent{
+						Type:      DashboardEventToolCallFinished,
+						ChatID:    chatID,
+						UserID:    usageCtx.UserID,
+						RequestID: usageCtx.RequestID,
+						ToolName:  tc.Function.Name,
+						Summary:   fmt.Sprintf("tool %s completed", tc.Function.Name),
+						Detail:    truncateDashboardText(result, 200),
+						Success:   true,
+					})
 					messages = append(messages, openai.ChatCompletionMessage{
 						Role:       openai.ChatMessageRoleTool,
 						Content:    result,
@@ -1175,7 +1293,7 @@ func (b *Bot) streamReply(
 	// Streams the LLM's final response to the user. When tools were used,
 	// the messages slice now contains the full tool-call conversation, so
 	// the LLM will summarise the tool results into a natural reply.
-	finalText := b.doStream(ctx, messages, placeholder, toolView)
+	finalText := b.doStream(ctx, messages, placeholder, toolView, usageCtx)
 	if finalText == "" {
 		return // error already reported by doStream
 	}
@@ -1190,6 +1308,7 @@ func (b *Bot) doStream(
 	messages []openai.ChatCompletionMessage,
 	placeholder *tele.Message,
 	toolView *MergedToolView,
+	usageCtx UsageContext,
 ) string {
 	snap := b.snapshot()
 	showText := true
@@ -1202,6 +1321,9 @@ func (b *Bot) doStream(
 		Messages:  messages,
 		Stream:    true,
 		MaxTokens: snap.cfg.MaxTokens,
+		StreamOptions: &openai.StreamOptions{
+			IncludeUsage: true,
+		},
 	}
 
 	// If tools are available, include them so the model knows about them
@@ -1210,8 +1332,19 @@ func (b *Bot) doStream(
 		req.Tools = toolView.OpenAITools()
 	}
 
+	started := time.Now()
 	stream, err := snap.ai.CreateChatCompletionStream(ctx, req)
 	if err != nil {
+		b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, nil, false))
+		b.recordDashboardEvent(DashboardEvent{
+			Type:      DashboardEventConversationError,
+			ChatID:    usageCtx.ChatID,
+			UserID:    usageCtx.UserID,
+			Model:     snap.cfg.OpenAIModel,
+			RequestID: usageCtx.RequestID,
+			Summary:   "failed to start stream",
+			Detail:    err.Error(),
+		})
 		b.editOrLog(placeholder, fmt.Sprintf("❌ Error starting stream: %v", err))
 		return ""
 	}
@@ -1250,6 +1383,7 @@ func (b *Bot) doStream(
 	}()
 
 	// Main loop: consume stream tokens.
+	var streamUsage *openai.Usage
 	streamErr := func() error {
 		for {
 			resp, err := stream.Recv()
@@ -1258,6 +1392,10 @@ func (b *Bot) doStream(
 			}
 			if err != nil {
 				return err
+			}
+			if resp.Usage != nil {
+				usage := *resp.Usage
+				streamUsage = &usage
 			}
 			if len(resp.Choices) == 0 {
 				continue
@@ -1276,6 +1414,16 @@ func (b *Bot) doStream(
 	finalText := fullResponse.String()
 
 	if streamErr != nil {
+		b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, false))
+		b.recordDashboardEvent(DashboardEvent{
+			Type:      DashboardEventConversationError,
+			ChatID:    usageCtx.ChatID,
+			UserID:    usageCtx.UserID,
+			Model:     snap.cfg.OpenAIModel,
+			RequestID: usageCtx.RequestID,
+			Summary:   "stream failed",
+			Detail:    streamErr.Error(),
+		})
 		errMsg := fmt.Sprintf("❌ Stream error: %v", streamErr)
 		if finalText != "" {
 			errMsg = finalText + "\n\n" + errMsg
@@ -1287,6 +1435,17 @@ func (b *Bot) doStream(
 	if finalText == "" {
 		finalText = "⚠️ The model returned an empty response."
 	}
+	b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, true))
+	b.recordDashboardEvent(DashboardEvent{
+		Type:      DashboardEventConversationFinished,
+		ChatID:    usageCtx.ChatID,
+		UserID:    usageCtx.UserID,
+		Model:     snap.cfg.OpenAIModel,
+		RequestID: usageCtx.RequestID,
+		LatencyMs: time.Since(started).Milliseconds(),
+		Success:   true,
+		Summary:   truncateDashboardText(finalText, 200),
+	})
 
 	if showText {
 		// One final edit with the complete text, rendered as Telegram HTML.
@@ -1321,11 +1480,11 @@ func (b *Bot) postReply(
 	}
 
 	// Trigger background user-profile extraction if due.
-	if snap.profiles != nil && sender != nil && sender.Username != "" {
-		if snap.profiles.ShouldExtract(sender.Username, snap.cfg.ProfileExtractEvery, 2*time.Minute) {
+	if snap.profiles != nil && sender != nil && sender.ID != 0 {
+		if snap.profiles.ShouldExtract(sender.ID, snap.cfg.ProfileExtractEvery, 2*time.Minute) {
 			allMsgs := snap.store.Get(chatID)
 			displayName := strings.TrimSpace(sender.FirstName + " " + sender.LastName)
-			go b.extractProfile(sender.Username, displayName, allMsgs)
+			go b.extractProfile(chatID, sender.ID, sender.Username, displayName, allMsgs)
 		}
 	}
 
@@ -1369,6 +1528,12 @@ func Run() {
 	}
 	if bot.chatDB != nil {
 		defer bot.chatDB.Close()
+	}
+	if bot.stats != nil {
+		defer bot.stats.Close()
+	}
+	if bot.dashboardSSH != nil {
+		defer bot.dashboardSSH.Close()
 	}
 	if bot.profiles != nil {
 		defer bot.profiles.Close()

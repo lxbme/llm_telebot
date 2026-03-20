@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,8 +15,8 @@ import (
 // ─── Profile Extraction ──────────────────────────────────────────────────────
 
 // profileExtractSystemPrompt is the system-level instruction for the profile
-// extraction LLM call. %s placeholders: username, displayName, existingFacts.
-const profileExtractSystemPrompt = `You are a user-profile extractor. Analyze the conversation and extract or update concise factual tags about user @%s (%s).
+// extraction LLM call. %s placeholders: subjectLabel, displayName, existingFacts.
+const profileExtractSystemPrompt = `You are a user-profile extractor. Analyze the conversation and extract or update concise factual tags about user %s (%s).
 
 Existing profile:
 %s
@@ -35,22 +36,24 @@ If nothing new, return the existing tags unchanged. If nothing at all, return: [
 
 // extractProfile runs a background LLM call to extract/update the user's
 // profile from the recent conversation. Safe to call from a goroutine.
-func (b *Bot) extractProfile(username, displayName string, conversation []openai.ChatCompletionMessage) {
+func (b *Bot) extractProfile(chatID, userID int64, username, displayName string, conversation []openai.ChatCompletionMessage) {
 	snap := b.snapshot()
-	if username == "" || snap.profiles == nil {
+	if userID == 0 || snap.profiles == nil {
 		return
 	}
+	usageCtx := newUsageContext(chatID, userID, 0)
+	subjectLabel := formatProfileIdentity(userID, username)
 
 	// Acquire per-user lock.
-	if !snap.profiles.MarkExtracting(username) {
+	if !snap.profiles.MarkExtracting(userID) {
 		return // another goroutine is already extracting
 	}
-	defer snap.profiles.DoneExtracting(username)
+	defer snap.profiles.DoneExtracting(userID)
 
 	// Load existing profile facts.
-	existing, err := snap.profiles.Get(username)
+	existing, err := snap.profiles.Get(userID)
 	if err != nil {
-		log.Printf("[profile] read error for @%s: %v", username, err)
+		log.Printf("[profile] read error for %s: %v", subjectLabel, err)
 		return
 	}
 	existingFacts := "None"
@@ -77,11 +80,12 @@ func (b *Bot) extractProfile(username, displayName string, conversation []openai
 		convBuf.WriteString(fmt.Sprintf("[%s] %s\n", tag, content))
 	}
 
-	sysPrompt := fmt.Sprintf(profileExtractSystemPrompt, username, displayName, existingFacts)
+	sysPrompt := fmt.Sprintf(profileExtractSystemPrompt, subjectLabel, displayName, existingFacts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	started := time.Now()
 	resp, err := snap.profileAI.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: snap.profileModel,
 		Messages: []openai.ChatCompletionMessage{
@@ -91,19 +95,20 @@ func (b *Bot) extractProfile(username, displayName string, conversation []openai
 		MaxTokens:   500,
 		Temperature: 0.1,
 	})
+	b.recordUsageEvent(usageEvent(usageCtx, UsageCallProfileExtract, firstNonEmpty(resp.Model, snap.profileModel), false, 0, started, &resp.Usage, err == nil))
 	if err != nil {
-		log.Printf("[profile] LLM error for @%s: %v", username, err)
+		log.Printf("[profile] LLM error for %s: %v", subjectLabel, err)
 		return
 	}
 	if len(resp.Choices) == 0 {
-		log.Printf("[profile] empty LLM response for @%s", username)
+		log.Printf("[profile] empty LLM response for %s", subjectLabel)
 		return
 	}
 
 	raw := strings.TrimSpace(resp.Choices[0].Message.Content)
 	facts, err := parseJSONArray(raw)
 	if err != nil {
-		log.Printf("[profile] parse error for @%s: %v (raw: %s)", username, err, raw)
+		log.Printf("[profile] parse error for %s: %v (raw: %s)", subjectLabel, err, raw)
 		return
 	}
 	if len(facts) > 10 {
@@ -111,17 +116,26 @@ func (b *Bot) extractProfile(username, displayName string, conversation []openai
 	}
 
 	profile := &UserProfile{
+		UserID:      userID,
 		Username:    username,
 		DisplayName: displayName,
 		Facts:       facts,
 		UpdatedAt:   time.Now(),
 	}
 	if err := snap.profiles.Save(profile); err != nil {
-		log.Printf("[profile] save error for @%s: %v", username, err)
+		log.Printf("[profile] save error for %s: %v", subjectLabel, err)
 		return
 	}
 
-	log.Printf("[profile] updated @%s: %v", username, facts)
+	b.recordDashboardEvent(DashboardEvent{
+		Type:    DashboardEventProfileUpdated,
+		ChatID:  chatID,
+		UserID:  userID,
+		Model:   firstNonEmpty(resp.Model, snap.profileModel),
+		Summary: truncateDashboardText(strings.Join(facts, "; "), 200),
+		Success: true,
+	})
+	log.Printf("[profile] updated %s: %v", subjectLabel, facts)
 }
 
 // parseJSONArray extracts a JSON string-array from possibly noisy LLM output.
@@ -152,21 +166,23 @@ func (b *Bot) buildProfileSection(history []openai.ChatCompletionMessage) string
 		return ""
 	}
 
-	// Collect unique usernames from message metadata headers.
-	usernames := make(map[string]struct{})
+	// Collect unique participants from message metadata headers.
+	participants := make(map[int64]string)
 	for _, msg := range history {
-		if uname := extractUsernameFromContent(msg.Content); uname != "" {
-			usernames[uname] = struct{}{}
+		userID := extractUserIDFromContent(msg.Content)
+		if userID == 0 {
+			continue
 		}
+		participants[userID] = extractUsernameFromContent(msg.Content)
 	}
-	if len(usernames) == 0 {
+	if len(participants) == 0 {
 		return ""
 	}
 
 	var sb strings.Builder
 	count := 0
-	for uname := range usernames {
-		profile, err := snap.profiles.Get(uname)
+	for userID, username := range participants {
+		profile, err := snap.profiles.Get(userID)
 		if err != nil || profile == nil || len(profile.Facts) == 0 {
 			continue
 		}
@@ -174,10 +190,18 @@ func (b *Bot) buildProfileSection(history []openai.ChatCompletionMessage) string
 			sb.WriteString("\n\n=== Participant Profiles ===\n")
 		}
 		count++
-		sb.WriteString(fmt.Sprintf("@%s: %s\n", uname, strings.Join(profile.Facts, "; ")))
+		sb.WriteString(fmt.Sprintf("%s: %s\n", formatProfileIdentity(userID, firstNonEmpty(profile.Username, username)), strings.Join(profile.Facts, "; ")))
 	}
 
 	return sb.String()
+}
+
+func formatProfileIdentity(userID int64, username string) string {
+	username = strings.TrimSpace(username)
+	if username != "" {
+		return fmt.Sprintf("@%s (%d)", username, userID)
+	}
+	return fmt.Sprintf("user_%d", userID)
 }
 
 // extractUsernameFromContent pulls a @username from the metadata header that
@@ -195,4 +219,22 @@ func extractUsernameFromContent(content string) string {
 		return ""
 	}
 	return rest[:end]
+}
+
+func extractUserIDFromContent(content string) int64 {
+	const prefix = "user_id:"
+	idx := strings.Index(content, prefix)
+	if idx < 0 {
+		return 0
+	}
+	rest := content[idx+len(prefix):]
+	end := strings.IndexAny(rest, " ]\n")
+	if end <= 0 {
+		return 0
+	}
+	userID, err := strconv.ParseInt(rest[:end], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return userID
 }

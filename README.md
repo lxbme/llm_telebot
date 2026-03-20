@@ -20,6 +20,7 @@
 - **远程 MCP 服务器** — 通过 JSON 配置文件接入远程 MCP 服务器，支持 Streamable HTTP、SSE、Stdio 三种传输方式
 - **动态 per-user MCP** — 每个用户可在聊天中通过发送 JSON 导入自己专属的 MCP 服务器，持久化存储、重启不丢失，通过命令管理
 - **聊天级定时任务** — 每个聊天都可以配置独立的定时任务，按 cron 表达式定时触发，并复用正常 chat 流程向 LLM 发送 prompt
+- **SSH TUI 管理看板** — 可通过 SSH 登录内嵌 Dashboard，基于 [Bubble Tea](https://github.com/charmbracelet/bubbletea) 呈现多 Tab 运行态、用户画像、任务和详细事件流
 - **可选 TTS 语音播报** — 管理员可按聊天开启 `/speach` 模式，机器人会自动缩短回复并额外发送火山引擎合成音频
 - **贴纸策略发送** — 支持在回复后按规则/模型策略自动发送 Telegram Sticker，支持 `append` / `replace` / `command_only` 模式
 - **管理员热修改配置** — 管理员可在私聊中通过 `/admin` 查看、修改并持久化保存全部配置项，支持 `cancel` 返回上一步
@@ -52,6 +53,11 @@ cp sticker_rules.json.example ./data/sticker_rules.json
 cp .env.example .env
 # 编辑 ./data/config.yaml / ./data/sticker_rules.json / .env
 
+# 如需 SSH Dashboard，先准备 host key 与 authorized_keys
+ssh-keygen -t ed25519 -f ./data/dashboard_ssh_ed25519 -N ""
+# 将你自己的 SSH 公钥追加到 ./data/dashboard_authorized_keys
+# 然后在 ./data/config.yaml 中设置 DASHBOARD_SSH_ENABLED: true
+
 # 运行
 CONFIG_FILE=./data/config.yaml go run ./cmd/llm_telebot
 ```
@@ -69,6 +75,8 @@ cp .env.example .env
 # 编辑 ./data/config.yaml / ./data/sticker_rules.json 与 .env
 
 # 如需 MCP 工具，编辑 ./mcp_config.json（可选）
+# 如需 SSH Dashboard，请确认 ./data/config.yaml 中已启用 DASHBOARD_SSH_ENABLED
+# compose 文件默认已映射 23234:23234
 
 # 使用预构建镜像一键启动
 podman compose up -f ./docker-compose.deploy.yml -d
@@ -91,6 +99,7 @@ cp config.yaml.example ./data/config.yaml
 cp sticker_rules.json.example ./data/sticker_rules.json
 cp .env.example .env
 
+# compose 文件默认已映射 23234:23234，启用 Dashboard 后可直接从宿主机 SSH 登录
 docker compose up -d
 docker compose logs -f
 docker compose down
@@ -105,7 +114,7 @@ cp sticker_rules.json.example ./data/sticker_rules.json
 cp .env.example .env
 
 docker build -t llm-telebot .
-docker run --env-file .env -v "$(pwd)/data:/app/data" llm-telebot
+docker run --env-file .env -p 23234:23234 -v "$(pwd)/data:/app/data" llm-telebot
 ```
 
 ### 直接拉取镜像运行
@@ -119,9 +128,73 @@ cp sticker_rules.json.example ./data/sticker_rules.json
 cp .env.example .env
 
 podman pull ghcr.io/lxbme/llm_telebot:latest
-podman run --env-file .env -v "$(pwd)/data:/app/data" ghcr.io/lxbme/llm_telebot:latest
+podman run --env-file .env -p 23234:23234 -v "$(pwd)/data:/app/data" ghcr.io/lxbme/llm_telebot:latest
 ```
 
+
+## SSH Dashboard
+
+项目内置一个只读 SSH TUI 看板，用于查看全局概览、按 `userID` 聚合的用户详情、按聊天维度的定时任务，以及详细事件流。
+
+### Dashboard 能看到什么
+
+- `Overview`：最近窗口请求数、成功率、总 token、热点聊天、最近活跃用户/聊天
+- `Users`：左侧用户列表，右侧展示 `userID`、`username`、`displayName`、profile、个人 MCP、个人 usage 汇总
+- `Schedules`：按聊天查看定时任务、下次执行时间、上次执行时间、最近错误
+- `Logs`：比进程终端更细的结构化事件流，包括对话、usage、tool、MCP、schedule、profile、config 等事件
+
+### 启用步骤
+
+1. 生成服务端 host key：
+
+```bash
+ssh-keygen -t ed25519 -f ./data/dashboard_ssh_ed25519 -N ""
+```
+
+2. 创建 `authorized_keys` 白名单：
+
+```bash
+mkdir -p ./data
+touch ./data/dashboard_authorized_keys
+chmod 600 ./data/dashboard_authorized_keys
+```
+
+3. 把允许登录的客户端公钥写进去，一行一个，例如：
+
+```text
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... your-name@machine
+```
+
+4. 在 `./data/config.yaml` 中开启：
+
+```yaml
+DASHBOARD_SSH_ENABLED: true
+DASHBOARD_SSH_LISTEN: :23234
+DASHBOARD_SSH_HOST_KEY_PATH: ./data/dashboard_ssh_ed25519
+DASHBOARD_SSH_AUTHORIZED_KEYS_PATH: ./data/dashboard_authorized_keys
+```
+
+5. 重启 bot 进程或容器。
+
+### 本地连接示例
+
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
+```
+
+说明：
+
+- `-i` 指向的是与你写入 `authorized_keys` 的那条公钥相对应的私钥
+- 用户名只是 SSH 会话字段，占位即可，例如 `dashboard`
+- 如果通过 Docker/Podman 运行，需要 compose 暴露 `23234:23234`，项目中的两个 compose 文件已包含该映射
+
+### TUI 快捷键
+
+- `Tab` / `Shift+Tab`：切换 Tab
+- `h` / `l`：切换 Tab
+- `j` / `k`：在列表中移动
+- `r`：手动刷新
+- `q`：退出
 
 ## 配置说明
 
@@ -168,6 +241,23 @@ podman run --env-file .env -v "$(pwd)/data:/app/data" ghcr.io/lxbme/llm_telebot:
 | `SYSTEM_PROMPT` | 否 | `You are a helpful assistant.` | 系统提示词 |
 | `CONTEXT_MAX_MESSAGES` | 否 | `20` | 每个对话保留的最大消息数（滑动窗口） |
 | `MAX_TOKENS` | 否 | `0` | 每次回复的最大 token 数，0 表示不限 |
+
+### SSH Dashboard（可选）
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `DASHBOARD_SSH_ENABLED` | `false` | 是否启用内嵌 SSH TUI 看板 |
+| `DASHBOARD_SSH_LISTEN` | `:23234` | Dashboard SSH 监听地址 |
+| `DASHBOARD_SSH_HOST_KEY_PATH` | `./data/dashboard_ssh_ed25519` | SSH 服务端 host key 私钥路径 |
+| `DASHBOARD_SSH_AUTHORIZED_KEYS_PATH` | `./data/dashboard_authorized_keys` | 允许登录的客户端公钥白名单文件 |
+| `DASHBOARD_SSH_IDLE_TIMEOUT` | `1h` | 单个 SSH session 的空闲超时 |
+| `DASHBOARD_SSH_MAX_SESSIONS` | `8` | 同时允许的最大 Dashboard 会话数 |
+
+说明：
+
+- `HOST_KEY` 是服务器证明自身身份的私钥文件，应该保密
+- `AUTHORIZED_KEYS` 是客户端公钥白名单，格式与 OpenSSH 的 `authorized_keys` 一致
+- 客户端连接时仍需要本地持有与公钥匹配的私钥，服务器不会保存你的私钥
 
 ### 火山引擎 TTS（可选）
 

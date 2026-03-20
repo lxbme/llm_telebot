@@ -76,6 +76,7 @@ type runtimeSnapshot struct {
 	stickerModel   string
 	chatDB         *ChatDB
 	store          *HistoryStore
+	stats          *StatsManager
 	summaries      *SummaryStore
 	profiles       *ProfileStore
 	tools          *ToolRegistry
@@ -105,6 +106,7 @@ func (b *Bot) snapshot() runtimeSnapshot {
 		stickerModel:   b.stickerModel,
 		chatDB:         b.chatDB,
 		store:          b.store,
+		stats:          b.stats,
 		summaries:      b.summaries,
 		profiles:       b.profiles,
 		tools:          b.tools,
@@ -1067,6 +1069,9 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 		if b.store != nil {
 			b.store.db = newChatDB
 		}
+		if b.stats != nil {
+			b.stats.RebindDB(newChatDB)
+		}
 		if b.summaries != nil {
 			b.summaries.db = newChatDB
 		}
@@ -1088,6 +1093,9 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 
 	if chatDBChanged {
 		b.persistRuntimeChatState(newChatDB)
+		if b.stats != nil {
+			_ = b.stats.Flush()
+		}
 		if oldChatDB != nil {
 			_ = oldChatDB.Close()
 		}
@@ -1105,5 +1113,10 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	}
 
 	log.Printf("[config] runtime config updated")
+	b.recordDashboardEvent(DashboardEvent{
+		Type:    DashboardEventConfigReloaded,
+		Summary: "runtime config updated",
+		Success: true,
+	})
 	return nil
 }

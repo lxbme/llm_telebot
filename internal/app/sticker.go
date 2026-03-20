@@ -295,7 +295,7 @@ func (b *Bot) sendSticker(chat *tele.Chat, fileID string) error {
 	return nil
 }
 
-func (b *Bot) selectStickerLabel(userMsg, finalText string) string {
+func (b *Bot) selectStickerLabel(chatID int64, userMsg, finalText string) string {
 	snap := b.snapshot()
 	if snap.stickers == nil {
 		return ""
@@ -316,14 +316,15 @@ func (b *Bot) selectStickerLabel(userMsg, finalText string) string {
 	if !snap.cfg.StickerModelEnabled || snap.stickerAI == nil {
 		return ""
 	}
-	return b.selectStickerLabelWithModel(userText, finalText, snap.stickers.Labels())
+	return b.selectStickerLabelWithModel(chatID, extractUserIDFromContent(userMsg), userText, finalText, snap.stickers.Labels())
 }
 
-func (b *Bot) selectStickerLabelWithModel(userText, finalText string, labels []string) string {
+func (b *Bot) selectStickerLabelWithModel(chatID, userID int64, userText, finalText string, labels []string) string {
 	if len(labels) == 0 {
 		return ""
 	}
 	snap := b.snapshot()
+	usageCtx := newUsageContext(chatID, userID, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -338,7 +339,9 @@ func (b *Bot) selectStickerLabelWithModel(userText, finalText string, labels []s
 		MaxTokens:   16,
 		Temperature: 0,
 	}
+	started := time.Now()
 	resp, err := snap.stickerAI.CreateChatCompletion(ctx, req)
+	b.recordUsageEvent(usageEvent(usageCtx, UsageCallStickerModel, firstNonEmpty(resp.Model, snap.stickerModel), false, 0, started, &resp.Usage, err == nil))
 	if err != nil {
 		log.Printf("[sticker] model selection error: %v", err)
 		return ""
@@ -383,7 +386,7 @@ func (b *Bot) finalizeStickerReply(
 		return
 	}
 
-	label := b.selectStickerLabel(userMsg.Content, finalText)
+	label := b.selectStickerLabel(chatID, userMsg.Content, finalText)
 	if label == "" {
 		return
 	}

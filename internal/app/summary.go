@@ -97,6 +97,7 @@ Rules:
 // Safe to call from a goroutine.
 func (b *Bot) summarizeOverflow(chatID int64) {
 	snap := b.snapshot()
+	usageCtx := newUsageContext(chatID, 0, 0)
 	// Acquire per-chat lock.
 	if !snap.summaries.MarkSummarizing(chatID) {
 		return // another goroutine is already summarizing this chat
@@ -137,6 +138,7 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	started := time.Now()
 	resp, err := snap.summaryAI.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: snap.summaryModel,
 		Messages: []openai.ChatCompletionMessage{
@@ -146,6 +148,7 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 		MaxTokens:   800,
 		Temperature: 0.2,
 	})
+	b.recordUsageEvent(usageEvent(usageCtx, UsageCallSummary, firstNonEmpty(resp.Model, snap.summaryModel), false, 0, started, &resp.Usage, err == nil))
 	if err != nil {
 		log.Printf("[summary] LLM error for chat %d: %v", chatID, err)
 		return
@@ -161,5 +164,12 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 	}
 
 	snap.summaries.Set(chatID, summary)
+	b.recordDashboardEvent(DashboardEvent{
+		Type:    DashboardEventSummaryUpdated,
+		ChatID:  chatID,
+		Model:   firstNonEmpty(resp.Model, snap.summaryModel),
+		Summary: truncateDashboardText(summary, 200),
+		Success: true,
+	})
 	log.Printf("[summary] updated chat %d (%d chars)", chatID, len(summary))
 }

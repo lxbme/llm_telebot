@@ -473,6 +473,13 @@ func (r *TaskRunner) runDue(now time.Time) {
 
 func (r *TaskRunner) execute(chatID int64, task ScheduledTask) {
 	log.Printf("[schedule] triggering chat=%d id=%s", chatID, task.ID)
+	r.bot.recordDashboardEvent(DashboardEvent{
+		Type:    DashboardEventScheduleTriggered,
+		ChatID:  chatID,
+		Summary: fmt.Sprintf("trigger schedule %s", task.ID),
+		Detail:  truncateDashboardText(task.Prompt, 160),
+		Success: true,
+	})
 
 	taskMsg := buildScheduledTaskMessage(task)
 	chat := &tele.Chat{ID: chatID}
@@ -482,6 +489,12 @@ func (r *TaskRunner) execute(chatID int64, task ScheduledTask) {
 	if err != nil {
 		errText = err.Error()
 		log.Printf("[schedule] trigger failed chat=%d id=%s: %v", chatID, task.ID, err)
+		r.bot.recordDashboardEvent(DashboardEvent{
+			Type:    DashboardEventScheduleFailed,
+			ChatID:  chatID,
+			Summary: fmt.Sprintf("schedule %s failed", task.ID),
+			Detail:  err.Error(),
+		})
 	}
 	r.store.MarkRunResult(chatID, task.ID, ranAt, errText)
 }
