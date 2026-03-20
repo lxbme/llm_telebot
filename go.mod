@@ -10,6 +10,8 @@ require (
 	gopkg.in/telebot.v3 v3.3.8
 )
 
+require github.com/robfig/cron/v3 v3.0.1 // indirect
+
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.1 // indirect

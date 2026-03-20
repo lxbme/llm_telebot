@@ -64,54 +64,58 @@ func (s *AdminConfigSessionStore) Clear(userID int64) {
 }
 
 type runtimeSnapshot struct {
-	cfg           Config
-	ai            *openai.Client
-	detectorAI    *openai.Client
-	detectorModel string
-	profileAI     *openai.Client
-	profileModel  string
-	summaryAI     *openai.Client
-	summaryModel  string
-	stickerAI     *openai.Client
-	stickerModel  string
-	chatDB        *ChatDB
-	store         *HistoryStore
-	summaries     *SummaryStore
-	profiles      *ProfileStore
-	tools         *ToolRegistry
-	mcpClients    *MCPClientManager
-	userTools     *UserToolManager
-	speechModes   *SpeechModeStore
-	tts           *VolcengineTTSClient
-	stickers      *StickerEngine
-	tg            *tele.Bot
+	cfg            Config
+	ai             *openai.Client
+	detectorAI     *openai.Client
+	detectorModel  string
+	profileAI      *openai.Client
+	profileModel   string
+	summaryAI      *openai.Client
+	summaryModel   string
+	stickerAI      *openai.Client
+	stickerModel   string
+	chatDB         *ChatDB
+	store          *HistoryStore
+	summaries      *SummaryStore
+	profiles       *ProfileStore
+	tools          *ToolRegistry
+	mcpClients     *MCPClientManager
+	userTools      *UserToolManager
+	tasks          *TaskStore
+	scheduleWizard *ScheduleWizardStore
+	speechModes    *SpeechModeStore
+	tts            *VolcengineTTSClient
+	stickers       *StickerEngine
+	tg             *tele.Bot
 }
 
 func (b *Bot) snapshot() runtimeSnapshot {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return runtimeSnapshot{
-		cfg:           b.cfg,
-		ai:            b.ai,
-		detectorAI:    b.detectorAI,
-		detectorModel: b.detectorModel,
-		profileAI:     b.profileAI,
-		profileModel:  b.profileModel,
-		summaryAI:     b.summaryAI,
-		summaryModel:  b.summaryModel,
-		stickerAI:     b.stickerAI,
-		stickerModel:  b.stickerModel,
-		chatDB:        b.chatDB,
-		store:         b.store,
-		summaries:     b.summaries,
-		profiles:      b.profiles,
-		tools:         b.tools,
-		mcpClients:    b.mcpClients,
-		userTools:     b.userTools,
-		speechModes:   b.speechModes,
-		tts:           b.tts,
-		stickers:      b.stickers,
-		tg:            b.tg,
+		cfg:            b.cfg,
+		ai:             b.ai,
+		detectorAI:     b.detectorAI,
+		detectorModel:  b.detectorModel,
+		profileAI:      b.profileAI,
+		profileModel:   b.profileModel,
+		summaryAI:      b.summaryAI,
+		summaryModel:   b.summaryModel,
+		stickerAI:      b.stickerAI,
+		stickerModel:   b.stickerModel,
+		chatDB:         b.chatDB,
+		store:          b.store,
+		summaries:      b.summaries,
+		profiles:       b.profiles,
+		tools:          b.tools,
+		mcpClients:     b.mcpClients,
+		userTools:      b.userTools,
+		tasks:          b.tasks,
+		scheduleWizard: b.scheduleWizard,
+		speechModes:    b.speechModes,
+		tts:            b.tts,
+		stickers:       b.stickers,
+		tg:             b.tg,
 	}
 }
 
@@ -945,6 +949,23 @@ func (b *Bot) persistRuntimeChatState(db *ChatDB) {
 			db.SaveSummary(chatID, summary)
 		}
 	}
+
+	if snap.tasks != nil {
+		snap.tasks.mu.RLock()
+		taskCopy := make(map[int64][]ScheduledTask, len(snap.tasks.tasks))
+		for chatID, chatTasks := range snap.tasks.tasks {
+			items := make([]ScheduledTask, 0, len(chatTasks))
+			for _, task := range chatTasks {
+				items = append(items, task)
+			}
+			taskCopy[chatID] = items
+		}
+		snap.tasks.mu.RUnlock()
+
+		for chatID, tasks := range taskCopy {
+			db.SaveSchedules(chatID, tasks)
+		}
+	}
 }
 
 func (b *Bot) applyRuntimeConfig(next Config) error {
@@ -1048,6 +1069,9 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 		}
 		if b.summaries != nil {
 			b.summaries.db = newChatDB
+		}
+		if b.tasks != nil {
+			b.tasks.RebindDB(newChatDB)
 		}
 	}
 

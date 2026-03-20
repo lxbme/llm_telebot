@@ -425,29 +425,32 @@ func (s *HistoryStore) persistChat(chatID int64) {
 // ─── Bot ──────────────────────────────────────────────────────────────────────
 
 type Bot struct {
-	mu            sync.RWMutex
-	cfg           Config
-	ai            *openai.Client // main LLM client
-	detectorAI    *openai.Client // lighter model for relevance detection (may equal ai)
-	detectorModel string         // model name for relevance detection
-	profileAI     *openai.Client // LLM client for profile extraction (may equal ai)
-	profileModel  string         // model name for profile extraction
-	summaryAI     *openai.Client // LLM client for conversation summarisation (may equal ai)
-	summaryModel  string         // model name for conversation summarisation
-	stickerAI     *openai.Client // LLM client for sticker strategy (may equal ai)
-	stickerModel  string         // model name for sticker strategy
-	chatDB        *ChatDB        // persistent chat storage (nil-safe)
-	store         *HistoryStore
-	summaries     *SummaryStore     // per-chat conversation summaries
-	profiles      *ProfileStore     // NoSQL user-profile store (nil if disabled)
-	tools         *ToolRegistry     // global registered MCP tools (nil if disabled)
-	mcpClients    *MCPClientManager // global remote MCP server connections (nil if none)
-	userTools     *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
-	speechModes   *SpeechModeStore
-	adminSessions *AdminConfigSessionStore
-	tts           *VolcengineTTSClient
-	stickers      *StickerEngine
-	tg            *tele.Bot
+	mu             sync.RWMutex
+	cfg            Config
+	ai             *openai.Client // main LLM client
+	detectorAI     *openai.Client // lighter model for relevance detection (may equal ai)
+	detectorModel  string         // model name for relevance detection
+	profileAI      *openai.Client // LLM client for profile extraction (may equal ai)
+	profileModel   string         // model name for profile extraction
+	summaryAI      *openai.Client // LLM client for conversation summarisation (may equal ai)
+	summaryModel   string         // model name for conversation summarisation
+	stickerAI      *openai.Client // LLM client for sticker strategy (may equal ai)
+	stickerModel   string         // model name for sticker strategy
+	chatDB         *ChatDB        // persistent chat storage (nil-safe)
+	store          *HistoryStore
+	summaries      *SummaryStore     // per-chat conversation summaries
+	profiles       *ProfileStore     // NoSQL user-profile store (nil if disabled)
+	tools          *ToolRegistry     // global registered MCP tools (nil if disabled)
+	mcpClients     *MCPClientManager // global remote MCP server connections (nil if none)
+	userTools      *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
+	tasks          *TaskStore
+	scheduler      *TaskRunner
+	scheduleWizard *ScheduleWizardStore
+	speechModes    *SpeechModeStore
+	adminSessions  *AdminConfigSessionStore
+	tts            *VolcengineTTSClient
+	stickers       *StickerEngine
+	tg             *tele.Bot
 }
 
 func NewBot(cfg Config) (*Bot, error) {
@@ -543,30 +546,34 @@ func NewBot(cfg Config) (*Bot, error) {
 			cfg.StickerMode, cfg.StickerRulesPath, stickerModel)
 	}
 
-	return &Bot{
-		cfg:           cfg,
-		ai:            aiClient,
-		detectorAI:    detectorClient,
-		detectorModel: detectorModel,
-		profileAI:     profileClient,
-		profileModel:  profileModel,
-		summaryAI:     summaryClient,
-		summaryModel:  summaryModel,
-		stickerAI:     stickerClient,
-		stickerModel:  stickerModel,
-		chatDB:        chatDB,
-		store:         NewHistoryStore(chatDB),
-		summaries:     NewSummaryStore(chatDB),
-		profiles:      profiles,
-		tools:         toolRegistry,
-		mcpClients:    mcpManager,
-		userTools:     userToolMgr,
-		speechModes:   NewSpeechModeStore(),
-		adminSessions: NewAdminConfigSessionStore(),
-		tts:           ttsClient,
-		stickers:      stickerEngine,
-		tg:            tgBot,
-	}, nil
+	bot := &Bot{
+		cfg:            cfg,
+		ai:             aiClient,
+		detectorAI:     detectorClient,
+		detectorModel:  detectorModel,
+		profileAI:      profileClient,
+		profileModel:   profileModel,
+		summaryAI:      summaryClient,
+		summaryModel:   summaryModel,
+		stickerAI:      stickerClient,
+		stickerModel:   stickerModel,
+		chatDB:         chatDB,
+		store:          NewHistoryStore(chatDB),
+		summaries:      NewSummaryStore(chatDB),
+		profiles:       profiles,
+		tools:          toolRegistry,
+		mcpClients:     mcpManager,
+		userTools:      userToolMgr,
+		tasks:          NewTaskStore(chatDB),
+		scheduleWizard: NewScheduleWizardStore(),
+		speechModes:    NewSpeechModeStore(),
+		adminSessions:  NewAdminConfigSessionStore(),
+		tts:            ttsClient,
+		stickers:       stickerEngine,
+		tg:             tgBot,
+	}
+	bot.scheduler = NewTaskRunner(bot, bot.tasks)
+	return bot, nil
 }
 
 // isAllowed checks whether a message from the given chat/user is permitted.
@@ -625,11 +632,22 @@ func (b *Bot) Run() {
 	b.tg.Handle("/mcp_list", b.handleMCPList)
 	b.tg.Handle("/mcp_del", b.handleMCPDel)
 	b.tg.Handle("/mcp_clear", b.handleMCPClear)
+	b.tg.Handle("/schedule", b.handleScheduleCommand)
+	b.tg.Handle("/schedule_new", b.handleScheduleNewCommand)
+	b.tg.Handle("/schedule_help", b.handleScheduleCommand)
+	b.tg.Handle("/schedule_list", b.handleScheduleListCommand)
+	b.tg.Handle("/schedule_example", b.handleScheduleExampleCommand)
+	b.tg.Handle("/schedule_pause", b.handleSchedulePauseCommand)
+	b.tg.Handle("/schedule_resume", b.handleScheduleResumeCommand)
+	b.tg.Handle("/schedule_del", b.handleScheduleDeleteCommandAlias)
 	b.tg.Handle("/admin", b.handleAdminCommand)
 	adminCancelBtn := &tele.Btn{Unique: adminCancelButtonUnique}
 	b.tg.Handle(adminCancelBtn, b.handleAdminCancel)
 	b.tg.Handle(tele.OnText, b.handleText)
 
+	if b.scheduler != nil {
+		b.scheduler.Start()
+	}
 	log.Printf("Bot @%s is running…", b.tg.Me.Username)
 	b.tg.Start()
 }
@@ -936,6 +954,9 @@ func (b *Bot) handleText(c tele.Context) error {
 	if handled, err := b.handleAdminTextIfNeeded(c, text); handled {
 		return err
 	}
+	if handled, err := b.handleScheduleTextIfNeeded(c, text); handled {
+		return err
+	}
 
 	if !b.isAllowed(c) {
 		log.Printf("Access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
@@ -971,6 +992,9 @@ func (b *Bot) handleText(c tele.Context) error {
 				return c.Reply(fmt.Sprintf("❌ Failed to add MCP servers: %v", err))
 			}
 			return c.Reply(formatMCPAddResult(result))
+		}
+		if handled, err := b.handleScheduleMessage(c, text); handled {
+			return err
 		}
 	}
 
@@ -1022,30 +1046,31 @@ func (b *Bot) handleText(c tele.Context) error {
 		return c.Reply("Please send me some text.")
 	}
 
-	chatID := c.Chat().ID
 	sender := msg.Sender
-
-	// Build the user message but do NOT append it to history yet.
-	// We will atomically append (user msg + assistant reply) after the
-	// LLM finishes, so concurrent requests never interleave.
 	userMsg := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
 		Name:    sanitizeName(sender.ID),
 		Content: buildUserContent(sender, text),
 	}
+	return b.startChatFlow(c.Chat(), sender, userMsg, true)
+}
 
-	// Snapshot current history and build the prompt.
+func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.ChatCompletionMessage, includeContext bool) error {
+	if chat == nil {
+		return fmt.Errorf("chat is nil")
+	}
+
+	chatID := chat.ID
 	snap := b.snapshot()
-	history := snap.store.Get(chatID)
-
-	// Inject user profiles of conversation participants into the system prompt.
-	profileSection := b.buildProfileSection(append(history, userMsg))
-	systemPrompt := snap.cfg.SystemPrompt + b.speechInstruction(chatID) + profileSection
-
-	// Inject conversation summary (compressed history beyond the sliding window).
-	if snap.cfg.SummaryEnabled {
-		if summary := snap.summaries.Get(chatID); summary != "" {
-			systemPrompt += "\n\n=== Previous Conversation Summary ===\n" + summary
+	var history []openai.ChatCompletionMessage
+	systemPrompt := snap.cfg.SystemPrompt + b.speechInstruction(chatID)
+	if includeContext {
+		history = snap.store.Get(chatID)
+		systemPrompt += b.buildProfileSection(append(history, userMsg))
+		if snap.cfg.SummaryEnabled {
+			if summary := snap.summaries.Get(chatID); summary != "" {
+				systemPrompt += "\n\n=== Previous Conversation Summary ===\n" + summary
+			}
 		}
 	}
 
@@ -1055,15 +1080,12 @@ func (b *Bot) handleText(c tele.Context) error {
 	messages = append(messages, history...)
 	messages = append(messages, userMsg)
 
-	// Send the initial placeholder message.
-	placeholder, err := snap.tg.Send(c.Chat(), "⏳ Thinking…")
+	placeholder, err := snap.tg.Send(chat, "⏳ Thinking…")
 	if err != nil {
 		return fmt.Errorf("failed to send placeholder: %w", err)
 	}
 
-	// Run streaming in a goroutine so we can tick-update Telegram.
 	go b.streamReply(chatID, userMsg, messages, placeholder, sender)
-
 	return nil
 }
 

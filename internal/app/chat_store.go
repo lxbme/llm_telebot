@@ -17,6 +17,7 @@ var (
 	historyBucket  = []byte("chat_history")
 	overflowBucket = []byte("chat_overflow")
 	summaryBucket  = []byte("chat_summaries")
+	scheduleBucket = []byte("chat_schedules")
 )
 
 // ChatDB wraps a bbolt database shared by HistoryStore and SummaryStore for
@@ -35,7 +36,7 @@ func OpenChatDB(path string) (*ChatDB, error) {
 		return nil, fmt.Errorf("open chat db: %w", err)
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{historyBucket, overflowBucket, summaryBucket} {
+		for _, b := range [][]byte{historyBucket, overflowBucket, summaryBucket, scheduleBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -224,5 +225,64 @@ func (c *ChatDB) DeleteSummary(chatID int64) {
 	}
 	c.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(summaryBucket).Delete(chatIDKey(chatID))
+	})
+}
+
+// ─── Schedule Persistence ────────────────────────────────────────────────────
+
+// SaveSchedules persists the scheduled task list for a chat.
+// An empty slice deletes the key.
+func (c *ChatDB) SaveSchedules(chatID int64, tasks []ScheduledTask) {
+	if c == nil {
+		return
+	}
+	if len(tasks) == 0 {
+		c.DeleteSchedules(chatID)
+		return
+	}
+	data, err := json.Marshal(tasks)
+	if err != nil {
+		log.Printf("[chat-db] marshal schedules error for chat %d: %v", chatID, err)
+		return
+	}
+	if err := c.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(scheduleBucket).Put(chatIDKey(chatID), data)
+	}); err != nil {
+		log.Printf("[chat-db] save schedules error for chat %d: %v", chatID, err)
+	}
+}
+
+// LoadAllSchedules loads all persisted scheduled tasks into a map.
+func (c *ChatDB) LoadAllSchedules() map[int64][]ScheduledTask {
+	if c == nil {
+		return nil
+	}
+	result := make(map[int64][]ScheduledTask)
+	c.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(scheduleBucket)
+		return b.ForEach(func(k, v []byte) error {
+			chatID, err := strconv.ParseInt(string(k), 10, 64)
+			if err != nil {
+				return nil
+			}
+			var tasks []ScheduledTask
+			if err := json.Unmarshal(v, &tasks); err != nil {
+				log.Printf("[chat-db] unmarshal schedules for chat %d: %v", chatID, err)
+				return nil
+			}
+			result[chatID] = tasks
+			return nil
+		})
+	})
+	return result
+}
+
+// DeleteSchedules removes persisted scheduled tasks for a chat.
+func (c *ChatDB) DeleteSchedules(chatID int64) {
+	if c == nil {
+		return
+	}
+	c.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(scheduleBucket).Delete(chatIDKey(chatID))
 	})
 }
