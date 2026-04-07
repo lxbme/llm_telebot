@@ -21,6 +21,7 @@
 - **动态 per-user MCP** — 每个用户可在聊天中通过发送 JSON 导入自己专属的 MCP 服务器，持久化存储、重启不丢失，通过命令管理
 - **聊天级定时任务** — 每个聊天都可以配置独立的定时任务，按 cron 表达式定时触发，并复用正常 chat 流程向 LLM 发送 prompt
 - **SSH TUI 管理看板** — 可通过 SSH 登录内嵌 Dashboard，基于 [Bubble Tea](https://github.com/charmbracelet/bubbletea) 呈现多 Tab 运行态、用户画像、任务和详细事件流
+- **语音输入 (STT)** — 接收 Telegram 语音消息，通过 OpenAI 兼容 STT API（Whisper、gpt-4o-transcribe 等）转写为文字后，走与文字消息完全相同的对话流程（历史记忆、工具调用、TTS 输出等）；可选是否向用户回显转写结果
 - **可选 TTS 语音播报** — 管理员可按聊天开启 `/speach` 模式，机器人会自动缩短回复并额外发送火山引擎合成音频
 - **贴纸策略发送** — 支持在回复后按规则/模型策略自动发送 Telegram Sticker，支持 `append` / `replace` / `command_only` 模式
 - **管理员热修改配置** — 管理员可在私聊中通过 `/admin` 查看、修改并持久化保存全部配置项，支持 `cancel` 返回上一步
@@ -275,6 +276,25 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 | `VOLCENGINE_TTS_SEND_TEXT` | `true` | `/speach` 模式下是否同时保留文字回复；设为 `false` 时默认只发语音，若语音失败会回退显示文字 |
 
 > 当前实现使用火山引擎 SSE 单向流式接口：[`/api/v3/tts/unidirectional/sse`](https://www.volcengine.com/docs/6561/1598757?lang=zh#_3-sse%E6%A0%BC%E5%BC%8F%E6%8E%A5%E5%8F%A3%E8%AF%B4%E6%98%8E)。bot 会在本地通过 `ffmpeg` 将火山返回的音频转成 Telegram 语音所需的 `ogg/opus` 后再发送。
+
+### 语音输入 STT（可选）
+
+接收 Telegram 语音消息，通过任何兼容 OpenAI `/v1/audio/transcriptions` 接口的端点进行转写。转写结果会以普通用户文本消息的形式进入完整对话流程（历史记录、工具调用、TTS、画像提取等）。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `STT_ENABLED` | `false` | 是否接收并转写语音消息 |
+| `STT_API_BASE` | — | STT 端点 Base URL（留空使用 OpenAI 官方默认） |
+| `STT_API_KEY` | — | STT 端点 API Key（必填，当 `STT_ENABLED=true` 时） |
+| `STT_MODEL` | `whisper-1` | STT 模型名称，例如 `whisper-1`、`gpt-4o-transcribe` |
+| `STT_DISPLAY` | `true` | 转写成功后是否以 `🎙️ <转写内容>` 回复用户；设为 `false` 则静默处理 |
+
+说明：
+
+- STT 使用独立 API Key，**不会**回退到主模型配置，需单独填写
+- Telegram 语音消息为 OGG/OPUS 格式，直接以流式传输发送给 STT 接口，无本地落盘
+- 语音消息同样受 `ALLOWED_USERS` / `ALLOWED_GROUPS` 白名单控制；未配置 STT 时，语音消息被静默忽略
+- 可通过 `/admin` 热修改所有 STT 配置项，无需重启
 
 ### Telegram Sticker 策略（可选）
 
@@ -615,6 +635,13 @@ admin - 管理员配置面板
 ## 架构简述
 
 ```
+用户语音 → handleVoice()
+            ├─ 权限检查: isAllowed()
+            ├─ STT 未配置 → 静默忽略
+            ├─ 下载 OGG/OPUS 流 → STT API (/v1/audio/transcriptions)
+            ├─ STT_DISPLAY=true → 回复 🎙️ <转写内容>
+            └─ 以转写文本构建 userMsg → startChatFlow() （与文字消息完全相同的后续流程）
+
 用户消息 → handleText()
             ├─ 权限检查: isAllowed()
             │   ├─ 私聊: 检查 ALLOWED_USERS

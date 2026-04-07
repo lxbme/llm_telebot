@@ -105,6 +105,13 @@ type Config struct {
 	StickerModelBase       string
 	StickerModelKey        string
 	StickerModel           string
+
+	// STT (Speech-to-Text) settings.
+	STTEnabled  bool
+	STTAPIBase  string
+	STTAPIKey   string
+	STTModel    string
+	STTDisplay  bool // when true, send transcription as acknowledgment before LLM reply
 }
 
 func loadConfig() Config {
@@ -269,6 +276,11 @@ func loadConfig() Config {
 		StickerModelBase:               get("STICKER_MODEL_BASE", ""),
 		StickerModelKey:                get("STICKER_MODEL_KEY", ""),
 		StickerModel:                   get("STICKER_MODEL", ""),
+		STTEnabled:                     strings.ToLower(get("STT_ENABLED", "false")) == "true",
+		STTAPIBase:                     get("STT_API_BASE", ""),
+		STTAPIKey:                      get("STT_API_KEY", ""),
+		STTModel:                       get("STT_MODEL", "whisper-1"),
+		STTDisplay:                     strings.ToLower(get("STT_DISPLAY", "true")) != "false",
 	}
 	if err := ensureConfigFileExists(cfg); err != nil {
 		log.Printf("Warning: failed to bootstrap config file %s: %v", effectiveConfigFilePath(cfg), err)
@@ -474,6 +486,7 @@ type Bot struct {
 	speechModes      *SpeechModeStore
 	adminSessions    *AdminConfigSessionStore
 	tts              *VolcengineTTSClient
+	stt              *STTClient
 	stickers         *StickerEngine
 	dashboardEvents  *DashboardEventHub
 	dashboardService *DashboardService
@@ -566,6 +579,11 @@ func NewBot(cfg Config) (*Bot, error) {
 			ttsClient.resourceID, ttsClient.speaker, ttsClient.audioFormat)
 	}
 
+	sttClient := NewSTTClient(cfg)
+	if sttClient != nil {
+		log.Printf("STT enabled (model: %s)", cfg.STTModel)
+	}
+
 	stickerEngine, err := NewStickerEngine(cfg.StickerRulesPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init sticker rules: %w", err)
@@ -601,6 +619,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		speechModes:     NewSpeechModeStore(),
 		adminSessions:   NewAdminConfigSessionStore(),
 		tts:             ttsClient,
+		stt:             sttClient,
 		stickers:        stickerEngine,
 		dashboardEvents: dashboardEvents,
 		tg:              tgBot,
@@ -684,6 +703,7 @@ func (b *Bot) Run() {
 	adminCancelBtn := &tele.Btn{Unique: adminCancelButtonUnique}
 	b.tg.Handle(adminCancelBtn, b.handleAdminCancel)
 	b.tg.Handle(tele.OnText, b.handleText)
+	b.tg.Handle(tele.OnVoice, b.handleVoice)
 
 	if b.scheduler != nil {
 		b.scheduler.Start()
@@ -1136,6 +1156,56 @@ func (b *Bot) handleText(c tele.Context) error {
 		Role:    openai.ChatMessageRoleUser,
 		Name:    sanitizeName(sender.ID),
 		Content: buildUserContent(sender, text),
+	}
+	return b.startChatFlow(c.Chat(), sender, userMsg, true)
+}
+
+func (b *Bot) handleVoice(c tele.Context) error {
+	msg := c.Message()
+	if msg == nil || msg.Voice == nil {
+		return nil
+	}
+	if !b.isAllowed(c) {
+		log.Printf("[stt] access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
+
+	snap := b.snapshot()
+	if snap.stt == nil {
+		return nil // STT not configured; silently ignore voice messages
+	}
+
+	reader, err := snap.tg.File(&msg.Voice.File)
+	if err != nil {
+		log.Printf("[stt] failed to download voice: %v", err)
+		return c.Reply("❌ Failed to download voice message.")
+	}
+	defer reader.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	text, err := snap.stt.Transcribe(ctx, reader)
+	if err != nil {
+		log.Printf("[stt] transcription error: %v", err)
+		return c.Reply("❌ Voice transcription failed. Please try again.")
+	}
+	if text == "" {
+		return c.Reply("⚠️ Could not transcribe voice message (empty result).")
+	}
+
+	// Acknowledge the transcription so the user knows what was heard.
+	if snap.cfg.STTDisplay {
+		if _, err := snap.tg.Reply(msg, "🎙️ "+text); err != nil {
+			log.Printf("[stt] failed to send acknowledgment: %v", err)
+		}
+	}
+
+	sender := msg.Sender
+	userMsg := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Name:    sanitizeName(sender.ID),
+		Content: buildUserContent(sender, "[Voice message, transcribed]\n"+text),
 	}
 	return b.startChatFlow(c.Chat(), sender, userMsg, true)
 }

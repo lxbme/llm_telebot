@@ -86,3 +86,12 @@ STICKER_MODEL_ENABLED: false
 STICKER_MODEL_BASE: ""
 STICKER_MODEL_KEY: ""
 STICKER_MODEL: ""
+
+# ── STT (Speech-to-Text) ──────────────────────────────────────────────────────
+# 启用后，机器人可接收 Telegram 语音消息并通过 STT API 转为文字，触发完整对话流程。
+# 支持任何兼容 OpenAI /v1/audio/transcriptions 的端点（Whisper、gpt-4o-transcribe 等）。
+STT_ENABLED: false
+STT_API_BASE: ""
+STT_API_KEY: ""
+STT_MODEL: whisper-1
+STT_DISPLAY: true

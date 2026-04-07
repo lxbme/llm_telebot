@@ -86,6 +86,7 @@ type runtimeSnapshot struct {
 	scheduleWizard *ScheduleWizardStore
 	speechModes    *SpeechModeStore
 	tts            *VolcengineTTSClient
+	stt            *STTClient
 	stickers       *StickerEngine
 	tg             *tele.Bot
 }
@@ -116,6 +117,7 @@ func (b *Bot) snapshot() runtimeSnapshot {
 		scheduleWizard: b.scheduleWizard,
 		speechModes:    b.speechModes,
 		tts:            b.tts,
+		stt:            b.stt,
 		stickers:       b.stickers,
 		tg:             b.tg,
 	}
@@ -389,6 +391,21 @@ func allConfigOptions() []configOption {
 		stringOption(52, "STICKER_MODEL", "Model name for sticker strategy. Leave empty to fall back to primary model.", false,
 			func(cfg Config) string { return cfg.StickerModel },
 			func(cfg *Config, v string) { cfg.StickerModel = v }),
+		boolOption(53, "STT_ENABLED", "Enable voice message transcription via Speech-to-Text API.", false,
+			func(cfg Config) bool { return cfg.STTEnabled },
+			func(cfg *Config, v bool) { cfg.STTEnabled = v }),
+		stringOption(54, "STT_API_BASE", "Base URL for the STT endpoint (e.g. https://api.openai.com/v1). Leave empty for official OpenAI default.", false,
+			func(cfg Config) string { return cfg.STTAPIBase },
+			func(cfg *Config, v string) { cfg.STTAPIBase = v }),
+		stringOption(55, "STT_API_KEY", "API key for the STT endpoint.", true,
+			func(cfg Config) string { return cfg.STTAPIKey },
+			func(cfg *Config, v string) { cfg.STTAPIKey = v }),
+		stringOption(56, "STT_MODEL", "STT model name (e.g. whisper-1, gpt-4o-transcribe). Defaults to whisper-1.", false,
+			func(cfg Config) string { return cfg.STTModel },
+			func(cfg *Config, v string) { cfg.STTModel = v }),
+		boolOption(57, "STT_DISPLAY", "When enabled, send the transcription text as an acknowledgment before the LLM reply. Defaults to true.", false,
+			func(cfg Config) bool { return cfg.STTDisplay },
+			func(cfg *Config, v bool) { cfg.STTDisplay = v }),
 	}
 }
 
@@ -1034,6 +1051,7 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	}
 
 	newTTS := NewVolcengineTTSClient(next)
+	newSTT := NewSTTClient(next)
 	newStickerEngine, err := NewStickerEngine(next.StickerRulesPath)
 	if err != nil {
 		if newProfiles != nil && profilesChanged {
@@ -1062,6 +1080,7 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	b.stickerAI = stickerAI
 	b.stickerModel = stickerModel
 	b.tts = newTTS
+	b.stt = newSTT
 	b.stickers = newStickerEngine
 
 	if chatDBChanged {
