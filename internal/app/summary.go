@@ -147,6 +147,7 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 		Temperature: 0.2,
 	}
 	applyMaxTokens(&summaryReq, 800)
+	sanitizeBetaRequest(&summaryReq)
 	started := time.Now()
 	resp, err := snap.summaryAI.CreateChatCompletion(ctx, summaryReq)
 	b.recordUsageEvent(usageEvent(usageCtx, UsageCallSummary, firstNonEmpty(resp.Model, snap.summaryModel), false, 0, started, &resp.Usage, err == nil))

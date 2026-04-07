@@ -828,6 +828,7 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 		Messages: msgs,
 	}
 	applyMaxTokens(&req, 100)
+	sanitizeBetaRequest(&req)
 
 	// Retry up to 3 times on transient errors (EOF, timeout, etc.).
 	var resp openai.ChatCompletionResponse
@@ -1342,6 +1343,7 @@ func (b *Bot) streamReply(
 				Tools:    buildActiveTools(toolView, expandedServers, summaryMode),
 			}
 			applyMaxTokens(&req, snap.cfg.MaxTokens)
+			sanitizeBetaRequest(&req)
 
 			started := time.Now()
 			resp, err := snap.ai.CreateChatCompletion(ctx, req)
@@ -1469,6 +1471,7 @@ func (b *Bot) doStream(
 		},
 	}
 	applyMaxTokens(&req, snap.cfg.MaxTokens)
+	sanitizeBetaRequest(&req)
 
 	// If tools are available, include them so the model knows about them
 	// even in streaming mode. In summary mode use the same active tool set

@@ -175,6 +175,7 @@ func (g *MCPSummaryGenerator) EnsureSummary(ctx context.Context, prefix, serverN
 		Temperature: 0.2,
 	}
 	applyMaxTokens(&summaryReq, 150)
+	sanitizeBetaRequest(&summaryReq)
 	resp, err := g.client.CreateChatCompletion(ctx, summaryReq)
 	if err != nil {
 		log.Printf("[mcp_summary] failed to generate summary for %q: %v", serverName, err)

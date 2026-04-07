@@ -94,6 +94,7 @@ func (b *Bot) extractProfile(chatID, userID int64, username, displayName string,
 		Temperature: 0.1,
 	}
 	applyMaxTokens(&profileReq, 500)
+	sanitizeBetaRequest(&profileReq)
 	started := time.Now()
 	resp, err := snap.profileAI.CreateChatCompletion(ctx, profileReq)
 	b.recordUsageEvent(usageEvent(usageCtx, UsageCallProfileExtract, firstNonEmpty(resp.Model, snap.profileModel), false, 0, started, &resp.Usage, err == nil))

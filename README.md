@@ -28,7 +28,7 @@
 - **管理员热修改配置** — 管理员可在私聊中通过 `/admin` 查看、修改并持久化保存全部配置项，支持 `cancel` 返回上一步
 - **并发安全** — 快照 + 原子追加机制，多个并发请求不会导致上下文错乱
 - **白名单 / 权限控制** — 通过 `ALLOWED_USERS` 和 `ALLOWED_GROUPS` 限制 bot 的使用范围
-- **OpenAI 兼容** — 支持任何 OpenAI 兼容 API（如 DeepSeek、通义千问、Ollama 等）
+- **OpenAI 兼容** — 支持任何 OpenAI 兼容 API（如 DeepSeek、通义千问、Ollama 等）；自动适配新一代模型（o1/o3/o4、gpt-5+）的 API 限制：自动切换 `max_completion_tokens` 字段，并自动清除不受支持的采样参数（`temperature`、`top_p` 等）
 - **用户身份追踪** — 每条消息自动附带发送者信息，LLM 能区分不同用户
 
 ## 快速开始
@@ -242,7 +242,7 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 | `BOT_USERNAME` | 否 | 自动获取 | 机器人用户名（带 @ 前缀），用于群聊中检测 @提及 |
 | `SYSTEM_PROMPT` | 否 | `You are a helpful assistant.` | 系统提示词 |
 | `CONTEXT_MAX_MESSAGES` | 否 | `20` | 每个对话保留的最大消息数（滑动窗口） |
-| `MAX_TOKENS` | 否 | `0` | 每次回复的最大 token 数，0 表示不限。新一代模型（o1/o3/o4 系列及 gpt-5+）会自动切换为 `max_completion_tokens` 字段，无需额外配置 |
+| `MAX_TOKENS` | 否 | `0` | 每次回复的最大 token 数，0 表示不限。新一代模型（o1/o3/o4 系列及 gpt-5+）会自动切换为 `max_completion_tokens` 字段，并自动清除 `temperature`、`top_p` 等不受支持的采样参数，无需额外配置 |
 
 ### SSH Dashboard（可选）
 

@@ -20,6 +20,20 @@ func requiresMaxCompletionTokens(model string) bool {
 	return false
 }
 
+// sanitizeBetaRequest zeros out sampling parameters that newer model families
+// (o1/o3/o4, gpt-5+) do not accept. With go-openai's omitempty json tags,
+// zero values are omitted from the request, satisfying the API constraint.
+func sanitizeBetaRequest(req *openai.ChatCompletionRequest) {
+	if !requiresMaxCompletionTokens(req.Model) {
+		return
+	}
+	req.Temperature = 0
+	req.TopP = 0
+	req.N = 0
+	req.PresencePenalty = 0
+	req.FrequencyPenalty = 0
+}
+
 // applyMaxTokens sets either MaxTokens or MaxCompletionTokens on req,
 // depending on which field the model supports. limit=0 is a no-op (no limit).
 func applyMaxTokens(req *openai.ChatCompletionRequest, limit int) {
