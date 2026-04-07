@@ -1,7 +1,5 @@
 # LLM Telegram Bot
 
-> ⚠️本项目完全采用 **Vibe Coding** 方式开发。
-
 一个基于 Go 开发的 Telegram 聊天机器人，接入 OpenAI 兼容 API，支持流式回复、多轮上下文、群聊智能检测、MCP 工具调用等功能。
 
 ## 功能特性
