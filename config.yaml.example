@@ -95,3 +95,12 @@ STT_API_BASE: ""
 STT_API_KEY: ""
 STT_MODEL: whisper-1
 STT_DISPLAY: true
+
+# ── MCP Tool Summary (Lazy Loading) ───────────────────────────────────────────
+# 启用后，仅将各 MCP server 的摘要注入上下文，LLM 按需调用 get_tool_details 加载完整 schema。
+# 可显著减少 token 消耗。推荐配置一个较小/便宜的模型来生成摘要。
+# 摘要持久化到 user_mcp.db，工具列表变化时自动失效并重新生成。
+TOOLS_SUMMARY_ENABLED: false
+TOOLS_SUMMARY_API_BASE: ""
+TOOLS_SUMMARY_API_KEY: ""
+TOOLS_SUMMARY_MODEL: ""

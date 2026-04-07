@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -151,18 +152,22 @@ func (s *UserMCPStore) AllUserIDs() ([]int64, error) {
 // UserToolManager manages per-user MCP client connections and tool registries.
 // Each user has their own set of connected MCP servers and discovered tools.
 type UserToolManager struct {
-	mu         sync.RWMutex
-	store      *UserMCPStore
-	registries map[int64]*ToolRegistry     // userID → personal tool registry
-	clients    map[int64]*MCPClientManager // userID → personal MCP connections
+	mu          sync.RWMutex
+	store       *UserMCPStore
+	registries  map[int64]*ToolRegistry     // userID → personal tool registry
+	clients     map[int64]*MCPClientManager // userID → personal MCP connections
+	summaryStore *MCPSummaryStore           // nil when summary mode is disabled
+	summaryGen   *MCPSummaryGenerator       // nil when summary mode is disabled
 }
 
 // NewUserToolManager creates a new manager backed by the given store.
-func NewUserToolManager(store *UserMCPStore) *UserToolManager {
+func NewUserToolManager(store *UserMCPStore, summaryStore *MCPSummaryStore, summaryGen *MCPSummaryGenerator) *UserToolManager {
 	return &UserToolManager{
-		store:      store,
-		registries: make(map[int64]*ToolRegistry),
-		clients:    make(map[int64]*MCPClientManager),
+		store:        store,
+		registries:   make(map[int64]*ToolRegistry),
+		clients:      make(map[int64]*MCPClientManager),
+		summaryStore: summaryStore,
+		summaryGen:   summaryGen,
 	}
 }
 
@@ -203,6 +208,16 @@ func (m *UserToolManager) connectUser(userID int64, cfg *MCPConfig) map[string]e
 
 	m.registries[userID] = registry
 	m.clients[userID] = manager
+
+	// Fire summary generation for all connected servers asynchronously.
+	if m.summaryGen != nil {
+		prefix := fmt.Sprintf("u%d", userID)
+		for _, srv := range registry.ServerNames() {
+			tools := registry.OpenAIToolsForServer(srv)
+			go m.summaryGen.EnsureSummary(context.Background(), prefix, srv, tools)
+		}
+	}
+
 	return failures
 }
 
@@ -284,6 +299,11 @@ func (m *UserToolManager) RemoveServer(userID int64, serverName string) (bool, e
 		return found, err
 	}
 
+	// Drop cached summary for the removed server.
+	if m.summaryStore != nil {
+		m.summaryStore.deleteByPrefix(fmt.Sprintf("u%d:%s", userID, serverName))
+	}
+
 	// Reload.
 	cfg, err := m.store.Get(userID)
 	if err != nil {
@@ -313,6 +333,10 @@ func (m *UserToolManager) ClearAll(userID int64) error {
 	if err := m.store.Delete(userID); err != nil {
 		return err
 	}
+	// Drop all cached summaries for this user.
+	if m.summaryStore != nil {
+		m.summaryStore.deleteByPrefix(fmt.Sprintf("u%d:", userID))
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.disconnectUserLocked(userID)
@@ -340,6 +364,7 @@ func (m *UserToolManager) ListServers(userID int64) ([]ServerInfo, error) {
 	reg := m.registries[userID]
 	m.mu.RUnlock()
 
+	prefix := fmt.Sprintf("u%d", userID)
 	var infos []ServerInfo
 	for name, srv := range cfg.MCPServers {
 		info := ServerInfo{
@@ -347,9 +372,11 @@ func (m *UserToolManager) ListServers(userID int64) ([]ServerInfo, error) {
 			Type: srv.Type,
 			URL:  srv.URL,
 		}
-		// Count tools from this server's registry.
 		if reg != nil {
-			info.ToolCount = reg.Count()
+			info.ToolCount = reg.CountForServer(name)
+		}
+		if m.summaryStore != nil {
+			info.Summary = m.summaryStore.GetSummary(prefix, name)
 		}
 		infos = append(infos, info)
 	}
@@ -372,6 +399,7 @@ type ServerInfo struct {
 	Type      string
 	URL       string
 	ToolCount int
+	Summary   string // cached summary text; empty if not yet generated
 }
 
 // ─── Merged Tool View ────────────────────────────────────────────────────────
@@ -424,6 +452,55 @@ func (v *MergedToolView) OpenAITools() []openai.Tool {
 		tools = append(tools, v.user.OpenAITools()...)
 	}
 	return tools
+}
+
+// ServerNames returns distinct server names from global then user registries.
+func (v *MergedToolView) ServerNames() []string {
+	seen := map[string]bool{}
+	var out []string
+	if v.global != nil {
+		for _, s := range v.global.ServerNames() {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	if v.user != nil {
+		for _, s := range v.user.ServerNames() {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// OpenAIToolsForServer returns full tool schemas for a single server, checking
+// user registry first (higher priority), then global.
+func (v *MergedToolView) OpenAIToolsForServer(serverName string) []openai.Tool {
+	if v.user != nil {
+		if tools := v.user.OpenAIToolsForServer(serverName); len(tools) > 0 {
+			return tools
+		}
+	}
+	if v.global != nil {
+		return v.global.OpenAIToolsForServer(serverName)
+	}
+	return nil
+}
+
+// CountForServer returns the tool count for a specific server across both registries.
+func (v *MergedToolView) CountForServer(serverName string) int {
+	n := 0
+	if v.global != nil {
+		n += v.global.CountForServer(serverName)
+	}
+	if v.user != nil {
+		n += v.user.CountForServer(serverName)
+	}
+	return n
 }
 
 // ExecuteToolCall looks up and executes a tool call from either registry.
@@ -489,9 +566,16 @@ func FormatServerList(servers []ServerInfo) string {
 	sb.WriteString("🔌 Your MCP servers:\n\n")
 	for i, s := range servers {
 		sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, s.Name))
-		sb.WriteString(fmt.Sprintf("   Type: %s\n", s.Type))
+		sb.WriteString(fmt.Sprintf("   Type: %s", s.Type))
 		if s.URL != "" {
-			sb.WriteString(fmt.Sprintf("   URL: %s\n", s.URL))
+			sb.WriteString(fmt.Sprintf("  URL: %s", s.URL))
+		}
+		if s.ToolCount > 0 {
+			sb.WriteString(fmt.Sprintf("  Tools: %d", s.ToolCount))
+		}
+		sb.WriteString("\n")
+		if s.Summary != "" {
+			sb.WriteString("   " + s.Summary + "\n")
 		}
 		sb.WriteString("\n")
 	}

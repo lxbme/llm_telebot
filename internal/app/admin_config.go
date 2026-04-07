@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sort"
@@ -85,10 +86,12 @@ type runtimeSnapshot struct {
 	tasks          *TaskStore
 	scheduleWizard *ScheduleWizardStore
 	speechModes    *SpeechModeStore
-	tts            *VolcengineTTSClient
-	stt            *STTClient
-	stickers       *StickerEngine
-	tg             *tele.Bot
+	tts              *VolcengineTTSClient
+	stt              *STTClient
+	toolSummaryStore *MCPSummaryStore
+	toolSummaryGen   *MCPSummaryGenerator
+	stickers         *StickerEngine
+	tg               *tele.Bot
 }
 
 func (b *Bot) snapshot() runtimeSnapshot {
@@ -116,10 +119,12 @@ func (b *Bot) snapshot() runtimeSnapshot {
 		tasks:          b.tasks,
 		scheduleWizard: b.scheduleWizard,
 		speechModes:    b.speechModes,
-		tts:            b.tts,
-		stt:            b.stt,
-		stickers:       b.stickers,
-		tg:             b.tg,
+		tts:              b.tts,
+		stt:              b.stt,
+		toolSummaryStore: b.toolSummaryStore,
+		toolSummaryGen:   b.toolSummaryGen,
+		stickers:         b.stickers,
+		tg:               b.tg,
 	}
 }
 
@@ -406,6 +411,18 @@ func allConfigOptions() []configOption {
 		boolOption(57, "STT_DISPLAY", "When enabled, send the transcription text as an acknowledgment before the LLM reply. Defaults to true.", false,
 			func(cfg Config) bool { return cfg.STTDisplay },
 			func(cfg *Config, v bool) { cfg.STTDisplay = v }),
+		boolOption(58, "TOOLS_SUMMARY_ENABLED", "Enable two-phase lazy tool loading: inject compact server summaries in the system prompt; LLM calls get_tool_details to load full schemas on demand. Reduces token usage when many MCP tools are configured.", false,
+			func(cfg Config) bool { return cfg.ToolsSummaryEnabled },
+			func(cfg *Config, v bool) { cfg.ToolsSummaryEnabled = v }),
+		stringOption(59, "TOOLS_SUMMARY_API_BASE", "Base URL for the model used to generate MCP server summaries. Defaults to OPENAI_API_BASE.", false,
+			func(cfg Config) string { return cfg.ToolsSummaryAPIBase },
+			func(cfg *Config, v string) { cfg.ToolsSummaryAPIBase = v }),
+		stringOption(60, "TOOLS_SUMMARY_API_KEY", "API key for the summary generation model. Defaults to OPENAI_API_KEY.", true,
+			func(cfg Config) string { return cfg.ToolsSummaryAPIKey },
+			func(cfg *Config, v string) { cfg.ToolsSummaryAPIKey = v }),
+		stringOption(61, "TOOLS_SUMMARY_MODEL", "Model for MCP server summary generation (a small/cheap model is recommended). Defaults to OPENAI_MODEL.", false,
+			func(cfg Config) string { return cfg.ToolsSummaryModel },
+			func(cfg *Config, v string) { cfg.ToolsSummaryModel = v }),
 	}
 }
 
@@ -892,12 +909,12 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserToolManager, error) {
+func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserToolManager, *MCPSummaryStore, *MCPSummaryGenerator, error) {
 	if !cfg.ToolsEnabled {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 	if strings.TrimSpace(cfg.UserMCPDBPath) == "" {
-		return nil, nil, nil, fmt.Errorf("USER_MCP_DB_PATH cannot be empty")
+		return nil, nil, nil, nil, nil, fmt.Errorf("USER_MCP_DB_PATH cannot be empty")
 	}
 
 	registry := NewToolRegistry()
@@ -905,7 +922,7 @@ func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserTool
 	if strings.TrimSpace(cfg.MCPConfigPath) != "" {
 		mcpCfg, err := LoadMCPConfig(cfg.MCPConfigPath)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("failed to load MCP_CONFIG_PATH: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to load MCP_CONFIG_PATH: %w", err)
 		}
 		mcpManager = NewMCPClientManager()
 		failures := mcpManager.ConnectAll(mcpCfg, registry)
@@ -919,11 +936,25 @@ func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserTool
 		if mcpManager != nil {
 			mcpManager.Close()
 		}
-		return nil, nil, nil, fmt.Errorf("failed to initialize USER_MCP_DB_PATH: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("failed to initialize USER_MCP_DB_PATH: %w", err)
 	}
-	userTools := NewUserToolManager(store)
+
+	var summaryStore *MCPSummaryStore
+	var summaryGen *MCPSummaryGenerator
+	if cfg.ToolsSummaryEnabled {
+		summaryStore = NewMCPSummaryStore(store.db)
+		summaryGen = NewMCPSummaryGenerator(cfg, summaryStore)
+		if summaryGen != nil {
+			for _, srv := range registry.ServerNames() {
+				tools := registry.OpenAIToolsForServer(srv)
+				go summaryGen.EnsureSummary(context.Background(), "g", srv, tools)
+			}
+		}
+	}
+
+	userTools := NewUserToolManager(store, summaryStore, summaryGen)
 	userTools.RestoreAll()
-	return registry, mcpManager, userTools, nil
+	return registry, mcpManager, userTools, summaryStore, summaryGen, nil
 }
 
 func (b *Bot) persistRuntimeChatState(db *ChatDB) {
@@ -1033,12 +1064,18 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 
 	toolsChanged := next.ToolsEnabled != current.cfg.ToolsEnabled ||
 		strings.TrimSpace(next.MCPConfigPath) != strings.TrimSpace(current.cfg.MCPConfigPath) ||
-		strings.TrimSpace(next.UserMCPDBPath) != strings.TrimSpace(current.cfg.UserMCPDBPath)
+		strings.TrimSpace(next.UserMCPDBPath) != strings.TrimSpace(current.cfg.UserMCPDBPath) ||
+		next.ToolsSummaryEnabled != current.cfg.ToolsSummaryEnabled ||
+		strings.TrimSpace(next.ToolsSummaryAPIBase) != strings.TrimSpace(current.cfg.ToolsSummaryAPIBase) ||
+		strings.TrimSpace(next.ToolsSummaryAPIKey) != strings.TrimSpace(current.cfg.ToolsSummaryAPIKey) ||
+		strings.TrimSpace(next.ToolsSummaryModel) != strings.TrimSpace(current.cfg.ToolsSummaryModel)
 	newTools := current.tools
 	newMCPClients := current.mcpClients
 	newUserTools := current.userTools
+	newToolSummaryStore := current.toolSummaryStore
+	newToolSummaryGen := current.toolSummaryGen
 	if toolsChanged {
-		newTools, newMCPClients, newUserTools, err = buildToolResources(next)
+		newTools, newMCPClients, newUserTools, newToolSummaryStore, newToolSummaryGen, err = buildToolResources(next)
 		if err != nil {
 			if newProfiles != nil && profilesChanged {
 				_ = newProfiles.Close()
@@ -1107,6 +1144,8 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 		b.tools = newTools
 		b.mcpClients = newMCPClients
 		b.userTools = newUserTools
+		b.toolSummaryStore = newToolSummaryStore
+		b.toolSummaryGen = newToolSummaryGen
 	}
 	b.mu.Unlock()
 

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -107,11 +108,17 @@ type Config struct {
 	StickerModel           string
 
 	// STT (Speech-to-Text) settings.
-	STTEnabled  bool
-	STTAPIBase  string
-	STTAPIKey   string
-	STTModel    string
-	STTDisplay  bool // when true, send transcription as acknowledgment before LLM reply
+	STTEnabled bool
+	STTAPIBase string
+	STTAPIKey  string
+	STTModel   string
+	STTDisplay bool // when true, send transcription as acknowledgment before LLM reply
+
+	// MCP lazy-loading tool summary settings.
+	ToolsSummaryEnabled bool
+	ToolsSummaryAPIBase string
+	ToolsSummaryAPIKey  string
+	ToolsSummaryModel   string
 }
 
 func loadConfig() Config {
@@ -281,6 +288,10 @@ func loadConfig() Config {
 		STTAPIKey:                      get("STT_API_KEY", ""),
 		STTModel:                       get("STT_MODEL", "whisper-1"),
 		STTDisplay:                     strings.ToLower(get("STT_DISPLAY", "true")) != "false",
+		ToolsSummaryEnabled:            strings.ToLower(get("TOOLS_SUMMARY_ENABLED", "false")) == "true",
+		ToolsSummaryAPIBase:            get("TOOLS_SUMMARY_API_BASE", ""),
+		ToolsSummaryAPIKey:             get("TOOLS_SUMMARY_API_KEY", ""),
+		ToolsSummaryModel:              get("TOOLS_SUMMARY_MODEL", ""),
 	}
 	if err := ensureConfigFileExists(cfg); err != nil {
 		log.Printf("Warning: failed to bootstrap config file %s: %v", effectiveConfigFilePath(cfg), err)
@@ -487,6 +498,8 @@ type Bot struct {
 	adminSessions    *AdminConfigSessionStore
 	tts              *VolcengineTTSClient
 	stt              *STTClient
+	toolSummaryStore *MCPSummaryStore
+	toolSummaryGen   *MCPSummaryGenerator
 	stickers         *StickerEngine
 	dashboardEvents  *DashboardEventHub
 	dashboardService *DashboardService
@@ -563,12 +576,26 @@ func NewBot(cfg Config) (*Bot, error) {
 
 	// Initialise per-user MCP tool manager (always enabled when tools are enabled).
 	var userToolMgr *UserToolManager
+	var toolSummaryStore *MCPSummaryStore
+	var toolSummaryGen *MCPSummaryGenerator
 	if cfg.ToolsEnabled {
 		umcpStore, err := NewUserMCPStore(cfg.UserMCPDBPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to init user MCP store: %w", err)
 		}
-		userToolMgr = NewUserToolManager(umcpStore)
+		if cfg.ToolsSummaryEnabled {
+			toolSummaryStore = NewMCPSummaryStore(umcpStore.db)
+			toolSummaryGen = NewMCPSummaryGenerator(cfg, toolSummaryStore)
+			// Pre-generate summaries for all global MCP servers.
+			if toolSummaryGen != nil && toolRegistry != nil {
+				for _, srv := range toolRegistry.ServerNames() {
+					tools := toolRegistry.OpenAIToolsForServer(srv)
+					go toolSummaryGen.EnsureSummary(context.Background(), "g", srv, tools)
+				}
+				log.Printf("[mcp_summary] pre-generating summaries for %d global server(s)", len(toolRegistry.ServerNames()))
+			}
+		}
+		userToolMgr = NewUserToolManager(umcpStore, toolSummaryStore, toolSummaryGen)
 		userToolMgr.RestoreAll()
 		log.Printf("Per-user dynamic MCP enabled (db: %s)", cfg.UserMCPDBPath)
 	}
@@ -618,9 +645,11 @@ func NewBot(cfg Config) (*Bot, error) {
 		scheduleWizard:  NewScheduleWizardStore(),
 		speechModes:     NewSpeechModeStore(),
 		adminSessions:   NewAdminConfigSessionStore(),
-		tts:             ttsClient,
-		stt:             sttClient,
-		stickers:        stickerEngine,
+		tts:              ttsClient,
+		stt:              sttClient,
+		toolSummaryStore: toolSummaryStore,
+		toolSummaryGen:   toolSummaryGen,
+		stickers:         stickerEngine,
 		dashboardEvents: dashboardEvents,
 		tg:              tgBot,
 	}
@@ -1280,6 +1309,25 @@ func (b *Bot) streamReply(
 		toolView = NewMergedToolView(snap.tools, userReg)
 	}
 
+	// ── Summary-mode setup ──────────────────────────────────────────────
+	// When TOOLS_SUMMARY_ENABLED=true, inject compact server descriptions
+	// into the system prompt and use the virtual get_tool_details tool
+	// instead of injecting all full schemas up-front.
+	var senderID int64
+	if sender != nil {
+		senderID = sender.ID
+	}
+	summaryMode := snap.cfg.ToolsSummaryEnabled && snap.toolSummaryStore != nil && toolView != nil && toolView.Count() > 0
+	if summaryMode {
+		section := buildMCPSummarySection(toolView, snap.toolSummaryStore, senderID)
+		if section != "" && len(messages) > 0 {
+			messages[0].Content += section
+		}
+	}
+	// expandedServers tracks which MCP server groups the LLM has requested
+	// full schemas for (used in summary mode only).
+	expandedServers := map[string]bool{}
+
 	// ── Tool-call loop ──────────────────────────────────────────────────
 	// If tools are enabled, we do non-streaming requests in a loop so the
 	// LLM can call tools repeatedly. Once all tool calls are resolved, the
@@ -1291,7 +1339,7 @@ func (b *Bot) streamReply(
 			req := openai.ChatCompletionRequest{
 				Model:     snap.cfg.OpenAIModel,
 				Messages:  messages,
-				Tools:     toolView.OpenAITools(),
+				Tools:     buildActiveTools(toolView, expandedServers, summaryMode),
 				MaxTokens: snap.cfg.MaxTokens,
 			}
 
@@ -1314,15 +1362,37 @@ func (b *Bot) streamReply(
 				// Append the assistant's tool-call message to the conversation.
 				messages = append(messages, choice.Message)
 
-				// Show the user which tools are being called.
+				// Show the user which tools are being called (skip internal virtual tool).
 				var toolNames []string
 				for _, tc := range choice.Message.ToolCalls {
-					toolNames = append(toolNames, tc.Function.Name)
+					if tc.Function.Name != "get_tool_details" {
+						toolNames = append(toolNames, tc.Function.Name)
+					}
 				}
-				b.editOrLog(placeholder, fmt.Sprintf("\U0001f527 Calling tools: %s…", strings.Join(toolNames, ", ")))
+				if len(toolNames) > 0 {
+					b.editOrLog(placeholder, fmt.Sprintf("\U0001f527 Calling tools: %s…", strings.Join(toolNames, ", ")))
+				}
 
 				// Execute each tool call and append the results.
 				for _, tc := range choice.Message.ToolCalls {
+					// Handle the virtual get_tool_details call in summary mode.
+					if summaryMode && tc.Function.Name == "get_tool_details" {
+						var args struct {
+							Groups []string `json:"groups"`
+						}
+						_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+						for _, g := range args.Groups {
+							expandedServers[g] = true
+						}
+						log.Printf("[mcp_summary] schemas expanded for: %s", strings.Join(args.Groups, ", "))
+						messages = append(messages, openai.ChatCompletionMessage{
+							Role:       openai.ChatMessageRoleTool,
+							Content:    "Tool schemas loaded for: " + strings.Join(args.Groups, ", ") + ". You can now call those tools.",
+							ToolCallID: tc.ID,
+						})
+						continue
+					}
+
 					log.Printf("[tools] executing %s", tc.Function.Name)
 					b.recordDashboardEvent(DashboardEvent{
 						Type:      DashboardEventToolCallStarted,
@@ -1363,7 +1433,7 @@ func (b *Bot) streamReply(
 	// Streams the LLM's final response to the user. When tools were used,
 	// the messages slice now contains the full tool-call conversation, so
 	// the LLM will summarise the tool results into a natural reply.
-	finalText := b.doStream(ctx, messages, placeholder, toolView, usageCtx)
+	finalText := b.doStream(ctx, messages, placeholder, toolView, expandedServers, summaryMode, usageCtx)
 	if finalText == "" {
 		return // error already reported by doStream
 	}
@@ -1373,11 +1443,15 @@ func (b *Bot) streamReply(
 // doStream performs the streaming LLM call and returns the final text.
 // Returns empty string if an error was already reported to the user.
 // toolView may be nil if tools are disabled.
+// expandedServers and summaryMode are forwarded from the tool-call loop so
+// the streaming request uses the same active tool set.
 func (b *Bot) doStream(
 	ctx context.Context,
 	messages []openai.ChatCompletionMessage,
 	placeholder *tele.Message,
 	toolView *MergedToolView,
+	expandedServers map[string]bool,
+	summaryMode bool,
 	usageCtx UsageContext,
 ) string {
 	snap := b.snapshot()
@@ -1397,9 +1471,10 @@ func (b *Bot) doStream(
 	}
 
 	// If tools are available, include them so the model knows about them
-	// even in streaming mode.
+	// even in streaming mode. In summary mode use the same active tool set
+	// that the tool-call loop settled on (virtual tool + expanded schemas).
 	if toolView != nil && toolView.Count() > 0 {
-		req.Tools = toolView.OpenAITools()
+		req.Tools = buildActiveTools(toolView, expandedServers, summaryMode)
 	}
 
 	started := time.Now()

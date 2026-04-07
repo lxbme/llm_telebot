@@ -96,6 +96,57 @@ func (r *ToolRegistry) Count() int {
 	return len(r.tools)
 }
 
+// ServerNames returns the distinct MCP server names in registration order.
+func (r *ToolRegistry) ServerNames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, name := range r.order {
+		if rt, ok := r.tools[name].(*MCPRemoteTool); ok {
+			if !seen[rt.serverName] {
+				seen[rt.serverName] = true
+				out = append(out, rt.serverName)
+			}
+		}
+	}
+	return out
+}
+
+// OpenAIToolsForServer returns OpenAI tool definitions for a single server.
+func (r *ToolRegistry) OpenAIToolsForServer(serverName string) []openai.Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var tools []openai.Tool
+	for _, name := range r.order {
+		t := r.tools[name]
+		if rt, ok := t.(*MCPRemoteTool); ok && rt.serverName == serverName {
+			tools = append(tools, openai.Tool{
+				Type: openai.ToolTypeFunction,
+				Function: &openai.FunctionDefinition{
+					Name:        t.Name(),
+					Description: t.Description(),
+					Parameters:  t.Parameters(),
+				},
+			})
+		}
+	}
+	return tools
+}
+
+// CountForServer returns the number of tools belonging to a specific server.
+func (r *ToolRegistry) CountForServer(serverName string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, name := range r.order {
+		if rt, ok := r.tools[name].(*MCPRemoteTool); ok && rt.serverName == serverName {
+			n++
+		}
+	}
+	return n
+}
+
 // ─── Tool Execution ──────────────────────────────────────────────────────────
 
 // ExecuteToolCall looks up and executes a single tool call, returning the
