@@ -824,10 +824,10 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 	})
 
 	req := openai.ChatCompletionRequest{
-		Model:     snap.detectorModel,
-		Messages:  msgs,
-		MaxTokens: 100,
+		Model:    snap.detectorModel,
+		Messages: msgs,
 	}
+	applyMaxTokens(&req, 100)
 
 	// Retry up to 3 times on transient errors (EOF, timeout, etc.).
 	var resp openai.ChatCompletionResponse
@@ -1337,11 +1337,11 @@ func (b *Bot) streamReply(
 		maxIter := snap.cfg.ToolsMaxIterations
 		for i := 0; i < maxIter; i++ {
 			req := openai.ChatCompletionRequest{
-				Model:     snap.cfg.OpenAIModel,
-				Messages:  messages,
-				Tools:     buildActiveTools(toolView, expandedServers, summaryMode),
-				MaxTokens: snap.cfg.MaxTokens,
+				Model:    snap.cfg.OpenAIModel,
+				Messages: messages,
+				Tools:    buildActiveTools(toolView, expandedServers, summaryMode),
 			}
+			applyMaxTokens(&req, snap.cfg.MaxTokens)
 
 			started := time.Now()
 			resp, err := snap.ai.CreateChatCompletion(ctx, req)
@@ -1461,14 +1461,14 @@ func (b *Bot) doStream(
 	}
 
 	req := openai.ChatCompletionRequest{
-		Model:     snap.cfg.OpenAIModel,
-		Messages:  messages,
-		Stream:    true,
-		MaxTokens: snap.cfg.MaxTokens,
+		Model:    snap.cfg.OpenAIModel,
+		Messages: messages,
+		Stream:   true,
 		StreamOptions: &openai.StreamOptions{
 			IncludeUsage: true,
 		},
 	}
+	applyMaxTokens(&req, snap.cfg.MaxTokens)
 
 	// If tools are available, include them so the model knows about them
 	// even in streaming mode. In summary mode use the same active tool set

@@ -336,9 +336,9 @@ func (b *Bot) selectStickerLabelWithModel(chatID, userID int64, userText, finalT
 			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 		},
-		MaxTokens:   16,
 		Temperature: 0,
 	}
+	applyMaxTokens(&req, 16)
 	started := time.Now()
 	resp, err := snap.stickerAI.CreateChatCompletion(ctx, req)
 	b.recordUsageEvent(usageEvent(usageCtx, UsageCallStickerModel, firstNonEmpty(resp.Model, snap.stickerModel), false, 0, started, &resp.Usage, err == nil))

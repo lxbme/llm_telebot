@@ -166,15 +166,16 @@ func (g *MCPSummaryGenerator) EnsureSummary(ctx context.Context, prefix, serverN
 		sb.WriteString("- " + t.Function.Name + ": " + t.Function.Description + "\n")
 	}
 
-	resp, err := g.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+	summaryReq := openai.ChatCompletionRequest{
 		Model: g.model,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleSystem, Content: mcpSummarySystemPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: sb.String()},
 		},
-		MaxTokens:   150,
 		Temperature: 0.2,
-	})
+	}
+	applyMaxTokens(&summaryReq, 150)
+	resp, err := g.client.CreateChatCompletion(ctx, summaryReq)
 	if err != nil {
 		log.Printf("[mcp_summary] failed to generate summary for %q: %v", serverName, err)
 		return

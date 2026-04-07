@@ -138,16 +138,17 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	started := time.Now()
-	resp, err := snap.summaryAI.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+	summaryReq := openai.ChatCompletionRequest{
 		Model: snap.summaryModel,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleSystem, Content: summaryExtractSystemPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: userPrompt.String()},
 		},
-		MaxTokens:   800,
 		Temperature: 0.2,
-	})
+	}
+	applyMaxTokens(&summaryReq, 800)
+	started := time.Now()
+	resp, err := snap.summaryAI.CreateChatCompletion(ctx, summaryReq)
 	b.recordUsageEvent(usageEvent(usageCtx, UsageCallSummary, firstNonEmpty(resp.Model, snap.summaryModel), false, 0, started, &resp.Usage, err == nil))
 	if err != nil {
 		log.Printf("[summary] LLM error for chat %d: %v", chatID, err)

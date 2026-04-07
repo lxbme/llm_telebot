@@ -85,16 +85,17 @@ func (b *Bot) extractProfile(chatID, userID int64, username, displayName string,
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	started := time.Now()
-	resp, err := snap.profileAI.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+	profileReq := openai.ChatCompletionRequest{
 		Model: snap.profileModel,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleSystem, Content: sysPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: convBuf.String()},
 		},
-		MaxTokens:   500,
 		Temperature: 0.1,
-	})
+	}
+	applyMaxTokens(&profileReq, 500)
+	started := time.Now()
+	resp, err := snap.profileAI.CreateChatCompletion(ctx, profileReq)
 	b.recordUsageEvent(usageEvent(usageCtx, UsageCallProfileExtract, firstNonEmpty(resp.Model, snap.profileModel), false, 0, started, &resp.Usage, err == nil))
 	if err != nil {
 		log.Printf("[profile] LLM error for %s: %v", subjectLabel, err)
