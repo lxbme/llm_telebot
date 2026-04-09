@@ -1336,6 +1336,7 @@ func (b *Bot) streamReply(
 	// so the LLM can summarise/present the results fluently.
 	if toolView != nil && toolView.Count() > 0 {
 		maxIter := snap.cfg.ToolsMaxIterations
+		hitMaxIter := false
 		for i := 0; i < maxIter; i++ {
 			req := openai.ChatCompletionRequest{
 				Model:    snap.cfg.OpenAIModel,
@@ -1353,8 +1354,8 @@ func (b *Bot) streamReply(
 				return
 			}
 			if len(resp.Choices) == 0 {
-				b.editOrLog(placeholder, "\u26a0\ufe0f The model returned an empty response.")
-				return
+				// No choices returned — fall through to streaming with accumulated context.
+				break
 			}
 
 			choice := resp.Choices[0]
@@ -1422,12 +1423,27 @@ func (b *Bot) streamReply(
 						ToolCallID: tc.ID,
 					})
 				}
+				if i == maxIter-1 {
+					// Last iteration and model still wants more tool calls — mark exhausted.
+					hitMaxIter = true
+				}
 				continue // loop back to let the LLM process tool results
 			}
 
 			// No more tool calls — break out to the streaming path below
 			// so the LLM's final answer is streamed to the user.
 			break
+		}
+
+		// If the tool-call budget was exhausted, explicitly ask the model to
+		// answer with whatever information it has gathered so far.
+		if hitMaxIter {
+			messages = append(messages, openai.ChatCompletionMessage{
+				Role: openai.ChatMessageRoleUser,
+				Content: "(You have reached the maximum number of tool calls. " +
+					"Based on the information gathered so far, please provide the best answer you can. " +
+					"If some information is uncertain or incomplete, clearly say so.)",
+			})
 		}
 	}
 
@@ -1581,7 +1597,7 @@ func (b *Bot) doStream(
 	}
 
 	if finalText == "" {
-		finalText = "⚠️ The model returned an empty response."
+		finalText = buildFallbackFromMessages(messages)
 	}
 	b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, true))
 	b.recordDashboardEvent(DashboardEvent{
@@ -1694,4 +1710,20 @@ func Run() {
 	}
 
 	bot.Run()
+}
+
+// buildFallbackFromMessages constructs a best-effort response from tool results
+// in the message history when the model returns an empty streaming response.
+func buildFallbackFromMessages(messages []openai.ChatCompletionMessage) string {
+	var parts []string
+	for _, m := range messages {
+		if m.Role == openai.ChatMessageRoleTool && m.Content != "" {
+			parts = append(parts, m.Content)
+		}
+	}
+	if len(parts) == 0 {
+		return "⚠️ The model returned an empty response."
+	}
+	return "⚠️ The model did not generate a final reply. Here are the raw tool results for reference (information may be incomplete):\n\n" +
+		strings.Join(parts, "\n\n---\n\n")
 }
