@@ -133,6 +133,12 @@ type Config struct {
 	DocumentMaxTextChars int
 	DocumentAllowedExts  string
 	DocumentPdftotextCmd string
+
+	// Reminder (natural-language /remind) settings.
+	ReminderDefaultTimezone string // IANA zone used when the parser has no hint (default Asia/Shanghai)
+	ReminderBase            string // optional separate API base for the NL parser
+	ReminderKey             string // optional separate API key for the NL parser
+	ReminderModel           string // optional separate model for the NL parser
 }
 
 func loadConfig() Config {
@@ -327,6 +333,10 @@ func loadConfig() Config {
 		DocumentMaxTextChars:           documentMaxTextChars,
 		DocumentAllowedExts:            get("DOCUMENT_ALLOWED_EXTS", defaultDocumentAllowedExts),
 		DocumentPdftotextCmd:           get("DOCUMENT_PDFTOTEXT_CMD", "pdftotext"),
+		ReminderDefaultTimezone:        get("REMINDER_DEFAULT_TIMEZONE", "Asia/Shanghai"),
+		ReminderBase:                   get("REMINDER_API_BASE", ""),
+		ReminderKey:                    get("REMINDER_API_KEY", ""),
+		ReminderModel:                  get("REMINDER_MODEL", ""),
 	}
 	if err := ensureConfigFileExists(cfg); err != nil {
 		log.Printf("Warning: failed to bootstrap config file %s: %v", effectiveConfigFilePath(cfg), err)
@@ -547,6 +557,9 @@ type Bot struct {
 	mcpClients       *MCPClientManager // global remote MCP server connections (nil if none)
 	userTools        *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
 	tasks            *TaskStore
+	reminders        *ReminderStore
+	reminderAI       *openai.Client // LLM client for reminder NL parsing (may equal ai)
+	reminderModel    string         // model name for reminder NL parsing
 	scheduler        *TaskRunner
 	scheduleWizard   *ScheduleWizardStore
 	speechModes      *SpeechModeStore
@@ -570,8 +583,8 @@ func NewBot(cfg Config) (*Bot, error) {
 		return nil, fmt.Errorf("OPENAI_API_KEY is not set")
 	}
 
-	aiClient, detectorClient, profileClient, summaryClient, stickerClient,
-		detectorModel, profileModel, summaryModel, stickerModel, err := buildAIResources(cfg)
+	aiClient, detectorClient, profileClient, summaryClient, stickerClient, reminderClient,
+		detectorModel, profileModel, summaryModel, stickerModel, reminderModel, err := buildAIResources(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -707,6 +720,9 @@ func NewBot(cfg Config) (*Bot, error) {
 		mcpClients:      mcpManager,
 		userTools:       userToolMgr,
 		tasks:           NewTaskStore(chatDB),
+		reminders:       NewReminderStore(chatDB),
+		reminderAI:      reminderClient,
+		reminderModel:   reminderModel,
 		scheduleWizard:  NewScheduleWizardStore(),
 		speechModes:     NewSpeechModeStore(),
 		adminSessions:   NewAdminConfigSessionStore(),
@@ -793,6 +809,10 @@ func (b *Bot) Run() {
 	b.tg.Handle("/schedule_pause", b.handleSchedulePauseCommand)
 	b.tg.Handle("/schedule_resume", b.handleScheduleResumeCommand)
 	b.tg.Handle("/schedule_del", b.handleScheduleDeleteCommandAlias)
+	b.tg.Handle("/remind", b.handleRemindCommand)
+	b.tg.Handle("/reminders", b.handleRemindersCommand)
+	b.tg.Handle("/reminder_del", b.handleReminderDeleteCommand)
+	b.tg.Handle("/reminderd", b.handleReminderDeleteCommand)
 	b.tg.Handle("/admin", b.handleAdminCommand)
 	adminCancelBtn := &tele.Btn{Unique: adminCancelButtonUnique}
 	b.tg.Handle(adminCancelBtn, b.handleAdminCancel)

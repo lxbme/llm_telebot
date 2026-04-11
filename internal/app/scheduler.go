@@ -451,9 +451,13 @@ func (r *TaskRunner) loop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
-	r.runDue(time.Now().UTC())
-	for now := range ticker.C {
-		r.runDue(now.UTC())
+	now := time.Now().UTC()
+	r.runDue(now)
+	r.runDueReminders(now)
+	for tick := range ticker.C {
+		tickUTC := tick.UTC()
+		r.runDue(tickUTC)
+		r.runDueReminders(tickUTC)
 	}
 }
 

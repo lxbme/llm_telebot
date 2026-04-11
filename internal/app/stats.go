@@ -46,6 +46,7 @@ const (
 	UsageCallSummary        UsageCallType = "summary"
 	UsageCallProfileExtract UsageCallType = "profile_extract"
 	UsageCallStickerModel   UsageCallType = "sticker_strategy"
+	UsageCallReminderParse  UsageCallType = "reminder_parse"
 )
 
 type UsageContext struct {

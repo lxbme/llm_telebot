@@ -129,3 +129,14 @@ DOCUMENT_MAX_BYTES: 5242880
 DOCUMENT_MAX_TEXT_CHARS: 20000
 DOCUMENT_ALLOWED_EXTS: "txt,md,markdown,csv,tsv,json,xml,yaml,yml,toml,ini,log,pdf,docx,odt,pptx,epub,xlsx,xlsm,go,py,js,ts,tsx,jsx,rs,java,c,cc,cpp,h,hpp,sh,rb,php,kt,swift,html,css,sql"
 DOCUMENT_PDFTOTEXT_CMD: pdftotext
+
+# ── Reminder (Natural-Language /remind) ──────────────────────────────────────
+# 启用后，任何被允许用户都可以通过 `/remind 自然语言` 创建一次性或重复提醒。
+# LLM 将自然语言解析为 {fire_at, cron?, prompt}。仅 `/remind` `/reminders`
+# `/reminder_del` 三个命令能访问提醒存储（与聊天流/工具调用完全隔离，作为安
+# 全边界：即使模型被 jailbreak 也无法创建/删除提醒）。
+# REMINDER_API_* 为空时解析器回退到主 OpenAI 客户端。
+REMINDER_DEFAULT_TIMEZONE: Asia/Shanghai
+REMINDER_API_BASE: ""
+REMINDER_API_KEY: ""
+REMINDER_MODEL: ""

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
@@ -75,6 +76,8 @@ type runtimeSnapshot struct {
 	summaryModel   string
 	stickerAI      *openai.Client
 	stickerModel   string
+	reminderAI     *openai.Client
+	reminderModel  string
 	chatDB         *ChatDB
 	store          *HistoryStore
 	stats          *StatsManager
@@ -84,6 +87,7 @@ type runtimeSnapshot struct {
 	mcpClients     *MCPClientManager
 	userTools      *UserToolManager
 	tasks          *TaskStore
+	reminders      *ReminderStore
 	scheduleWizard *ScheduleWizardStore
 	speechModes    *SpeechModeStore
 	tts              *VolcengineTTSClient
@@ -108,6 +112,8 @@ func (b *Bot) snapshot() runtimeSnapshot {
 		summaryModel:   b.summaryModel,
 		stickerAI:      b.stickerAI,
 		stickerModel:   b.stickerModel,
+		reminderAI:     b.reminderAI,
+		reminderModel:  b.reminderModel,
 		chatDB:         b.chatDB,
 		store:          b.store,
 		stats:          b.stats,
@@ -117,6 +123,7 @@ func (b *Bot) snapshot() runtimeSnapshot {
 		mcpClients:     b.mcpClients,
 		userTools:      b.userTools,
 		tasks:          b.tasks,
+		reminders:      b.reminders,
 		scheduleWizard: b.scheduleWizard,
 		speechModes:    b.speechModes,
 		tts:              b.tts,
@@ -462,6 +469,28 @@ func allConfigOptions() []configOption {
 		stringOption(68, "DOCUMENT_PDFTOTEXT_CMD", "Command used to extract PDF text (absolute path or PATH name). Defaults to 'pdftotext'.", false,
 			func(cfg Config) string { return cfg.DocumentPdftotextCmd },
 			func(cfg *Config, v string) { cfg.DocumentPdftotextCmd = v }),
+		customOption(69, "REMINDER_DEFAULT_TIMEZONE", "Default IANA timezone used by the /remind natural-language parser (e.g. Asia/Shanghai).", false,
+			func(cfg Config) string { return cfg.ReminderDefaultTimezone },
+			func(input string, cfg *Config) error {
+				value := normalizeConfigTextInput(input)
+				if value == "" {
+					return fmt.Errorf("cannot be empty")
+				}
+				if _, err := time.LoadLocation(value); err != nil {
+					return fmt.Errorf("invalid IANA timezone: %w", err)
+				}
+				cfg.ReminderDefaultTimezone = value
+				return nil
+			}),
+		stringOption(70, "REMINDER_API_BASE", "Optional API base for the reminder NL parser. Leave empty to fall back to the primary config.", false,
+			func(cfg Config) string { return cfg.ReminderBase },
+			func(cfg *Config, v string) { cfg.ReminderBase = v }),
+		stringOption(71, "REMINDER_API_KEY", "Optional API key for the reminder NL parser. Leave empty to fall back to the primary config.", true,
+			func(cfg Config) string { return cfg.ReminderKey },
+			func(cfg *Config, v string) { cfg.ReminderKey = v }),
+		stringOption(72, "REMINDER_MODEL", "Optional model name for the reminder NL parser. Leave empty to fall back to OPENAI_MODEL.", false,
+			func(cfg Config) string { return cfg.ReminderModel },
+			func(cfg *Config, v string) { cfg.ReminderModel = v }),
 	}
 }
 
@@ -881,7 +910,7 @@ func buildOpenAIClient(apiKey, baseURL string) (*openai.Client, error) {
 	return openai.NewClientWithConfig(cfg), nil
 }
 
-func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI, stickerAI *openai.Client, detectorModel, profileModel, summaryModel, stickerModel string, err error) {
+func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI, stickerAI, reminderAI *openai.Client, detectorModel, profileModel, summaryModel, stickerModel, reminderModel string, err error) {
 	if strings.TrimSpace(cfg.OpenAIModel) == "" {
 		err = fmt.Errorf("OPENAI_MODEL cannot be empty")
 		return
@@ -934,6 +963,17 @@ func buildAIResources(cfg Config) (mainAI, detectorAI, profileAI, summaryAI, sti
 			return
 		}
 		stickerModel = firstNonEmpty(cfg.StickerModel, cfg.OpenAIModel)
+	}
+
+	reminderAI = mainAI
+	reminderModel = cfg.OpenAIModel
+	if cfg.ReminderKey != "" || cfg.ReminderBase != "" || cfg.ReminderModel != "" {
+		reminderAI, err = buildOpenAIClient(firstNonEmpty(cfg.ReminderKey, cfg.OpenAIKey), firstNonEmpty(cfg.ReminderBase, cfg.OpenAIBase))
+		if err != nil {
+			err = fmt.Errorf("REMINDER configuration is invalid: %w", err)
+			return
+		}
+		reminderModel = firstNonEmpty(cfg.ReminderModel, cfg.OpenAIModel)
 	}
 
 	return
@@ -1060,7 +1100,7 @@ func (b *Bot) persistRuntimeChatState(db *ChatDB) {
 func (b *Bot) applyRuntimeConfig(next Config) error {
 	current := b.snapshot()
 
-	mainAI, detectorAI, profileAI, summaryAI, stickerAI, detectorModel, profileModel, summaryModel, stickerModel, err := buildAIResources(next)
+	mainAI, detectorAI, profileAI, summaryAI, stickerAI, reminderAI, detectorModel, profileModel, summaryModel, stickerModel, reminderModel, err := buildAIResources(next)
 	if err != nil {
 		return err
 	}
@@ -1155,6 +1195,8 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	b.summaryModel = summaryModel
 	b.stickerAI = stickerAI
 	b.stickerModel = stickerModel
+	b.reminderAI = reminderAI
+	b.reminderModel = reminderModel
 	b.tts = newTTS
 	b.stt = newSTT
 	b.stickers = newStickerEngine
@@ -1172,6 +1214,9 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 		}
 		if b.tasks != nil {
 			b.tasks.RebindDB(newChatDB)
+		}
+		if b.reminders != nil {
+			b.reminders.RebindDB(newChatDB)
 		}
 	}
 
