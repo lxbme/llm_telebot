@@ -104,3 +104,10 @@ TOOLS_SUMMARY_ENABLED: false
 TOOLS_SUMMARY_API_BASE: ""
 TOOLS_SUMMARY_API_KEY: ""
 TOOLS_SUMMARY_MODEL: ""
+
+# ── Vision (Image Understanding) ──────────────────────────────────────────────
+# 启用后，机器人可接收 Telegram 图片消息（含可选 caption），下载图片并以 OpenAI Vision
+# 协议（image_url data URL）发送给 LLM。需要使用支持视觉的模型，例如 gpt-4o、qwen-vl 等。
+# VISION_MAX_IMAGE_BYTES：单张图片的最大字节数，超过会被拒绝（默认 5 MiB）。
+VISION_ENABLED: false
+VISION_MAX_IMAGE_BYTES: 5242880

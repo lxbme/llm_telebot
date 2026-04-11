@@ -4,3 +4,4 @@ config.yaml
 data
 mcp_config.json
 .ai
+.claude

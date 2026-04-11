@@ -2,10 +2,12 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -119,6 +121,10 @@ type Config struct {
 	ToolsSummaryAPIBase string
 	ToolsSummaryAPIKey  string
 	ToolsSummaryModel   string
+
+	// Vision (image understanding) settings.
+	VisionEnabled       bool
+	VisionMaxImageBytes int
 }
 
 func loadConfig() Config {
@@ -201,6 +207,11 @@ func loadConfig() Config {
 	stickerMaxPerReply, err := strconv.Atoi(get("STICKER_MAX_PER_REPLY", "1"))
 	if err != nil || stickerMaxPerReply <= 0 {
 		stickerMaxPerReply = 1
+	}
+
+	visionMaxImageBytes, err := strconv.Atoi(get("VISION_MAX_IMAGE_BYTES", "5242880"))
+	if err != nil || visionMaxImageBytes <= 0 {
+		visionMaxImageBytes = 5 * 1024 * 1024
 	}
 
 	allowedUsers := parseIDList(get("ALLOWED_USERS", ""))
@@ -292,6 +303,8 @@ func loadConfig() Config {
 		ToolsSummaryAPIBase:            get("TOOLS_SUMMARY_API_BASE", ""),
 		ToolsSummaryAPIKey:             get("TOOLS_SUMMARY_API_KEY", ""),
 		ToolsSummaryModel:              get("TOOLS_SUMMARY_MODEL", ""),
+		VisionEnabled:                  strings.ToLower(get("VISION_ENABLED", "false")) == "true",
+		VisionMaxImageBytes:            visionMaxImageBytes,
 	}
 	if err := ensureConfigFileExists(cfg); err != nil {
 		log.Printf("Warning: failed to bootstrap config file %s: %v", effectiveConfigFilePath(cfg), err)
@@ -346,6 +359,26 @@ func buildUserContent(sender *tele.User, text string) string {
 	fmt.Fprintf(&sb, " time:%s", time.Now().UTC().Format(time.RFC3339))
 	sb.WriteString("]\n")
 	sb.WriteString(text)
+	return sb.String()
+}
+
+// userMessageText returns the textual portion of a user message regardless of
+// whether the message uses Content (plain text) or MultiContent (multimodal).
+// Vision messages put their text inside MultiContent[0] because Content and
+// MultiContent are mutually exclusive in the go-openai SDK.
+func userMessageText(m openai.ChatCompletionMessage) string {
+	if m.Content != "" {
+		return m.Content
+	}
+	var sb strings.Builder
+	for _, part := range m.MultiContent {
+		if part.Type == openai.ChatMessagePartTypeText {
+			if sb.Len() > 0 {
+				sb.WriteByte('\n')
+			}
+			sb.WriteString(part.Text)
+		}
+	}
 	return sb.String()
 }
 
@@ -611,6 +644,11 @@ func NewBot(cfg Config) (*Bot, error) {
 		log.Printf("STT enabled (model: %s)", cfg.STTModel)
 	}
 
+	if cfg.VisionEnabled {
+		log.Printf("Vision enabled (model: %s, max image bytes: %d)",
+			cfg.OpenAIModel, cfg.VisionMaxImageBytes)
+	}
+
 	stickerEngine, err := NewStickerEngine(cfg.StickerRulesPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init sticker rules: %w", err)
@@ -733,6 +771,7 @@ func (b *Bot) Run() {
 	b.tg.Handle(adminCancelBtn, b.handleAdminCancel)
 	b.tg.Handle(tele.OnText, b.handleText)
 	b.tg.Handle(tele.OnVoice, b.handleVoice)
+	b.tg.Handle(tele.OnPhoto, b.handlePhoto)
 
 	if b.scheduler != nil {
 		b.scheduler.Start()
@@ -814,7 +853,7 @@ func (b *Bot) isRelevant(chatID int64, sender *tele.User, text string) bool {
 	for _, h := range history {
 		msgs = append(msgs, openai.ChatCompletionMessage{
 			Role:    h.Role,
-			Content: h.Content,
+			Content: userMessageText(h),
 		})
 	}
 
@@ -1240,6 +1279,94 @@ func (b *Bot) handleVoice(c tele.Context) error {
 	return b.startChatFlow(c.Chat(), sender, userMsg, true)
 }
 
+func (b *Bot) handlePhoto(c tele.Context) error {
+	msg := c.Message()
+	if msg == nil || msg.Photo == nil {
+		return nil
+	}
+	if !b.isAllowed(c) {
+		log.Printf("[vision] access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
+
+	snap := b.snapshot()
+	if !snap.cfg.VisionEnabled {
+		return nil // silently ignore unless explicitly enabled
+	}
+
+	// Group-chat mention gating: mirror handleText. Photos in groups should
+	// only trigger a reply when the bot is mentioned in the caption (or when
+	// AUTO_DETECT decides the caption is relevant).
+	caption := strings.TrimSpace(msg.Caption)
+	if msg.Chat.Type != tele.ChatPrivate {
+		mention := snap.cfg.BotUsername
+		if mention == "" {
+			mention = "@" + snap.tg.Me.Username
+		}
+		mentioned := caption != "" &&
+			strings.Contains(strings.ToLower(caption), strings.ToLower(mention))
+		if !mentioned && snap.cfg.AutoDetect && caption != "" {
+			mentioned = b.isRelevant(c.Chat().ID, msg.Sender, caption)
+		}
+		if !mentioned {
+			return nil
+		}
+		if idx := strings.Index(strings.ToLower(caption), strings.ToLower(mention)); idx >= 0 {
+			caption = strings.TrimSpace(caption[:idx] + caption[idx+len(mention):])
+		}
+	}
+
+	photo := msg.Photo
+	maxBytes := int64(snap.cfg.VisionMaxImageBytes)
+	if photo.FileSize > 0 && int64(photo.FileSize) > maxBytes {
+		return c.Reply(fmt.Sprintf("⚠️ Image too large (%d bytes, max %d).",
+			photo.FileSize, snap.cfg.VisionMaxImageBytes))
+	}
+
+	reader, err := snap.tg.File(&photo.File)
+	if err != nil {
+		log.Printf("[vision] failed to download photo: %v", err)
+		return c.Reply("❌ Failed to download image.")
+	}
+	defer reader.Close()
+
+	// Bounded read so a lying FileSize cannot OOM us.
+	limited := io.LimitReader(reader, int64(snap.cfg.VisionMaxImageBytes)+1)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		log.Printf("[vision] read error: %v", err)
+		return c.Reply("❌ Failed to read image data.")
+	}
+	if len(raw) > snap.cfg.VisionMaxImageBytes {
+		return c.Reply(fmt.Sprintf("⚠️ Image exceeds %d bytes.", snap.cfg.VisionMaxImageBytes))
+	}
+
+	mime := http.DetectContentType(raw)
+	dataURL := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(raw)
+
+	captionForText := caption
+	if captionForText == "" {
+		captionForText = "[Photo message]"
+	} else {
+		captionForText = "[Photo message]\n" + captionForText
+	}
+	sender := msg.Sender
+	headerAndText := buildUserContent(sender, captionForText)
+
+	userMsg := openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleUser,
+		Name: sanitizeName(sender.ID),
+		MultiContent: []openai.ChatMessagePart{
+			{Type: openai.ChatMessagePartTypeText, Text: headerAndText},
+			{Type: openai.ChatMessagePartTypeImageURL, ImageURL: &openai.ChatMessageImageURL{
+				URL:    dataURL,
+				Detail: openai.ImageURLDetailAuto,
+			}},
+		},
+	}
+	return b.startChatFlow(c.Chat(), sender, userMsg, true)
+}
+
 func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.ChatCompletionMessage, includeContext bool) error {
 	if chat == nil {
 		return fmt.Errorf("chat is nil")
@@ -1280,7 +1407,7 @@ func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.C
 		ChatID:    chatID,
 		UserID:    userID,
 		RequestID: usageCtx.RequestID,
-		Summary:   truncateDashboardText(userMsg.Content, 180),
+		Summary:   truncateDashboardText(userMessageText(userMsg), 180),
 	})
 	go b.streamReply(chatID, userMsg, messages, placeholder, sender, usageCtx)
 	return nil

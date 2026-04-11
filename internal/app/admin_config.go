@@ -423,6 +423,18 @@ func allConfigOptions() []configOption {
 		stringOption(61, "TOOLS_SUMMARY_MODEL", "Model for MCP server summary generation (a small/cheap model is recommended). Defaults to OPENAI_MODEL.", false,
 			func(cfg Config) string { return cfg.ToolsSummaryModel },
 			func(cfg *Config, v string) { cfg.ToolsSummaryModel = v }),
+		boolOption(62, "VISION_ENABLED", "Enable photo (image) understanding. Photos are sent to the primary model as OpenAI Vision image_url parts. Requires a vision-capable OPENAI_MODEL.", false,
+			func(cfg Config) bool { return cfg.VisionEnabled },
+			func(cfg *Config, v bool) { cfg.VisionEnabled = v }),
+		intOption(63, "VISION_MAX_IMAGE_BYTES", "Maximum allowed photo size in bytes. Photos larger than this are rejected. Must be greater than 0.", false,
+			func(cfg Config) int { return cfg.VisionMaxImageBytes },
+			func(cfg *Config, v int) { cfg.VisionMaxImageBytes = v },
+			func(v int) error {
+				if v <= 0 {
+					return fmt.Errorf("must be greater than 0")
+				}
+				return nil
+			}),
 	}
 }
 

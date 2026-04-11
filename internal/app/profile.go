@@ -171,11 +171,12 @@ func (b *Bot) buildProfileSection(history []openai.ChatCompletionMessage) string
 	// Collect unique participants from message metadata headers.
 	participants := make(map[int64]string)
 	for _, msg := range history {
-		userID := extractUserIDFromContent(msg.Content)
+		text := userMessageText(msg)
+		userID := extractUserIDFromContent(text)
 		if userID == 0 {
 			continue
 		}
-		participants[userID] = extractUsernameFromContent(msg.Content)
+		participants[userID] = extractUsernameFromContent(text)
 	}
 	if len(participants) == 0 {
 		return ""

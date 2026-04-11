@@ -21,6 +21,7 @@
 - **聊天级定时任务** — 每个聊天都可以配置独立的定时任务，按 cron 表达式定时触发，并复用正常 chat 流程向 LLM 发送 prompt
 - **SSH TUI 管理看板** — 可通过 SSH 登录内嵌 Dashboard，基于 [Bubble Tea](https://github.com/charmbracelet/bubbletea) 呈现多 Tab 运行态、用户画像、任务和详细事件流
 - **语音输入 (STT)** — 接收 Telegram 语音消息，通过 OpenAI 兼容 STT API（Whisper、gpt-4o-transcribe 等）转写为文字后，走与文字消息完全相同的对话流程（历史记忆、工具调用、TTS 输出等）；可选是否向用户回显转写结果
+- **图片理解 (Vision)** — 接收 Telegram 图片消息（含可选 caption），按 OpenAI Vision 协议封装为 `image_url` data URL，与文字一并送入主对话流程；支持任何视觉模型（gpt-4o、qwen-vl 等），并复用历史记忆、工具调用、画像等所有能力
 - **可选 TTS 语音播报** — 管理员可按聊天开启 `/speach` 模式，机器人会自动缩短回复并额外发送火山引擎合成音频
 - **贴纸策略发送** — 支持在回复后按规则/模型策略自动发送 Telegram Sticker，支持 `append` / `replace` / `command_only` 模式
 - **管理员热修改配置** — 管理员可在私聊中通过 `/admin` 查看、修改并持久化保存全部配置项，支持 `cancel` 返回上一步
@@ -294,6 +295,24 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 - Telegram 语音消息为 OGG/OPUS 格式，直接以流式传输发送给 STT 接口，无本地落盘
 - 语音消息同样受 `ALLOWED_USERS` / `ALLOWED_GROUPS` 白名单控制；未配置 STT 时，语音消息被静默忽略
 - 可通过 `/admin` 热修改所有 STT 配置项，无需重启
+
+### 图片理解 Vision（可选）
+
+接收 Telegram 图片消息（含可选 caption），下载最大尺寸的原图后按 OpenAI Vision 协议封装为 base64 `image_url` data URL，与 caption 一起作为 `MultiContent` 发送给主对话模型。回复流程与文字消息完全一致：流式输出、历史记忆、工具调用、画像提取、贴纸/TTS 后处理均自动复用。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `VISION_ENABLED` | `false` | 是否接收并理解图片消息；关闭时图片被静默忽略 |
+| `VISION_MAX_IMAGE_BYTES` | `5242880` | 单张图片的最大字节数（默认 5 MiB），超出会拒收并提示用户 |
+
+说明：
+
+- 视觉能力由主对话模型提供，**复用** `OPENAI_API_BASE` / `OPENAI_API_KEY` / `OPENAI_MODEL`，因此需要将主模型配置为支持视觉的模型（如 `gpt-4o`、`gpt-4o-mini`、`qwen-vl-max` 等）
+- 图片以 base64 data URL 形式直接嵌入请求，不依赖外部 CDN；MIME 类型由本地嗅探得出
+- 图片消息同样受 `ALLOWED_USERS` / `ALLOWED_GROUPS` 白名单控制
+- 群聊中遵循与文字消息相同的 @ 提及规则：caption 必须包含 `BOT_USERNAME`（或被 `AUTO_DETECT` 判定为相关）才会触发回复
+- 历史记录中的图片消息会以多模态格式持久化到 `chat.db`，后续轮次仍可引用上文图片
+- 可通过 `/admin` 热修改 `VISION_ENABLED` 与 `VISION_MAX_IMAGE_BYTES`，无需重启
 
 ### Telegram Sticker 策略（可选）
 
@@ -665,6 +684,14 @@ admin - 管理员配置面板
             ├─ 下载 OGG/OPUS 流 → STT API (/v1/audio/transcriptions)
             ├─ STT_DISPLAY=true → 回复 🎙️ <转写内容>
             └─ 以转写文本构建 userMsg → startChatFlow() （与文字消息完全相同的后续流程）
+
+用户图片 → handlePhoto()
+            ├─ 权限检查: isAllowed()
+            ├─ VISION_ENABLED=false → 静默忽略
+            ├─ 群聊: 检查 caption 中的 @mention（或 AUTO_DETECT 判定相关）
+            ├─ 下载最大尺寸原图 → 校验大小不超过 VISION_MAX_IMAGE_BYTES
+            ├─ 嗅探 MIME → base64 编码 → data URL
+            └─ 构建 MultiContent userMsg [text + image_url] → startChatFlow()
 
 用户消息 → handleText()
             ├─ 权限检查: isAllowed()

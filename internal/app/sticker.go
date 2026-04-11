@@ -387,7 +387,7 @@ func (b *Bot) finalizeStickerReply(
 		return
 	}
 
-	label := b.selectStickerLabel(chatID, userMsg.Content, finalText)
+	label := b.selectStickerLabel(chatID, userMessageText(userMsg), finalText)
 	if label == "" {
 		return
 	}
