@@ -201,6 +201,9 @@ func (m *MCPClientManager) connectOne(
 		if err != nil {
 			return fmt.Errorf("create streamable HTTP client: %w", err)
 		}
+		if err := c.Start(ctx); err != nil {
+			return fmt.Errorf("start streamable HTTP client: %w", err)
+		}
 
 	case "sse":
 		if srv.URL == "" {
@@ -213,6 +216,9 @@ func (m *MCPClientManager) connectOne(
 		c, err = client.NewSSEMCPClient(srv.URL, opts...)
 		if err != nil {
 			return fmt.Errorf("create SSE client: %w", err)
+		}
+		if err := c.Start(ctx); err != nil {
+			return fmt.Errorf("start SSE client: %w", err)
 		}
 
 	case "stdio":
