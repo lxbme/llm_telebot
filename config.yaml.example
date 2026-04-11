@@ -111,3 +111,17 @@ TOOLS_SUMMARY_MODEL: ""
 # VISION_MAX_IMAGE_BYTES：单张图片的最大字节数，超过会被拒绝（默认 5 MiB）。
 VISION_ENABLED: false
 VISION_MAX_IMAGE_BYTES: 5242880
+
+# ── Document (File Understanding) ─────────────────────────────────────────────
+# 启用后，机器人可接收 Telegram 文件上传。PDF 通过本地 pdftotext (poppler-utils)
+# 提取文本，其余白名单扩展（txt/md/csv/json/log/源代码等）按 UTF-8 读取。
+# Office 文件 (docx/xlsx/pptx) 在 v1 中不支持，会被直接拒绝。
+# DOCUMENT_MAX_BYTES：单个文件的原始大小上限（默认 5 MiB）。
+# DOCUMENT_MAX_TEXT_CHARS：注入到 LLM 消息的文本长度上限（按 rune 计），超出硬截断。
+# DOCUMENT_ALLOWED_EXTS：允许的扩展名白名单（小写、无前缀点，英文逗号分隔）。
+# DOCUMENT_PDFTOTEXT_CMD：PDF 文本提取命令（PATH 名或绝对路径），默认 pdftotext。
+DOCUMENT_ENABLED: false
+DOCUMENT_MAX_BYTES: 5242880
+DOCUMENT_MAX_TEXT_CHARS: 20000
+DOCUMENT_ALLOWED_EXTS: "txt,md,markdown,csv,tsv,json,xml,yaml,yml,toml,ini,log,pdf,go,py,js,ts,tsx,jsx,rs,java,c,cc,cpp,h,hpp,sh,rb,php,kt,swift,html,css,sql"
+DOCUMENT_PDFTOTEXT_CMD: pdftotext

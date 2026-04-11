@@ -435,6 +435,33 @@ func allConfigOptions() []configOption {
 				}
 				return nil
 			}),
+		boolOption(64, "DOCUMENT_ENABLED", "Enable document (file) understanding. Files are downloaded, text-extracted (pdftotext for PDF, UTF-8 read for plain text), then injected into the LLM message.", false,
+			func(cfg Config) bool { return cfg.DocumentEnabled },
+			func(cfg *Config, v bool) { cfg.DocumentEnabled = v }),
+		intOption(65, "DOCUMENT_MAX_BYTES", "Maximum allowed raw document size in bytes. Larger files are rejected before extraction. Must be greater than 0.", false,
+			func(cfg Config) int { return cfg.DocumentMaxBytes },
+			func(cfg *Config, v int) { cfg.DocumentMaxBytes = v },
+			func(v int) error {
+				if v <= 0 {
+					return fmt.Errorf("must be greater than 0")
+				}
+				return nil
+			}),
+		intOption(66, "DOCUMENT_MAX_TEXT_CHARS", "Maximum characters of extracted text injected into the LLM message. Exceeding text is hard-truncated. Must be greater than 0.", false,
+			func(cfg Config) int { return cfg.DocumentMaxTextChars },
+			func(cfg *Config, v int) { cfg.DocumentMaxTextChars = v },
+			func(v int) error {
+				if v <= 0 {
+					return fmt.Errorf("must be greater than 0")
+				}
+				return nil
+			}),
+		stringOption(67, "DOCUMENT_ALLOWED_EXTS", "Comma-separated list of accepted file extensions (no leading dot). 'pdf' is extracted via pdftotext; everything else is read as plain UTF-8 text.", false,
+			func(cfg Config) string { return cfg.DocumentAllowedExts },
+			func(cfg *Config, v string) { cfg.DocumentAllowedExts = v }),
+		stringOption(68, "DOCUMENT_PDFTOTEXT_CMD", "Command used to extract PDF text (absolute path or PATH name). Defaults to 'pdftotext'.", false,
+			func(cfg Config) string { return cfg.DocumentPdftotextCmd },
+			func(cfg *Config, v string) { cfg.DocumentPdftotextCmd = v }),
 	}
 }
 

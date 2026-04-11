@@ -19,6 +19,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/llm_tel
 FROM node:25-alpine3.22
 
 RUN apk add --no-cache ca-certificates tzdata ffmpeg \
+    # poppler-utils provides `pdftotext` for DOCUMENT_ENABLED PDF extraction.
+    poppler-utils \
     # Install Python + pip + uvx for Python-based MCP servers (optional, remove to slim down)
     python3 py3-pip pipx \
     && pipx install uvx 2>/dev/null || true

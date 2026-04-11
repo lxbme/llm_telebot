@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -125,6 +126,13 @@ type Config struct {
 	// Vision (image understanding) settings.
 	VisionEnabled       bool
 	VisionMaxImageBytes int
+
+	// Document (file upload understanding) settings.
+	DocumentEnabled      bool
+	DocumentMaxBytes     int
+	DocumentMaxTextChars int
+	DocumentAllowedExts  string
+	DocumentPdftotextCmd string
 }
 
 func loadConfig() Config {
@@ -212,6 +220,15 @@ func loadConfig() Config {
 	visionMaxImageBytes, err := strconv.Atoi(get("VISION_MAX_IMAGE_BYTES", "5242880"))
 	if err != nil || visionMaxImageBytes <= 0 {
 		visionMaxImageBytes = 5 * 1024 * 1024
+	}
+
+	documentMaxBytes, err := strconv.Atoi(get("DOCUMENT_MAX_BYTES", "5242880"))
+	if err != nil || documentMaxBytes <= 0 {
+		documentMaxBytes = 5 * 1024 * 1024
+	}
+	documentMaxTextChars, err := strconv.Atoi(get("DOCUMENT_MAX_TEXT_CHARS", "20000"))
+	if err != nil || documentMaxTextChars <= 0 {
+		documentMaxTextChars = 20000
 	}
 
 	allowedUsers := parseIDList(get("ALLOWED_USERS", ""))
@@ -305,6 +322,11 @@ func loadConfig() Config {
 		ToolsSummaryModel:              get("TOOLS_SUMMARY_MODEL", ""),
 		VisionEnabled:                  strings.ToLower(get("VISION_ENABLED", "false")) == "true",
 		VisionMaxImageBytes:            visionMaxImageBytes,
+		DocumentEnabled:                strings.ToLower(get("DOCUMENT_ENABLED", "false")) == "true",
+		DocumentMaxBytes:               documentMaxBytes,
+		DocumentMaxTextChars:           documentMaxTextChars,
+		DocumentAllowedExts:            get("DOCUMENT_ALLOWED_EXTS", defaultDocumentAllowedExts),
+		DocumentPdftotextCmd:           get("DOCUMENT_PDFTOTEXT_CMD", "pdftotext"),
 	}
 	if err := ensureConfigFileExists(cfg); err != nil {
 		log.Printf("Warning: failed to bootstrap config file %s: %v", effectiveConfigFilePath(cfg), err)
@@ -649,6 +671,11 @@ func NewBot(cfg Config) (*Bot, error) {
 			cfg.OpenAIModel, cfg.VisionMaxImageBytes)
 	}
 
+	if cfg.DocumentEnabled {
+		log.Printf("Document enabled (max bytes: %d, max chars: %d, pdftotext: %s, allowed: %s)",
+			cfg.DocumentMaxBytes, cfg.DocumentMaxTextChars, cfg.DocumentPdftotextCmd, cfg.DocumentAllowedExts)
+	}
+
 	stickerEngine, err := NewStickerEngine(cfg.StickerRulesPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init sticker rules: %w", err)
@@ -772,6 +799,7 @@ func (b *Bot) Run() {
 	b.tg.Handle(tele.OnText, b.handleText)
 	b.tg.Handle(tele.OnVoice, b.handleVoice)
 	b.tg.Handle(tele.OnPhoto, b.handlePhoto)
+	b.tg.Handle(tele.OnDocument, b.handleDocument)
 
 	if b.scheduler != nil {
 		b.scheduler.Start()
@@ -1363,6 +1391,118 @@ func (b *Bot) handlePhoto(c tele.Context) error {
 				Detail: openai.ImageURLDetailAuto,
 			}},
 		},
+	}
+	return b.startChatFlow(c.Chat(), sender, userMsg, true)
+}
+
+func (b *Bot) handleDocument(c tele.Context) error {
+	msg := c.Message()
+	if msg == nil || msg.Document == nil {
+		return nil
+	}
+	if !b.isAllowed(c) {
+		log.Printf("[document] access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
+		return nil
+	}
+
+	snap := b.snapshot()
+	if !snap.cfg.DocumentEnabled {
+		return nil
+	}
+
+	doc := msg.Document
+	fileName := strings.TrimSpace(doc.FileName)
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(fileName), "."))
+	if ext == "" || !documentExtAllowed(snap.cfg.DocumentAllowedExts, ext) {
+		displayName := fileName
+		if displayName == "" {
+			displayName = "(no name)"
+		}
+		return c.Reply(fmt.Sprintf("⚠️ Unsupported document type: %q. Allowed: %s",
+			displayName, snap.cfg.DocumentAllowedExts))
+	}
+
+	// Group-chat mention gating: mirror handleText / handlePhoto. Documents in
+	// groups only trigger a reply when the bot is mentioned in the caption (or
+	// when AUTO_DETECT decides the caption is relevant). The caption lives on
+	// the Message envelope (msg.Caption), not on the Document payload — telebot
+	// surfaces media captions at the message level exactly like handlePhoto.
+	caption := strings.TrimSpace(msg.Caption)
+	if msg.Chat.Type != tele.ChatPrivate {
+		mention := snap.cfg.BotUsername
+		if mention == "" {
+			mention = "@" + snap.tg.Me.Username
+		}
+		mentioned := caption != "" &&
+			strings.Contains(strings.ToLower(caption), strings.ToLower(mention))
+		if !mentioned && snap.cfg.AutoDetect && caption != "" {
+			mentioned = b.isRelevant(c.Chat().ID, msg.Sender, caption)
+		}
+		if !mentioned {
+			return nil
+		}
+		if idx := strings.Index(strings.ToLower(caption), strings.ToLower(mention)); idx >= 0 {
+			caption = strings.TrimSpace(caption[:idx] + caption[idx+len(mention):])
+		}
+	}
+
+	maxBytes := int64(snap.cfg.DocumentMaxBytes)
+	if doc.FileSize > 0 && doc.FileSize > maxBytes {
+		return c.Reply(fmt.Sprintf("⚠️ Document too large (%d bytes, max %d).",
+			doc.FileSize, snap.cfg.DocumentMaxBytes))
+	}
+
+	reader, err := snap.tg.File(&doc.File)
+	if err != nil {
+		log.Printf("[document] failed to download document: %v", err)
+		return c.Reply("❌ Failed to download document.")
+	}
+	defer reader.Close()
+
+	limited := io.LimitReader(reader, maxBytes+1)
+	raw, err := io.ReadAll(limited)
+	if err != nil {
+		log.Printf("[document] read error: %v", err)
+		return c.Reply("❌ Failed to read document.")
+	}
+	if int64(len(raw)) > maxBytes {
+		return c.Reply(fmt.Sprintf("⚠️ Document exceeds %d bytes.", snap.cfg.DocumentMaxBytes))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	text, err := extractDocumentText(ctx, ext, raw, snap.cfg.DocumentPdftotextCmd, snap.cfg.DocumentMaxTextChars)
+	if err != nil {
+		log.Printf("[document] extract failed: %v", err)
+		return c.Reply(fmt.Sprintf("❌ Failed to extract document text: %v", err))
+	}
+	if strings.TrimSpace(text) == "" {
+		return c.Reply("⚠️ Document appears to contain no extractable text.")
+	}
+
+	displayName := fileName
+	if displayName == "" {
+		displayName = "(unnamed)"
+	}
+	var bodyBuilder strings.Builder
+	if caption != "" {
+		bodyBuilder.WriteString(caption)
+		bodyBuilder.WriteString("\n\n")
+	}
+	fmt.Fprintf(&bodyBuilder, "[User attached a document: %s]\n", displayName)
+	fmt.Fprintf(&bodyBuilder, "<document name=%q type=%q bytes=%d>\n", displayName, ext, len(raw))
+	bodyBuilder.WriteString(text)
+	if !strings.HasSuffix(text, "\n") {
+		bodyBuilder.WriteByte('\n')
+	}
+	bodyBuilder.WriteString("</document>")
+	body := bodyBuilder.String()
+
+	sender := msg.Sender
+	userMsg := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Name:    sanitizeName(sender.ID),
+		Content: buildUserContent(sender, body),
 	}
 	return b.startChatFlow(c.Chat(), sender, userMsg, true)
 }
