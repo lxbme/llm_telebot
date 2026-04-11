@@ -21,6 +21,9 @@ FROM node:25-alpine3.22
 RUN apk add --no-cache ca-certificates tzdata ffmpeg \
     # poppler-utils provides `pdftotext` for DOCUMENT_ENABLED PDF extraction.
     poppler-utils \
+    # pandoc converts office formats (docx/odt/pptx/epub) to markdown for
+    # the document parser registry. xlsx is handled in-process via excelize.
+    pandoc \
     # Install Python + pip + uvx for Python-based MCP servers (optional, remove to slim down)
     python3 py3-pip pipx \
     && pipx install uvx 2>/dev/null || true

@@ -22,7 +22,7 @@
 - **SSH TUI 管理看板** — 可通过 SSH 登录内嵌 Dashboard，基于 [Bubble Tea](https://github.com/charmbracelet/bubbletea) 呈现多 Tab 运行态、用户画像、任务和详细事件流
 - **语音输入 (STT)** — 接收 Telegram 语音消息，通过 OpenAI 兼容 STT API（Whisper、gpt-4o-transcribe 等）转写为文字后，走与文字消息完全相同的对话流程（历史记忆、工具调用、TTS 输出等）；可选是否向用户回显转写结果
 - **图片理解 (Vision)** — 接收 Telegram 图片消息（含可选 caption），按 OpenAI Vision 协议封装为 `image_url` data URL，与文字一并送入主对话流程；支持任何视觉模型（gpt-4o、qwen-vl 等），并复用历史记忆、工具调用、画像等所有能力
-- **文档理解 (Document)** — 接收 Telegram 文件上传，PDF 通过本地 `pdftotext` (poppler-utils) 提取，其余白名单扩展（txt/md/csv/json/log/源代码等）按 UTF-8 直接读取；提取后的文本硬截断到上限字符数再注入主对话流程
+- **文档理解 (Document)** — 接收 Telegram 文件上传，按扩展名路由到 parser 注册表：PDF → `pdftotext` (poppler-utils)，docx/odt/pptx/epub → `pandoc` 转 markdown，xlsx/xlsm → 进程内 `excelize` 转 TSV，纯文本/源代码按 UTF-8 直读；提取后的文本硬截断到上限字符数再注入主对话流程
 - **可选 TTS 语音播报** — 管理员可按聊天开启 `/speach` 模式，机器人会自动缩短回复并额外发送火山引擎合成音频
 - **贴纸策略发送** — 支持在回复后按规则/模型策略自动发送 Telegram Sticker，支持 `append` / `replace` / `command_only` 模式
 - **管理员热修改配置** — 管理员可在私聊中通过 `/admin` 查看、修改并持久化保存全部配置项，支持 `cancel` 返回上一步
@@ -317,26 +317,43 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 
 ### 文档理解 Document（可选）
 
-接收 Telegram 文件上传。PDF 通过本地 `pdftotext`（poppler-utils）命令以 stdin/stdout 管道方式提取纯文本；其余白名单扩展（纯文本与常见源代码）按 UTF-8 直接读取（非法字节替换为 `U+FFFD`）。提取后的文本按 rune 数硬截断到 `DOCUMENT_MAX_TEXT_CHARS`，再连同文件元信息（文件名、扩展名、字节数）与用户 caption 一并作为普通 `Content` 注入主对话流程。后续历史、画像、工具调用完全复用现有管线。
+接收 Telegram 文件上传。`internal/app/document.go` 内部维护一个按扩展名路由的 parser 注册表：
 
-**前置条件**：如果需要 PDF 支持，需在宿主机安装 `poppler-utils` 并确保 `pdftotext` 可在 PATH 中解析（或通过 `DOCUMENT_PDFTOTEXT_CMD` 指定绝对路径）。仅使用纯文本/源代码时可无需安装。
+| 扩展名 | Parser | 输出格式 |
+|---|---|---|
+| `pdf` | 本地 `pdftotext` (poppler-utils)，stdin/stdout 管道 | 带版式的纯文本 |
+| `docx` / `odt` / `pptx` / `epub` | 本地 `pandoc`，临时文件 → `gfm` (`--wrap=none`) | GitHub-flavored markdown，保留标题/列表/表格/强调 |
+| `xlsx` / `xlsm` | 进程内 `github.com/xuri/excelize/v2` | 每张 sheet 一个 `## Sheet: <name>` 段 + TSV 行 |
+| 其他白名单扩展（txt/md/源代码…） | 直接按 UTF-8 读取（非法字节替换为 `U+FFFD`） | 原文 |
+
+提取后的文本按 rune 数硬截断到 `DOCUMENT_MAX_TEXT_CHARS`，再连同文件元信息（文件名、扩展名、字节数）与用户 caption 一并作为普通 `Content` 注入主对话流程。后续历史、画像、工具调用完全复用现有管线。
+
+**前置条件**：
+
+- 想接收 PDF → 安装 `poppler-utils`（提供 `pdftotext`）
+- 想接收 docx/odt/pptx/epub → 安装 `pandoc`（Alpine: `apk add pandoc`）
+- 想接收 xlsx/xlsm → 无系统依赖（excelize 是 Go 库，已编译进二进制）
+- 仅使用纯文本/源代码时无需任何额外安装
+
+仓库自带的 `Dockerfile` 已经在运行镜像中预装 `poppler-utils` 与 `pandoc`，开箱即可启用所有 parser。
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `DOCUMENT_ENABLED` | `false` | 是否接收并理解文档上传；关闭时文档被静默忽略 |
 | `DOCUMENT_MAX_BYTES` | `5242880` | 单个文件的原始字节上限（默认 5 MiB），超出直接拒绝 |
 | `DOCUMENT_MAX_TEXT_CHARS` | `20000` | 注入到 LLM 消息的文本长度上限（按 rune 计），超出硬截断并追加 `[... truncated, original N chars]` 标记 |
-| `DOCUMENT_ALLOWED_EXTS` | 见 `config.yaml.example` | 允许的扩展名白名单（小写、无前缀点，英文逗号分隔）。`pdf` 特殊处理，其余均按 UTF-8 文本读取 |
+| `DOCUMENT_ALLOWED_EXTS` | 见 `config.yaml.example` | 允许的扩展名白名单（小写、无前缀点，英文逗号分隔）。增删后缀即可单独开关任一格式 |
 | `DOCUMENT_PDFTOTEXT_CMD` | `pdftotext` | PDF 文本提取命令（PATH 名或绝对路径） |
 
 说明：
 
-- Office 文件（`docx` / `xlsx` / `pptx` / `odt` 等）**在 v1 中不支持**，会被直接拒绝并提示 "Unsupported document type"
-- 扫描版 PDF（仅含图片、无文字层）会被 `pdftotext` 返回空串，机器人会回复"文档不包含可提取文本"
+- 启用某种 office 格式只需把后缀加进 `DOCUMENT_ALLOWED_EXTS`；如果对应的命令（`pandoc`）未安装，用户上传时会收到清晰的 "pandoc not installed" 错误，而不会让服务崩溃
+- xlsx parser 内置两道安全闸：累计输出 ≤ 4 MiB 与 ≤ 50000 行，防止 zip-bomb；触发后会附加 `[... xlsx parser stopped early at safety cap]` 标记
+- 扫描版 PDF（仅含图片、无文字层）会被 `pdftotext` 返回空串，机器人回复"文档不包含可提取文本"
 - 下载使用 `io.LimitReader` 二次加界，即使 Telegram 汇报的 FileSize 不可信也不会 OOM
 - 群聊遵循与图片/文字相同的 @ 提及规则：caption 必须包含 `BOT_USERNAME`（或被 `AUTO_DETECT` 判定为相关）才会触发回复
 - 文档消息同样受 `ALLOWED_USERS` / `ALLOWED_GROUPS` 白名单控制
-- 当 `DOCUMENT_PDFTOTEXT_CMD` 指向不存在或无权限执行的路径时，用户上传 PDF 会收到明确错误，而不会导致服务崩溃
+- 旧式 Office 二进制格式（`.doc` / `.xls` / `.ppt`）暂未支持，需要的话自行注册 parser（见 `documentParsers`）
 - 可通过 `/admin` 热修改全部 `DOCUMENT_*` 配置项，无需重启
 
 ### Telegram Sticker 策略（可选）

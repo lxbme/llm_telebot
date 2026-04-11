@@ -21,6 +21,7 @@ var (
 	overflowBucket    = []byte("chat_overflow")
 	summaryBucket     = []byte("chat_summaries")
 	scheduleBucket    = []byte("chat_schedules")
+	reminderBucket    = []byte("user_reminders")
 	usageMinuteBucket = []byte("usage_minute")
 	usageDailyBucket  = []byte("usage_daily")
 	usageRecentBucket = []byte("usage_recent_meta")
@@ -47,6 +48,7 @@ func OpenChatDB(path string) (*ChatDB, error) {
 			overflowBucket,
 			summaryBucket,
 			scheduleBucket,
+			reminderBucket,
 			usageMinuteBucket,
 			usageDailyBucket,
 			usageRecentBucket,
@@ -470,5 +472,70 @@ func (c *ChatDB) DeleteSchedules(chatID int64) {
 	}
 	c.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(scheduleBucket).Delete(chatIDKey(chatID))
+	})
+}
+
+// ─── Reminder Persistence ────────────────────────────────────────────────────
+
+// userIDKey converts a user ID to a bbolt key.
+func userIDKey(userID int64) []byte {
+	return []byte(strconv.FormatInt(userID, 10))
+}
+
+// SaveReminders persists the reminder list for a user. An empty slice deletes
+// the key. Reminders are keyed by userID (not chatID) so the private-chat
+// "show me all my reminders across chats" listing is a single bucket lookup.
+func (c *ChatDB) SaveReminders(userID int64, reminders []Reminder) {
+	if c == nil {
+		return
+	}
+	if len(reminders) == 0 {
+		c.DeleteRemindersForUser(userID)
+		return
+	}
+	data, err := json.Marshal(reminders)
+	if err != nil {
+		log.Printf("[chat-db] marshal reminders error for user %d: %v", userID, err)
+		return
+	}
+	if err := c.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(reminderBucket).Put(userIDKey(userID), data)
+	}); err != nil {
+		log.Printf("[chat-db] save reminders error for user %d: %v", userID, err)
+	}
+}
+
+// LoadAllReminders loads all persisted reminders grouped by owner user ID.
+func (c *ChatDB) LoadAllReminders() map[int64][]Reminder {
+	if c == nil {
+		return nil
+	}
+	result := make(map[int64][]Reminder)
+	c.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(reminderBucket)
+		return b.ForEach(func(k, v []byte) error {
+			userID, err := strconv.ParseInt(string(k), 10, 64)
+			if err != nil {
+				return nil
+			}
+			var rems []Reminder
+			if err := json.Unmarshal(v, &rems); err != nil {
+				log.Printf("[chat-db] unmarshal reminders for user %d: %v", userID, err)
+				return nil
+			}
+			result[userID] = rems
+			return nil
+		})
+	})
+	return result
+}
+
+// DeleteRemindersForUser removes persisted reminders owned by a user.
+func (c *ChatDB) DeleteRemindersForUser(userID int64) {
+	if c == nil {
+		return
+	}
+	c.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(reminderBucket).Delete(userIDKey(userID))
 	})
 }
