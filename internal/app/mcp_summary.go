@@ -119,7 +119,7 @@ func mcpToolsHash(tools []openai.Tool) string {
 
 // ─── Summary Generator ────────────────────────────────────────────────────────
 
-var mcpSummarySystemPrompt = `Role: Minimalist Technical Writer.Task: Summarize the following MCP tool group in a single paragraph (≤80 words).Format: Start with [Group Name].Requirements: Synthesize the tools' collective capabilities into a high-density functional overview. Focus exclusively on the core utility and technical outcomes (what it enables the user to achieve). Use precise, active verbs. Do not list individual tool names or use introductory filler like "This group is designed to..." or "These tools provide...".`
+var mcpSummarySystemPrompt = `Role: Minimalist Technical Writer.Task: Summarize the following MCP tool group in a single paragraph (≤80 words).Format: Start with [Group Name] where Group Name is the EXACT tool group name as provided — do not change its casing, spelling, or formatting.Requirements: Synthesize the tools' collective capabilities into a high-density functional overview. Focus exclusively on the core utility and technical outcomes (what it enables the user to achieve). Use precise, active verbs. Do not list individual tool names or use introductory filler like "This group is designed to..." or "These tools provide...".`
 
 // MCPSummaryGenerator calls a small LLM to produce one-paragraph server summaries.
 type MCPSummaryGenerator struct {

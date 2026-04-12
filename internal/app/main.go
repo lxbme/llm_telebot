@@ -1672,7 +1672,14 @@ func (b *Bot) streamReply(
 						}
 						_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
 						for _, g := range args.Groups {
-							expandedServers[g] = true
+							resolved := g
+							for _, actual := range toolView.ServerNames() {
+								if strings.EqualFold(actual, g) {
+									resolved = actual
+									break
+								}
+							}
+							expandedServers[resolved] = true
 						}
 						log.Printf("[mcp_summary] schemas expanded for: %s", strings.Join(args.Groups, ", "))
 						messages = append(messages, openai.ChatCompletionMessage{

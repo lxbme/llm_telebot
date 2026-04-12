@@ -201,7 +201,7 @@ func (m *MCPClientManager) connectOne(
 		if err != nil {
 			return fmt.Errorf("create streamable HTTP client: %w", err)
 		}
-		if err := c.Start(ctx); err != nil {
+		if err := c.Start(context.Background()); err != nil {
 			return fmt.Errorf("start streamable HTTP client: %w", err)
 		}
 
@@ -217,7 +217,7 @@ func (m *MCPClientManager) connectOne(
 		if err != nil {
 			return fmt.Errorf("create SSE client: %w", err)
 		}
-		if err := c.Start(ctx); err != nil {
+		if err := c.Start(context.Background()); err != nil {
 			return fmt.Errorf("start SSE client: %w", err)
 		}
 
