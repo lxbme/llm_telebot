@@ -66,30 +66,30 @@ func (s *AdminConfigSessionStore) Clear(userID int64) {
 }
 
 type runtimeSnapshot struct {
-	cfg            Config
-	ai             *openai.Client
-	detectorAI     *openai.Client
-	detectorModel  string
-	profileAI      *openai.Client
-	profileModel   string
-	summaryAI      *openai.Client
-	summaryModel   string
-	stickerAI      *openai.Client
-	stickerModel   string
-	reminderAI     *openai.Client
-	reminderModel  string
-	chatDB         *ChatDB
-	store          *HistoryStore
-	stats          *StatsManager
-	summaries      *SummaryStore
-	profiles       *ProfileStore
-	tools          *ToolRegistry
-	mcpClients     *MCPClientManager
-	userTools      *UserToolManager
-	tasks          *TaskStore
-	reminders      *ReminderStore
-	scheduleWizard *ScheduleWizardStore
-	speechModes    *SpeechModeStore
+	cfg              Config
+	ai               *openai.Client
+	detectorAI       *openai.Client
+	detectorModel    string
+	profileAI        *openai.Client
+	profileModel     string
+	summaryAI        *openai.Client
+	summaryModel     string
+	stickerAI        *openai.Client
+	stickerModel     string
+	reminderAI       *openai.Client
+	reminderModel    string
+	chatDB           *ChatDB
+	store            *HistoryStore
+	stats            *StatsManager
+	summaries        *SummaryStore
+	profiles         *ProfileStore
+	tools            *ToolRegistry
+	mcpClients       *MCPClientManager
+	userTools        *UserToolManager
+	tasks            *TaskStore
+	reminders        *ReminderStore
+	scheduleWizard   *ScheduleWizardStore
+	speechModes      *SpeechModeStore
 	tts              *VolcengineTTSClient
 	stt              *STTClient
 	toolSummaryStore *MCPSummaryStore
@@ -102,30 +102,30 @@ func (b *Bot) snapshot() runtimeSnapshot {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return runtimeSnapshot{
-		cfg:            b.cfg,
-		ai:             b.ai,
-		detectorAI:     b.detectorAI,
-		detectorModel:  b.detectorModel,
-		profileAI:      b.profileAI,
-		profileModel:   b.profileModel,
-		summaryAI:      b.summaryAI,
-		summaryModel:   b.summaryModel,
-		stickerAI:      b.stickerAI,
-		stickerModel:   b.stickerModel,
-		reminderAI:     b.reminderAI,
-		reminderModel:  b.reminderModel,
-		chatDB:         b.chatDB,
-		store:          b.store,
-		stats:          b.stats,
-		summaries:      b.summaries,
-		profiles:       b.profiles,
-		tools:          b.tools,
-		mcpClients:     b.mcpClients,
-		userTools:      b.userTools,
-		tasks:          b.tasks,
-		reminders:      b.reminders,
-		scheduleWizard: b.scheduleWizard,
-		speechModes:    b.speechModes,
+		cfg:              b.cfg,
+		ai:               b.ai,
+		detectorAI:       b.detectorAI,
+		detectorModel:    b.detectorModel,
+		profileAI:        b.profileAI,
+		profileModel:     b.profileModel,
+		summaryAI:        b.summaryAI,
+		summaryModel:     b.summaryModel,
+		stickerAI:        b.stickerAI,
+		stickerModel:     b.stickerModel,
+		reminderAI:       b.reminderAI,
+		reminderModel:    b.reminderModel,
+		chatDB:           b.chatDB,
+		store:            b.store,
+		stats:            b.stats,
+		summaries:        b.summaries,
+		profiles:         b.profiles,
+		tools:            b.tools,
+		mcpClients:       b.mcpClients,
+		userTools:        b.userTools,
+		tasks:            b.tasks,
+		reminders:        b.reminders,
+		scheduleWizard:   b.scheduleWizard,
+		speechModes:      b.speechModes,
 		tts:              b.tts,
 		stt:              b.stt,
 		toolSummaryStore: b.toolSummaryStore,
@@ -491,6 +491,94 @@ func allConfigOptions() []configOption {
 		stringOption(72, "REMINDER_MODEL", "Optional model name for the reminder NL parser. Leave empty to fall back to OPENAI_MODEL.", false,
 			func(cfg Config) string { return cfg.ReminderModel },
 			func(cfg *Config, v string) { cfg.ReminderModel = v }),
+		customOption(73, "USER_DAILY_TOKEN_LIMIT", "Per-user daily token quota. Counts main_chat + tool_round call types only. 0 = unlimited.", false,
+			func(cfg Config) string { return strconv.FormatInt(cfg.UserDailyTokenLimit, 10) },
+			func(input string, cfg *Config) error {
+				value := normalizeConfigTextInput(input)
+				if value == "" {
+					cfg.UserDailyTokenLimit = 0
+					return nil
+				}
+				n, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return fmt.Errorf("please enter a non-negative integer")
+				}
+				if n < 0 {
+					return fmt.Errorf("cannot be less than 0")
+				}
+				cfg.UserDailyTokenLimit = n
+				return nil
+			}),
+		customOption(74, "USER_DAILY_USD_LIMIT", "Per-user daily USD quota. Counts main_chat + tool_round call types only. 0 = unlimited.", false,
+			func(cfg Config) string { return strconv.FormatFloat(cfg.UserDailyUSDLimit, 'f', -1, 64) },
+			func(input string, cfg *Config) error {
+				value := normalizeConfigTextInput(input)
+				if value == "" {
+					cfg.UserDailyUSDLimit = 0
+					return nil
+				}
+				n, err := strconv.ParseFloat(value, 64)
+				if err != nil {
+					return fmt.Errorf("please enter a non-negative number")
+				}
+				if n < 0 {
+					return fmt.Errorf("cannot be less than 0")
+				}
+				cfg.UserDailyUSDLimit = n
+				return nil
+			}),
+		customOption(75, "CHAT_DAILY_TOKEN_LIMIT", "Per-chat daily token quota. Counts main_chat + tool_round call types only. 0 = unlimited.", false,
+			func(cfg Config) string { return strconv.FormatInt(cfg.ChatDailyTokenLimit, 10) },
+			func(input string, cfg *Config) error {
+				value := normalizeConfigTextInput(input)
+				if value == "" {
+					cfg.ChatDailyTokenLimit = 0
+					return nil
+				}
+				n, err := strconv.ParseInt(value, 10, 64)
+				if err != nil {
+					return fmt.Errorf("please enter a non-negative integer")
+				}
+				if n < 0 {
+					return fmt.Errorf("cannot be less than 0")
+				}
+				cfg.ChatDailyTokenLimit = n
+				return nil
+			}),
+		customOption(76, "MODEL_PRICE_TABLE", "Model pricing for USD cost tracking. Format: \"gpt-4o:0.0025/0.01,gpt-4o-mini:0.00015/0.0006\" (input/output per 1k tokens). Use <empty> to clear.", false,
+			func(cfg Config) string {
+				if cfg.ModelPriceTableRaw != "" {
+					return cfg.ModelPriceTableRaw
+				}
+				return formatModelPriceTable(cfg.ModelPriceTable)
+			},
+			func(input string, cfg *Config) error {
+				value := normalizeConfigTextInput(input)
+				table, err := parseModelPriceTable(value)
+				if err != nil {
+					return err
+				}
+				cfg.ModelPriceTable = table
+				cfg.ModelPriceTableRaw = formatModelPriceTable(table)
+				return nil
+			}),
+		customOption(77, "QUOTA_RESET_TZ", "IANA timezone used to roll over per-day quota counters (e.g. Asia/Shanghai). Defaults to UTC on invalid input.", false,
+			func(cfg Config) string { return cfg.QuotaResetTZ },
+			func(input string, cfg *Config) error {
+				value := normalizeConfigTextInput(input)
+				if value == "" {
+					cfg.QuotaResetTZ = "UTC"
+					cfg.quotaResetLocation = time.UTC
+					return nil
+				}
+				loc, err := time.LoadLocation(value)
+				if err != nil {
+					return fmt.Errorf("invalid IANA timezone: %w", err)
+				}
+				cfg.QuotaResetTZ = value
+				cfg.quotaResetLocation = loc
+				return nil
+			}),
 	}
 }
 

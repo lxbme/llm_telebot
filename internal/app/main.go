@@ -139,6 +139,15 @@ type Config struct {
 	ReminderBase            string // optional separate API base for the NL parser
 	ReminderKey             string // optional separate API key for the NL parser
 	ReminderModel           string // optional separate model for the NL parser
+
+	// Daily usage quota & cost tracking.
+	UserDailyTokenLimit int64                 // 0 = unlimited; counts main_chat + tool_round tokens only
+	UserDailyUSDLimit   float64               // 0 = unlimited; counts main_chat + tool_round USD only
+	ChatDailyTokenLimit int64                 // 0 = unlimited; chat-scoped token cap
+	ModelPriceTable     map[string]ModelPrice // lowercased model name -> USD per 1k tokens
+	ModelPriceTableRaw  string                // last-serialized form, preserved for /admin display
+	QuotaResetTZ        string                // IANA tz used to decide "today" for quota rollover
+	quotaResetLocation  *time.Location        // parsed QuotaResetTZ, defaults to UTC on invalid input
 }
 
 func loadConfig() Config {
@@ -241,6 +250,32 @@ func loadConfig() Config {
 	allowedGroups := parseIDList(get("ALLOWED_GROUPS", ""))
 	stickerAllowedChats := parseIDList(get("STICKER_ALLOWED_CHATS", ""))
 
+	userDailyTokenLimit, _ := strconv.ParseInt(strings.TrimSpace(get("USER_DAILY_TOKEN_LIMIT", "0")), 10, 64)
+	if userDailyTokenLimit < 0 {
+		userDailyTokenLimit = 0
+	}
+	chatDailyTokenLimit, _ := strconv.ParseInt(strings.TrimSpace(get("CHAT_DAILY_TOKEN_LIMIT", "0")), 10, 64)
+	if chatDailyTokenLimit < 0 {
+		chatDailyTokenLimit = 0
+	}
+	userDailyUSDLimit, err := strconv.ParseFloat(strings.TrimSpace(get("USER_DAILY_USD_LIMIT", "0")), 64)
+	if err != nil || userDailyUSDLimit < 0 {
+		userDailyUSDLimit = 0
+	}
+	modelPriceRaw := strings.TrimSpace(get("MODEL_PRICE_TABLE", ""))
+	modelPriceTable, mpErr := parseModelPriceTable(modelPriceRaw)
+	if mpErr != nil {
+		log.Printf("Warning: MODEL_PRICE_TABLE parse error, ignoring: %v", mpErr)
+		modelPriceTable = nil
+	}
+	quotaTZRaw := strings.TrimSpace(get("QUOTA_RESET_TZ", "Asia/Shanghai"))
+	quotaLoc, tzErr := time.LoadLocation(quotaTZRaw)
+	if tzErr != nil {
+		log.Printf("Warning: QUOTA_RESET_TZ %q invalid, falling back to UTC: %v", quotaTZRaw, tzErr)
+		quotaTZRaw = "UTC"
+		quotaLoc = time.UTC
+	}
+
 	if len(allowedUsers) > 0 {
 		ids := make([]string, 0, len(allowedUsers))
 		for id := range allowedUsers {
@@ -337,6 +372,13 @@ func loadConfig() Config {
 		ReminderBase:                   get("REMINDER_API_BASE", ""),
 		ReminderKey:                    get("REMINDER_API_KEY", ""),
 		ReminderModel:                  get("REMINDER_MODEL", ""),
+		UserDailyTokenLimit:            userDailyTokenLimit,
+		UserDailyUSDLimit:              userDailyUSDLimit,
+		ChatDailyTokenLimit:            chatDailyTokenLimit,
+		ModelPriceTable:                modelPriceTable,
+		ModelPriceTableRaw:             formatModelPriceTable(modelPriceTable),
+		QuotaResetTZ:                   quotaTZRaw,
+		quotaResetLocation:             quotaLoc,
 	}
 	if err := ensureConfigFileExists(cfg); err != nil {
 		log.Printf("Warning: failed to bootstrap config file %s: %v", effectiveConfigFilePath(cfg), err)
@@ -701,38 +743,38 @@ func NewBot(cfg Config) (*Bot, error) {
 	dashboardEvents := NewDashboardEventHub(defaultDashboardEventBufferSize)
 
 	bot := &Bot{
-		cfg:             cfg,
-		ai:              aiClient,
-		detectorAI:      detectorClient,
-		detectorModel:   detectorModel,
-		profileAI:       profileClient,
-		profileModel:    profileModel,
-		summaryAI:       summaryClient,
-		summaryModel:    summaryModel,
-		stickerAI:       stickerClient,
-		stickerModel:    stickerModel,
-		chatDB:          chatDB,
-		store:           NewHistoryStore(chatDB),
-		stats:           NewStatsManager(chatDB),
-		summaries:       NewSummaryStore(chatDB),
-		profiles:        profiles,
-		tools:           toolRegistry,
-		mcpClients:      mcpManager,
-		userTools:       userToolMgr,
-		tasks:           NewTaskStore(chatDB),
-		reminders:       NewReminderStore(chatDB),
-		reminderAI:      reminderClient,
-		reminderModel:   reminderModel,
-		scheduleWizard:  NewScheduleWizardStore(),
-		speechModes:     NewSpeechModeStore(),
-		adminSessions:   NewAdminConfigSessionStore(),
+		cfg:              cfg,
+		ai:               aiClient,
+		detectorAI:       detectorClient,
+		detectorModel:    detectorModel,
+		profileAI:        profileClient,
+		profileModel:     profileModel,
+		summaryAI:        summaryClient,
+		summaryModel:     summaryModel,
+		stickerAI:        stickerClient,
+		stickerModel:     stickerModel,
+		chatDB:           chatDB,
+		store:            NewHistoryStore(chatDB),
+		stats:            NewStatsManager(chatDB),
+		summaries:        NewSummaryStore(chatDB),
+		profiles:         profiles,
+		tools:            toolRegistry,
+		mcpClients:       mcpManager,
+		userTools:        userToolMgr,
+		tasks:            NewTaskStore(chatDB),
+		reminders:        NewReminderStore(chatDB),
+		reminderAI:       reminderClient,
+		reminderModel:    reminderModel,
+		scheduleWizard:   NewScheduleWizardStore(),
+		speechModes:      NewSpeechModeStore(),
+		adminSessions:    NewAdminConfigSessionStore(),
 		tts:              ttsClient,
 		stt:              sttClient,
 		toolSummaryStore: toolSummaryStore,
 		toolSummaryGen:   toolSummaryGen,
 		stickers:         stickerEngine,
-		dashboardEvents: dashboardEvents,
-		tg:              tgBot,
+		dashboardEvents:  dashboardEvents,
+		tg:               tgBot,
 	}
 	bot.scheduler = NewTaskRunner(bot, bot.tasks)
 	bot.dashboardService = NewDashboardService(bot, dashboardEvents)
@@ -741,6 +783,11 @@ func NewBot(cfg Config) (*Bot, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to init dashboard ssh server: %w", err)
 		}
+	}
+	// Seed the quota counter from today's daily bucket so a restart doesn't
+	// give already-capped users a fresh allowance.
+	if bot.stats != nil {
+		bot.stats.HydrateQuotaFromDB(cfg.quotaResetLocation)
 	}
 	return bot, nil
 }
@@ -814,6 +861,7 @@ func (b *Bot) Run() {
 	b.tg.Handle("/reminder_del", b.handleReminderDeleteCommand)
 	b.tg.Handle("/reminderd", b.handleReminderDeleteCommand)
 	b.tg.Handle("/admin", b.handleAdminCommand)
+	b.tg.Handle("/quota_reset", b.handleQuotaReset)
 	adminCancelBtn := &tele.Btn{Unique: adminCancelButtonUnique}
 	b.tg.Handle(adminCancelBtn, b.handleAdminCancel)
 	b.tg.Handle(tele.OnText, b.handleText)
@@ -835,7 +883,11 @@ func (b *Bot) Run() {
 
 func (b *Bot) recordUsageEvent(event UsageEvent) {
 	snap := b.snapshot()
+	event.CostUSD = computeCostUSD(event, snap.cfg.ModelPriceTable)
 	if snap.stats != nil {
+		countsForQuota := event.CallType == UsageCallMainChat || event.CallType == UsageCallToolRound
+		localDate := currentLocalDate(snap.cfg.quotaResetLocation)
+		snap.stats.ApplyQuotaDelta(event, localDate, countsForQuota)
 		snap.stats.Record(event)
 	}
 	if b.dashboardEvents != nil {
@@ -1269,6 +1321,9 @@ func (b *Bot) handleText(c tele.Context) error {
 	}
 
 	sender := msg.Sender
+	if denial, ok := b.checkDailyQuota(sender.ID, c.Chat().ID); !ok {
+		return c.Reply(denial)
+	}
 	userMsg := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
 		Name:    sanitizeName(sender.ID),
@@ -1285,6 +1340,9 @@ func (b *Bot) handleVoice(c tele.Context) error {
 	if !b.isAllowed(c) {
 		log.Printf("[stt] access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
 		return nil
+	}
+	if denial, ok := b.checkDailyQuota(c.Sender().ID, c.Chat().ID); !ok {
+		return c.Reply(denial)
 	}
 
 	snap := b.snapshot()
@@ -1335,6 +1393,9 @@ func (b *Bot) handlePhoto(c tele.Context) error {
 	if !b.isAllowed(c) {
 		log.Printf("[vision] access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
 		return nil
+	}
+	if denial, ok := b.checkDailyQuota(c.Sender().ID, c.Chat().ID); !ok {
+		return c.Reply(denial)
 	}
 
 	snap := b.snapshot()
@@ -1423,6 +1484,9 @@ func (b *Bot) handleDocument(c tele.Context) error {
 	if !b.isAllowed(c) {
 		log.Printf("[document] access denied: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
 		return nil
+	}
+	if denial, ok := b.checkDailyQuota(c.Sender().ID, c.Chat().ID); !ok {
+		return c.Reply(denial)
 	}
 
 	snap := b.snapshot()

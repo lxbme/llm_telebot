@@ -77,6 +77,7 @@ type UsageEvent struct {
 	PromptTokens     int64         `json:"prompt_tokens"`
 	CompletionTokens int64         `json:"completion_tokens"`
 	TotalTokens      int64         `json:"total_tokens"`
+	CostUSD          float64       `json:"cost_usd,omitempty"`
 	RequestID        string        `json:"request_id,omitempty"`
 	MessageID        int           `json:"message_id,omitempty"`
 	ToolIterations   int           `json:"tool_iterations,omitempty"`
@@ -117,6 +118,7 @@ type UsageAggregate struct {
 	CompletionTokens int64     `json:"completion_tokens"`
 	TotalTokens      int64     `json:"total_tokens"`
 	TotalLatencyMs   int64     `json:"total_latency_ms"`
+	CostUSD          float64   `json:"cost_usd,omitempty"`
 	LastSeenAt       time.Time `json:"last_seen_at"`
 }
 
@@ -131,6 +133,7 @@ func (a *UsageAggregate) AddEvent(event UsageEvent) {
 	a.CompletionTokens += event.CompletionTokens
 	a.TotalTokens += event.TotalTokens
 	a.TotalLatencyMs += event.LatencyMs
+	a.CostUSD += event.CostUSD
 	if a.LastSeenAt.IsZero() || event.Timestamp.After(a.LastSeenAt) {
 		a.LastSeenAt = event.Timestamp
 	}
@@ -144,6 +147,7 @@ func (a *UsageAggregate) Merge(other UsageAggregate) {
 	a.CompletionTokens += other.CompletionTokens
 	a.TotalTokens += other.TotalTokens
 	a.TotalLatencyMs += other.TotalLatencyMs
+	a.CostUSD += other.CostUSD
 	if a.LastSeenAt.IsZero() || other.LastSeenAt.After(a.LastSeenAt) {
 		a.LastSeenAt = other.LastSeenAt
 	}
@@ -216,6 +220,8 @@ type StatsManager struct {
 	flushMu   sync.Mutex
 	flushKeys statsKeyLock
 
+	quota quotaCounter
+
 	closed atomic.Bool
 	wg     sync.WaitGroup
 }
@@ -231,6 +237,7 @@ func NewStatsManager(db *ChatDB) *StatsManager {
 	for i := range m.shards {
 		m.shards[i].pending = make(map[string]*UsageAggregate)
 	}
+	m.quota.data = make(map[string]*quotaBucket)
 
 	m.wg.Add(2)
 	go m.runAggregator()
@@ -767,4 +774,224 @@ func usageTimeFromStamp(granularity UsageGranularity, stamp string) (time.Time, 
 func nextRequestID() string {
 	seq := requestSequence.Add(1)
 	return strconv.FormatInt(time.Now().UTC().UnixNano(), 36) + "-" + strconv.FormatUint(seq, 36)
+}
+
+// quotaBucket holds the running per-day counters used to enforce daily usage
+// limits. QuotaTokens only accumulates call types that count against user
+// quota (main_chat + tool_round). TotalUSD accumulates every call type so
+// the dashboard can show full cost.
+type quotaBucket struct {
+	QuotaTokens int64
+	QuotaUSD    float64
+	TotalTokens int64
+	TotalUSD    float64
+	Date        string
+}
+
+// quotaCounter is an in-memory view of today's per-scope usage, sharded by
+// the same "{scope}|{entity}" key space as the stats shards. It is updated
+// synchronously on every recorded event so the quota check path is O(1) and
+// never hits the DB. On day rollover the bucket is lazily replaced.
+type quotaCounter struct {
+	mu   sync.RWMutex
+	data map[string]*quotaBucket
+}
+
+func quotaCounterKey(scope UsageScope, chatID, userID int64) (string, bool) {
+	entity, ok := usageEntity(scope, chatID, userID)
+	if !ok {
+		return "", false
+	}
+	return string(scope) + "|" + entity, true
+}
+
+// ApplyQuotaDelta updates the in-memory counter for the user and chat scopes
+// triggered by this event. countsForQuota indicates whether the call type
+// should push into QuotaTokens/QuotaUSD (the fields the quota check reads).
+// TotalTokens/TotalUSD always track every call.
+func (m *StatsManager) ApplyQuotaDelta(event UsageEvent, localDate string, countsForQuota bool) {
+	if m == nil {
+		return
+	}
+	for _, scope := range []UsageScope{UsageScopeUser, UsageScopeChat} {
+		key, ok := quotaCounterKey(scope, event.ChatID, event.UserID)
+		if !ok {
+			continue
+		}
+		m.quota.mu.Lock()
+		bucket := m.quota.data[key]
+		if bucket == nil || bucket.Date != localDate {
+			bucket = &quotaBucket{Date: localDate}
+			m.quota.data[key] = bucket
+		}
+		bucket.TotalTokens += event.TotalTokens
+		bucket.TotalUSD += event.CostUSD
+		if countsForQuota {
+			bucket.QuotaTokens += event.TotalTokens
+			bucket.QuotaUSD += event.CostUSD
+		}
+		m.quota.mu.Unlock()
+	}
+}
+
+// GetQuotaBucket returns a snapshot of the bucket used to enforce quota for
+// the given scope/entity on localDate. If the stored bucket is stale (date
+// rolled over) an empty bucket is returned; the caller never sees yesterday's
+// counters. The stale entry is lazily evicted.
+func (m *StatsManager) GetQuotaBucket(scope UsageScope, chatID, userID int64, localDate string) quotaBucket {
+	if m == nil {
+		return quotaBucket{Date: localDate}
+	}
+	key, ok := quotaCounterKey(scope, chatID, userID)
+	if !ok {
+		return quotaBucket{Date: localDate}
+	}
+	m.quota.mu.RLock()
+	bucket, exists := m.quota.data[key]
+	if exists && bucket.Date == localDate {
+		out := *bucket
+		m.quota.mu.RUnlock()
+		return out
+	}
+	m.quota.mu.RUnlock()
+	if exists {
+		m.quota.mu.Lock()
+		if stale, ok := m.quota.data[key]; ok && stale.Date != localDate {
+			delete(m.quota.data, key)
+		}
+		m.quota.mu.Unlock()
+	}
+	return quotaBucket{Date: localDate}
+}
+
+// ResetQuota clears any in-memory counter for the given scope/entity so the
+// next message falls back to zero. Returns true if an entry was evicted.
+func (m *StatsManager) ResetQuota(scope UsageScope, chatID, userID int64) bool {
+	if m == nil {
+		return false
+	}
+	key, ok := quotaCounterKey(scope, chatID, userID)
+	if !ok {
+		return false
+	}
+	m.quota.mu.Lock()
+	defer m.quota.mu.Unlock()
+	if _, exists := m.quota.data[key]; !exists {
+		return false
+	}
+	delete(m.quota.data, key)
+	return true
+}
+
+// HydrateQuotaFromDB seeds the in-memory counter with today's daily bucket
+// from bbolt so that after a restart the bot remembers which users are
+// already at their cap. CostUSD is read from the persisted aggregate where
+// available; old rows written before this feature shipped will report 0 USD.
+func (m *StatsManager) HydrateQuotaFromDB(loc *time.Location) {
+	if m == nil {
+		return
+	}
+	if loc == nil {
+		loc = time.UTC
+	}
+	db := m.currentDB()
+	if db == nil {
+		return
+	}
+	localDate := time.Now().In(loc).Format("20060102")
+	todayStart := time.Now().UTC().Add(-25 * time.Hour)
+	todayEnd := time.Now().UTC().Add(time.Hour)
+
+	m.quota.mu.Lock()
+	defer m.quota.mu.Unlock()
+	for _, scope := range []UsageScope{UsageScopeUser, UsageScopeChat} {
+		recents, err := db.LoadRecentUsageMeta(scope, 0)
+		if err != nil {
+			log.Printf("[quota] hydrate load recent %s error: %v", scope, err)
+			continue
+		}
+		for _, meta := range recents {
+			rows, err := db.QueryUsageAggregates(UsageQuery{
+				Granularity: UsageGranularityDaily,
+				Scope:       scope,
+				ChatID:      meta.ChatID,
+				UserID:      meta.UserID,
+				From:        todayStart,
+				To:          todayEnd,
+			})
+			if err != nil {
+				log.Printf("[quota] hydrate query %s error: %v", scope, err)
+				continue
+			}
+			var todayAgg UsageAggregate
+			for _, row := range rows {
+				rowDate := row.Time.In(loc).Format("20060102")
+				if rowDate != localDate {
+					continue
+				}
+				todayAgg.Merge(row.Aggregate)
+			}
+			if todayAgg.TotalTokens == 0 && todayAgg.CostUSD == 0 {
+				continue
+			}
+			key, ok := quotaCounterKey(scope, meta.ChatID, meta.UserID)
+			if !ok {
+				continue
+			}
+			// Hydration cannot distinguish quota-counting call types from
+			// aux ones, so we conservatively load the full total into the
+			// quota fields as well. The worst case is a slightly earlier
+			// cap after a restart — acceptable tradeoff over losing state.
+			m.quota.data[key] = &quotaBucket{
+				Date:        localDate,
+				QuotaTokens: todayAgg.TotalTokens,
+				QuotaUSD:    todayAgg.CostUSD,
+				TotalTokens: todayAgg.TotalTokens,
+				TotalUSD:    todayAgg.CostUSD,
+			}
+		}
+	}
+}
+
+// SumDailyRange scans the daily bucket for chat-scoped aggregates whose
+// stamp falls within [from, to] (UTC) and returns the merged total. This is
+// used by the dashboard to show "Today USD" / "Month USD" without double
+// counting user and chat_user scopes.
+func (m *StatsManager) SumDailyRange(from, to time.Time) UsageAggregate {
+	var total UsageAggregate
+	if m == nil {
+		return total
+	}
+	db := m.currentDB()
+	if db == nil {
+		return total
+	}
+	from = from.UTC()
+	to = to.UTC()
+	err := db.ForEachDailyChatAggregate(from, to, func(agg UsageAggregate) {
+		total.Merge(agg)
+	})
+	if err != nil {
+		log.Printf("[stats] SumDailyRange error: %v", err)
+	}
+
+	// Also merge pending chat-scope shards in the same range so dashboard
+	// reflects up-to-the-second cost without waiting for flush.
+	for i := range m.shards {
+		shard := &m.shards[i]
+		shard.mu.Lock()
+		for pendingKey, agg := range shard.pending {
+			granularity, scope, _, _, stamp, ok := parseUsagePendingKey(pendingKey)
+			if !ok || granularity != UsageGranularityDaily || scope != UsageScopeChat {
+				continue
+			}
+			pointTime, err := usageTimeFromStamp(granularity, stamp)
+			if err != nil || pointTime.Before(from) || pointTime.After(to) {
+				continue
+			}
+			total.Merge(agg.clone())
+		}
+		shard.mu.Unlock()
+	}
+	return total
 }

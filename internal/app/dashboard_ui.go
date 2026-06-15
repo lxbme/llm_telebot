@@ -480,6 +480,8 @@ func (m dashboardModel) renderOverviewTab() string {
 		{Label: "Success Rate", Value: successRate, Hint: fmt.Sprintf("%d ok / %d err", m.overview.Metrics.SuccessCount, m.overview.Metrics.ErrorCount), Tone: lipgloss.Color("35")},
 		{Label: "Avg Latency", Value: fmt.Sprintf("%d ms", avgLatencyMs(m.overview.Metrics)), Hint: "mean request latency", Tone: lipgloss.Color("111")},
 		{Label: "Tokens", Value: fmt.Sprintf("%d", m.overview.Metrics.TotalTokens), Hint: fmt.Sprintf("prompt %d / completion %d", m.overview.Metrics.PromptTokens, m.overview.Metrics.CompletionTokens), Tone: lipgloss.Color("141")},
+		{Label: "Today USD", Value: fmt.Sprintf("$%.4f", m.overview.TodayUSD), Hint: fmt.Sprintf("today tokens %d", m.overview.TodayTokens), Tone: lipgloss.Color("178")},
+		{Label: "Month USD", Value: fmt.Sprintf("$%.2f", m.overview.MonthUSD), Hint: "since deploy", Tone: lipgloss.Color("215")},
 		{Label: "Schedules", Value: fmt.Sprintf("%d", m.overview.ScheduleCount), Hint: "registered scheduled tasks", Tone: lipgloss.Color("75")},
 		{Label: "MCP Users", Value: fmt.Sprintf("%d", m.overview.MCPUserCount), Hint: "users with MCP servers", Tone: lipgloss.Color("99")},
 		{Label: "SSH Sessions", Value: fmt.Sprintf("%d", m.overview.SSHSessions), Hint: fmt.Sprintf("dropped events %d", m.overview.DroppedEvents), Tone: lipgloss.Color("136")},
@@ -590,6 +592,7 @@ func (m dashboardModel) renderUserDetailContent() string {
 		{Label: "Requests", Value: fmt.Sprintf("%d", m.userDetail.Usage.Total.RequestCount), Hint: "24h total", Tone: lipgloss.Color("69")},
 		{Label: "Success", Value: fmt.Sprintf("%d", m.userDetail.Usage.Total.SuccessCount), Hint: fmt.Sprintf("%d errors", m.userDetail.Usage.Total.ErrorCount), Tone: lipgloss.Color("35")},
 		{Label: "Tokens", Value: fmt.Sprintf("%d", m.userDetail.Usage.Total.TotalTokens), Hint: "prompt + completion", Tone: lipgloss.Color("141")},
+		{Label: "USD (24h)", Value: fmt.Sprintf("$%.4f", m.userDetail.Usage.Total.CostUSD), Hint: "recent cost", Tone: lipgloss.Color("178")},
 		{Label: "Latency", Value: fmt.Sprintf("%d ms", avgLatencyMs(m.userDetail.Usage.Total)), Hint: "average latency", Tone: lipgloss.Color("111")},
 	}
 

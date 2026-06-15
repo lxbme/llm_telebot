@@ -39,6 +39,10 @@ type DashboardUserSummary struct {
 type DashboardOverview struct {
 	Window         time.Duration
 	Metrics        UsageAggregate
+	TodayUSD       float64
+	MonthUSD       float64
+	TodayTokens    int64
+	MonthTokens    int64
 	RecentChats    []UsageRecentMeta
 	RecentUsers    []DashboardUserSummary
 	TopChats       []DashboardHotChat
@@ -433,6 +437,25 @@ func (s *DashboardService) GetOverview(window time.Duration, topN int) (Dashboar
 	sort.Slice(overview.ModelSummaries, func(i, j int) bool {
 		return overview.ModelSummaries[i].Count > overview.ModelSummaries[j].Count
 	})
+
+	if snap.stats != nil {
+		loc := snap.cfg.quotaResetLocation
+		if loc == nil {
+			loc = time.UTC
+		}
+		localNow := time.Now().In(loc)
+		todayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, loc).UTC()
+		todayEnd := todayStart.Add(24 * time.Hour)
+		monthStart := time.Date(localNow.Year(), localNow.Month(), 1, 0, 0, 0, 0, loc).UTC()
+		todayAgg := snap.stats.SumDailyRange(todayStart, todayEnd)
+		// Month window expands slightly past "now" so the current day's bucket
+		// (stamp = today UTC 00:00) is included regardless of TZ skew.
+		monthAgg := snap.stats.SumDailyRange(monthStart, time.Now().UTC().Add(time.Hour))
+		overview.TodayUSD = todayAgg.CostUSD
+		overview.TodayTokens = todayAgg.TotalTokens
+		overview.MonthUSD = monthAgg.CostUSD
+		overview.MonthTokens = monthAgg.TotalTokens
+	}
 
 	s.setCached(cacheKey, overview, defaultDashboardCacheTTL)
 	return overview, nil

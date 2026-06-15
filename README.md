@@ -21,6 +21,7 @@
 - **聊天级定时任务** — 每个聊天都可以配置独立的定时任务，按 cron 表达式定时触发，并复用正常 chat 流程向 LLM 发送 prompt
 - **自然语言提醒 (/remind)** — 普通用户即可通过 `/remind 自然语言` 创建一次性或重复提醒，LLM 自动解析「明天早上 9 点交报销」「每周一 9 点开会」等输入；提醒与调度器共用 tick，但条目用户私有、`/reminders` 只列出自己的、`/reminder_del` 只能删自己的；唯一入口是显式的 `/remind*` 命令，聊天流与工具调用层无法读写提醒存储
 - **SSH TUI 管理看板** — 可通过 SSH 登录内嵌 Dashboard，基于 [Bubble Tea](https://github.com/charmbracelet/bubbletea) 呈现多 Tab 运行态、用户画像、任务和详细事件流
+- **每日用量配额 / USD 成本追踪** — 在 `/admin` 中配置 `USER_DAILY_TOKEN_LIMIT` / `USER_DAILY_USD_LIMIT` / `CHAT_DAILY_TOKEN_LIMIT` 与 `MODEL_PRICE_TABLE`，bot 以本地时区为界按天统计 main_chat + tool_round 的 token 与 USD 消耗；超额时直接短路入口返回友好提示（管理员一律绕过），Dashboard 新增 "Today USD / Month USD" 列，管理员可用 `/quota_reset` 即时重置今日计数
 - **语音输入 (STT)** — 接收 Telegram 语音消息，通过 OpenAI 兼容 STT API（Whisper、gpt-4o-transcribe 等）转写为文字后，走与文字消息完全相同的对话流程（历史记忆、工具调用、TTS 输出等）；可选是否向用户回显转写结果
 - **图片理解 (Vision)** — 接收 Telegram 图片消息（含可选 caption），按 OpenAI Vision 协议封装为 `image_url` data URL，与文字一并送入主对话流程；支持任何视觉模型（gpt-4o、qwen-vl 等），并复用历史记忆、工具调用、画像等所有能力
 - **文档理解 (Document)** — 接收 Telegram 文件上传，按扩展名路由到 parser 注册表：PDF → `pdftotext` (poppler-utils)，docx/odt/pptx/epub → `pandoc` 转 markdown，xlsx/xlsm → 进程内 `excelize` 转 TSV，纯文本/源代码按 UTF-8 直读；提取后的文本硬截断到上限字符数再注入主对话流程
@@ -704,6 +705,40 @@ Bot 会自动识别 JSON 格式并导入，返回确认消息。可多次发送�
 
 所有配置均已接入 `/admin` 热修改面板，`REMINDER_DEFAULT_TIMEZONE` 设置时会验证 IANA 时区有效性。
 
+### 每日用量配额 / 成本追踪 (Quota)
+
+bot 复用现有 `internal/app/stats.go` 的 usage 管线，在其上层叠加一层内存配额计数器
+（`quotaCounter`），按 `QUOTA_RESET_TZ` 指定的时区按天滚动。计数器在进程启动时
+从 `chat.db` 的 `usage_daily` bucket 读取今日记录回填，避免重启后放空已封顶的
+用户。所有配置项均支持 `/admin` 热修改，无需重启。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `USER_DAILY_TOKEN_LIMIT` | `0` | 每用户每日 token 上限；仅累计 `main_chat` + `tool_round` 两种 call type 的 token。`0` 表示不限制 |
+| `USER_DAILY_USD_LIMIT` | `0` | 每用户每日 USD 上限；同样仅统计 `main_chat` + `tool_round`，`0` 表示不限制 |
+| `CHAT_DAILY_TOKEN_LIMIT` | `0` | 每聊天每日 token 上限；群聊可避免单个 chat 被刷爆，`0` 表示不限制 |
+| `MODEL_PRICE_TABLE` | `""` | 模型价目表，格式 `"gpt-4o:0.0025/0.01,gpt-4o-mini:0.00015/0.0006"`；key 为小写 model 名，值为 input / output 每 1k token 的 USD 单价。未列入表的模型成本按 0 计算（首次遇到时告警一次） |
+| `QUOTA_RESET_TZ` | `Asia/Shanghai` | 每日配额滚动所用的 IANA 时区；无效时回落到 UTC |
+
+行为细节：
+
+- 配额判断只看 `main_chat` + `tool_round`（即用户可见的对话轮次）。`summary` / `profile_extract` / `relevance_check` / `sticker_strategy` / `reminder_parse` 等后台调用**不**计入配额上限，但**仍**写入 Dashboard 的 USD 总额（你支付的就该被看见）
+- 管理员（`ADMIN_ID` 列表中的用户或 `ADMIN_ID=*` 时的全部用户）**始终绕过**配额检查
+- 超额后的处理：handleText / handleVoice / handlePhoto / handleDocument 四个入口在 `isAllowed` 之后、真正发起下载或 LLM 调用之前立即短路，返回中文友好提示（`💳 本日个人 token 配额已用完…`），**不**触发 LLM 请求、**不**扣链路消耗。正在进行中的流式回复不会被中断
+- Dashboard 的 **Today USD / Month USD** 两张卡按 `QUOTA_RESET_TZ` 计算起止时间，`SumDailyRange` 仅扫描 `usage_daily` 下 `scope=chat` 的聚合避免跨 scope 重复计入
+- **历史 USD 不回填**：部署前写入的 `usage_daily` 行没有 `cost_usd` 字段，反序列化时视为 0。"Month USD" 卡片标注 *since deploy* 以避免因价格随时间变化导致的重算失真
+- `/quota_reset` 命令会同时清空内存 counter **并**删除今日的 `usage_daily` 行，确保重启后 hydrate 不会把旧值读回来
+
+管理员 `/quota_reset` 命令语法：
+
+```text
+/quota_reset                 查看用法
+/quota_reset me              重置当前发送者自己的今日 user 计数
+/quota_reset here            重置当前聊天的今日 chat 计数
+/quota_reset user <user_id>  重置指定用户
+/quota_reset chat <chat_id>  重置指定聊天
+```
+
 ## Bot 命令
 
 | 命令 | 说明 |
@@ -728,6 +763,7 @@ Bot 会自动识别 JSON 格式并导入，返回确认消息。可多次发送�
 | `/remind <自然语言>` | 创建一次性或重复提醒（所有允许用户） |
 | `/reminders` | 列出自己的提醒 |
 | `/reminder_del <id>` | 删除自己的提醒（`/reminderd` 为别名） |
+| `/quota_reset [me\|here\|user <id>\|chat <id>]` | 管理员重置今日配额计数；同时清空内存与 `usage_daily` 对应行 |
 
 ## BotFather 命令列表
 
@@ -754,6 +790,7 @@ schedule_del - 删除指定定时任务
 remind - 自然语言创建一次性或重复提醒
 reminders - 列出自己的提醒
 reminder_del - 删除自己的提醒
+quota_reset - 管理员重置今日配额
 admin - 管理员配置面板
 ```
 

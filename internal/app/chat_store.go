@@ -449,6 +449,55 @@ func usageBucketName(granularity UsageGranularity) []byte {
 	return usageMinuteBucket
 }
 
+// DeleteUsageAggregate removes a single entry from the stats buckets.
+// Used by /quota_reset to purge both the in-memory counter and the
+// persisted row so a restart doesn't resurrect the old counters.
+func (c *ChatDB) DeleteUsageAggregate(granularity UsageGranularity, scope UsageScope, chatID, userID int64, stamp string) error {
+	if c == nil {
+		return nil
+	}
+	entity, ok := usageEntity(scope, chatID, userID)
+	if !ok {
+		return fmt.Errorf("invalid usage delete scope=%s chat_id=%d user_id=%d", scope, chatID, userID)
+	}
+	key := fmt.Sprintf("%s|%s|%s", scope, entity, stamp)
+	return c.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(usageBucketName(granularity)).Delete([]byte(key))
+	})
+}
+
+// ForEachDailyChatAggregate iterates every entry in the daily usage bucket
+// whose scope is "chat" and whose stamp falls within [from, to] (UTC),
+// invoking fn with the decoded aggregate. This powers the dashboard's
+// "Today USD" / "Month USD" summaries without double-counting user and
+// chat_user scopes.
+func (c *ChatDB) ForEachDailyChatAggregate(from, to time.Time, fn func(UsageAggregate)) error {
+	if c == nil || fn == nil {
+		return nil
+	}
+	prefix := []byte(string(UsageScopeChat) + "|")
+	return c.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(usageDailyBucket)
+		cursor := bucket.Cursor()
+		for key, value := cursor.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, value = cursor.Next() {
+			_, _, stamp, ok := splitUsageStorageKey(string(key))
+			if !ok {
+				continue
+			}
+			pointTime, err := usageTimeFromStamp(UsageGranularityDaily, stamp)
+			if err != nil || pointTime.Before(from) || pointTime.After(to) {
+				continue
+			}
+			var agg UsageAggregate
+			if err := json.Unmarshal(value, &agg); err != nil {
+				return fmt.Errorf("decode daily chat aggregate %s: %w", string(key), err)
+			}
+			fn(agg)
+		}
+		return nil
+	})
+}
+
 func usageQueryPrefix(scope UsageScope, chatID, userID int64) (string, error) {
 	entity, ok := usageEntity(scope, chatID, userID)
 	if !ok {

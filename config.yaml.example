@@ -140,3 +140,19 @@ REMINDER_DEFAULT_TIMEZONE: Asia/Shanghai
 REMINDER_API_BASE: ""
 REMINDER_API_KEY: ""
 REMINDER_MODEL: ""
+
+# ── Daily Usage Quota & Cost Tracking ────────────────────────────────────────
+# 以自然日为窗口限制每用户 / 每聊天的 token 与 USD 花销。超额时 bot 在入口直接
+# 返回友好提示，不触发 LLM 调用；管理员（ADMIN_ID）一律绕过限制。
+# 配额计数仅包含 main_chat + tool_round 两种 call type（用户可见的对话轮次）；
+# 摘要 / 画像 / 相关性判断等后台辅助调用不计入上限，但仍会累入 USD 总额。
+# 三项 *_LIMIT 留 0 即视为不限。重置窗口按 QUOTA_RESET_TZ 指定的时区滚动。
+# MODEL_PRICE_TABLE 格式: "model:input_per_1k/output_per_1k,model:input/output,…"
+#   • model 大小写不敏感，冒号+斜杠分隔，逗号分隔条目
+#   • 未出现在表中的模型成本按 0 计（只告警一次）
+# 管理员可通过 `/quota_reset me | here | user <id> | chat <id>` 立即重置今日用量。
+USER_DAILY_TOKEN_LIMIT: 0
+USER_DAILY_USD_LIMIT: 0
+CHAT_DAILY_TOKEN_LIMIT: 0
+MODEL_PRICE_TABLE: ""
+QUOTA_RESET_TZ: Asia/Shanghai
