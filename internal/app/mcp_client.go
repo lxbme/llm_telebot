@@ -218,7 +218,17 @@ func (m *MCPClientManager) connectOne(
 		if err != nil {
 			return fmt.Errorf("create SSE client: %w", err)
 		}
-		if err := c.Start(context.Background()); err != nil {
+		// A successful SSE stream stays open after the connection budget ends.
+		// Until startup returns, cancel it if the connection budget expires.
+		streamCtx, cancelStream := context.WithCancel(context.Background())
+		stopStartupCancel := context.AfterFunc(ctx, cancelStream)
+		err := c.Start(streamCtx)
+		if !stopStartupCancel() || err != nil {
+			cancelStream()
+			_ = c.Close()
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			}
 			return fmt.Errorf("start SSE client: %w", err)
 		}
 
