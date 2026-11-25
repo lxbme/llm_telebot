@@ -3,11 +3,11 @@ package app
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,6 +33,9 @@ type Config struct {
 	BotUsername    string // e.g. "@mybot"
 	ContextMode    string // "at" = only @bot messages as context; "global" = all group messages as context
 	AutoDetect     bool   // true = use LLM to judge if an un-mentioned message is relevant and should trigger a reply
+
+	EinoModelRetryEnabled bool
+	EinoFallbackModel     string
 
 	// Separate (optional) model config for the AUTO_DETECT relevance classifier.
 	// When empty, falls back to the main OpenAI settings above.
@@ -300,6 +303,8 @@ func loadConfig() Config {
 		SystemPrompt:                   get("SYSTEM_PROMPT", "You are a helpful assistant."),
 		ContextMaxMsgs:                 maxMsgs,
 		MaxTokens:                      maxTokens,
+		EinoModelRetryEnabled:          strings.EqualFold(strings.TrimSpace(os.Getenv("EINO_MODEL_RETRY_ENABLED")), "true"),
+		EinoFallbackModel:              strings.TrimSpace(os.Getenv("EINO_FALLBACK_MODEL")),
 		BotUsername:                    get("BOT_USERNAME", ""),
 		ContextMode:                    contextMode,
 		AutoDetect:                     autoDetect,
@@ -465,7 +470,8 @@ func sanitizeName(id int64) string {
 // ─── Chat History ─────────────────────────────────────────────────────────────
 
 type HistoryStore struct {
-	mu       sync.RWMutex
+	mu sync.RWMutex
+	// A nil value marks a removal that must survive restarts and DB migrations.
 	history  map[int64][]openai.ChatCompletionMessage
 	overflow map[int64][]openai.ChatCompletionMessage // messages trimmed from the sliding window
 	db       *ChatDB                                  // optional persistent backend
@@ -479,14 +485,18 @@ func NewHistoryStore(db *ChatDB) *HistoryStore {
 	}
 	// Restore persisted data on startup.
 	if db != nil {
+		restored := 0
 		for chatID, msgs := range db.LoadAllHistory() {
 			s.history[chatID] = msgs
+			if len(msgs) > 0 {
+				restored++
+			}
 		}
 		for chatID, msgs := range db.LoadAllOverflow() {
 			s.overflow[chatID] = msgs
 		}
-		if len(s.history) > 0 {
-			log.Printf("[chat-db] restored history for %d chat(s)", len(s.history))
+		if restored > 0 {
+			log.Printf("[chat-db] restored history for %d chat(s)", restored)
 		}
 	}
 	return s
@@ -539,12 +549,9 @@ func (s *HistoryStore) AppendBatch(chatID int64, msgs []openai.ChatCompletionMes
 func (s *HistoryStore) Clear(chatID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.history, chatID)
-	delete(s.overflow, chatID)
-	if s.db != nil {
-		s.db.DeleteHistory(chatID)
-		s.db.DeleteOverflow(chatID)
-	}
+	s.history[chatID] = nil
+	s.overflow[chatID] = nil
+	s.persistChat(chatID)
 }
 
 // OverflowCount returns the number of messages in the overflow buffer.
@@ -559,27 +566,16 @@ func (s *HistoryStore) DrainOverflow(chatID int64) []openai.ChatCompletionMessag
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	overflow := s.overflow[chatID]
-	delete(s.overflow, chatID)
-	if s.db != nil {
-		s.db.DeleteOverflow(chatID)
-	}
+	s.overflow[chatID] = nil
+	s.db.markOverflowDrained(chatID)
 	return overflow
-}
-
-// persistChat saves both history and overflow for a chat to the database.
-// Must be called with s.mu held.
-func (s *HistoryStore) persistChat(chatID int64) {
-	if s.db == nil {
-		return
-	}
-	s.db.SaveHistory(chatID, s.history[chatID])
-	s.db.SaveOverflow(chatID, s.overflow[chatID])
 }
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────
 
 type Bot struct {
 	mu               sync.RWMutex
+	runtimeConfigMu  sync.Mutex
 	cfg              Config
 	ai               *openai.Client // main LLM client
 	detectorAI       *openai.Client // lighter model for relevance detection (may equal ai)
@@ -598,6 +594,8 @@ type Bot struct {
 	tools            *ToolRegistry     // global registered MCP tools (nil if disabled)
 	mcpClients       *MCPClientManager // global remote MCP server connections (nil if none)
 	userTools        *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
+	replyTools       *replyToolGeneration
+	userMCPStores    *userMCPStorePool
 	tasks            *TaskStore
 	reminders        *ReminderStore
 	reminderAI       *openai.Client // LLM client for reminder NL parsing (may equal ai)
@@ -615,6 +613,7 @@ type Bot struct {
 	dashboardService *DashboardService
 	dashboardSSH     *DashboardSSHServer
 	tg               *tele.Bot
+	telegramHTTP     *http.Client
 }
 
 func NewBot(cfg Config) (*Bot, error) {
@@ -632,9 +631,11 @@ func NewBot(cfg Config) (*Bot, error) {
 	}
 
 	// Build Telegram bot.
+	telegramHTTP := &http.Client{Timeout: time.Minute}
 	pref := tele.Settings{
 		Token:  cfg.TelegramToken,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+		Client: telegramHTTP,
 	}
 	tgBot, err := tele.NewBot(pref)
 	if err != nil {
@@ -688,8 +689,9 @@ func NewBot(cfg Config) (*Bot, error) {
 	var userToolMgr *UserToolManager
 	var toolSummaryStore *MCPSummaryStore
 	var toolSummaryGen *MCPSummaryGenerator
+	userMCPStores := &userMCPStorePool{}
 	if cfg.ToolsEnabled {
-		umcpStore, err := NewUserMCPStore(cfg.UserMCPDBPath)
+		umcpStore, err := userMCPStores.open(cfg.UserMCPDBPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to init user MCP store: %w", err)
 		}
@@ -761,6 +763,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		tools:            toolRegistry,
 		mcpClients:       mcpManager,
 		userTools:        userToolMgr,
+		userMCPStores:    userMCPStores,
 		tasks:            NewTaskStore(chatDB),
 		reminders:        NewReminderStore(chatDB),
 		reminderAI:       reminderClient,
@@ -775,6 +778,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		stickers:         stickerEngine,
 		dashboardEvents:  dashboardEvents,
 		tg:               tgBot,
+		telegramHTTP:     telegramHTTP,
 	}
 	bot.scheduler = NewTaskRunner(bot, bot.tasks)
 	bot.dashboardService = NewDashboardService(bot, dashboardEvents)
@@ -882,7 +886,10 @@ func (b *Bot) Run() {
 }
 
 func (b *Bot) recordUsageEvent(event UsageEvent) {
-	snap := b.snapshot()
+	b.recordUsageEventFor(b.snapshot(), event)
+}
+
+func (b *Bot) recordUsageEventFor(snap runtimeSnapshot, event UsageEvent) {
 	event.CostUSD = computeCostUSD(event, snap.cfg.ModelPriceTable)
 	if snap.stats != nil {
 		countsForQuota := event.CallType == UsageCallMainChat || event.CallType == UsageCallToolRound
@@ -1140,6 +1147,19 @@ func (b *Bot) handleDisplayProfile(c tele.Context) error {
 
 // ─── MCP Management Commands ─────────────────────────────────────────────────
 
+// withPersonalMCP keeps the manager selection and use in the same critical
+// section as runtime config reload, which restores before publishing.
+func (b *Bot) withPersonalMCP(use func(*UserToolManager)) bool {
+	b.runtimeConfigMu.Lock()
+	defer b.runtimeConfigMu.Unlock()
+	manager := b.snapshot().userTools
+	if manager == nil {
+		return false
+	}
+	use(manager)
+	return true
+}
+
 func (b *Bot) handleMCPList(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
@@ -1161,16 +1181,20 @@ func (b *Bot) handleMCPDel(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
 	}
-	snap := b.snapshot()
-	if snap.userTools == nil {
+	name := strings.TrimSpace(c.Message().Payload)
+	userID := c.Sender().ID
+	var found bool
+	var err error
+	if !b.withPersonalMCP(func(manager *UserToolManager) {
+		if name != "" {
+			found, err = manager.RemoveServer(userID, name)
+		}
+	}) {
 		return c.Reply("⚠️ Tool calling is disabled.")
 	}
-	name := strings.TrimSpace(c.Message().Payload)
 	if name == "" {
 		return c.Reply("Usage: /mcp_del <server_name>\n\nUse /mcp_list to see your servers.")
 	}
-	userID := c.Sender().ID
-	found, err := snap.userTools.RemoveServer(userID, name)
 	if err != nil {
 		log.Printf("[user-mcp] remove error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to remove MCP server.")
@@ -1192,12 +1216,14 @@ func (b *Bot) handleMCPClear(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
 	}
-	snap := b.snapshot()
-	if snap.userTools == nil {
+	userID := c.Sender().ID
+	var err error
+	if !b.withPersonalMCP(func(manager *UserToolManager) {
+		err = manager.ClearAll(userID)
+	}) {
 		return c.Reply("⚠️ Tool calling is disabled.")
 	}
-	userID := c.Sender().ID
-	if err := snap.userTools.ClearAll(userID); err != nil {
+	if err != nil {
 		log.Printf("[user-mcp] clear error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to clear MCP servers.")
 	}
@@ -1242,18 +1268,25 @@ func (b *Bot) handleText(c tele.Context) error {
 	// import command rather than a normal chat message.
 	if strings.HasPrefix(text, "{") {
 		if mcpCfg, ok := TryParseMCPConfig(text); ok {
-			snap := b.snapshot()
-			if snap.userTools == nil {
+			userID := c.Sender().ID
+			var result *MCPAddResult
+			var err error
+			var rejected []string
+			if !b.withPersonalMCP(func(manager *UserToolManager) {
+				// Non-admin users may only add network-based (HTTP/SSE) MCP servers.
+				if !b.isAdmin(userID) {
+					rejected = filterCommandMCPs(mcpCfg)
+					if len(rejected) > 0 {
+						return
+					}
+				}
+				result, err = manager.AddServers(userID, mcpCfg.MCPServers)
+			}) {
 				return c.Reply("⚠️ Tool calling is disabled. Cannot import MCP servers.")
 			}
-			userID := c.Sender().ID
-			// Non-admin users may only add network-based (HTTP/SSE) MCP servers.
-			if !b.isAdmin(userID) {
-				if rejected := filterCommandMCPs(mcpCfg); len(rejected) > 0 {
-					return c.Reply(fmt.Sprintf("🚫 Only admins can add command-based (stdio) MCP servers.\nRejected: %s", strings.Join(rejected, ", ")))
-				}
+			if len(rejected) > 0 {
+				return c.Reply(fmt.Sprintf("🚫 Only admins can add command-based (stdio) MCP servers.\nRejected: %s", strings.Join(rejected, ", ")))
 			}
-			result, err := snap.userTools.AddServers(userID, mcpCfg.MCPServers)
 			if err != nil {
 				log.Printf("[user-mcp] add error for user %d: %v", userID, err)
 				return c.Reply(fmt.Sprintf("❌ Failed to add MCP servers: %v", err))
@@ -1601,19 +1634,18 @@ func (b *Bot) startChatFlowWithInstruction(chat *tele.Chat, sender *tele.User, u
 	}
 
 	chatID := chat.ID
-	snap := b.snapshot()
+	snap, toolGeneration := b.snapshotForReply()
 	var history []openai.ChatCompletionMessage
-	systemPrompt := snap.cfg.SystemPrompt + telegramReplyFormatInstruction + b.speechInstruction(chatID)
+	systemPrompt := snap.cfg.SystemPrompt + telegramReplyFormatInstruction + snap.speechInstruction(chatID)
 	if includeContext {
 		history = snap.store.Get(chatID)
-		systemPrompt += b.buildProfileSection(append(history, userMsg))
+		systemPrompt += snap.buildProfileSection(append(history, userMsg))
 		if snap.cfg.SummaryEnabled {
 			if summary := snap.summaries.Get(chatID); summary != "" {
 				systemPrompt += "\n\n=== Previous Conversation Summary ===\n" + summary
 			}
 		}
 	}
-
 	if instruction != "" {
 		systemPrompt += "\n\n" + instruction
 	}
@@ -1624,8 +1656,9 @@ func (b *Bot) startChatFlowWithInstruction(chat *tele.Chat, sender *tele.User, u
 	messages = append(messages, history...)
 	messages = append(messages, userMsg)
 
-	placeholder, err := snap.tg.Send(chat, "⏳ Thinking…")
+	placeholder, err := snap.tg.Send(chat, replyPlaceholderText)
 	if err != nil {
+		b.releaseReplyTools(toolGeneration)
 		return fmt.Errorf("failed to send placeholder: %w", err)
 	}
 
@@ -1641,13 +1674,23 @@ func (b *Bot) startChatFlowWithInstruction(chat *tele.Chat, sender *tele.User, u
 		RequestID: usageCtx.RequestID,
 		Summary:   truncateDashboardText(userMessageText(userMsg), 180),
 	})
-	go b.streamReply(chatID, userMsg, messages, placeholder, sender, usageCtx)
+	go func() {
+		defer b.releaseReplyTools(toolGeneration)
+		b.streamReply(snap, chatID, userMsg, messages, placeholder, sender, usageCtx)
+	}()
 	return nil
 }
 
 // ─── Streaming ────────────────────────────────────────────────────────────────
 
+const replyPlaceholderText = "⏳ Thinking…"
+
+const toolRoundLimitPrompt = "(You have reached the maximum number of tool calls. " +
+	"Based on the information gathered so far, please provide the best answer you can. " +
+	"If some information is uncertain or incomplete, clearly say so.)"
+
 func (b *Bot) streamReply(
+	snap runtimeSnapshot,
 	chatID int64,
 	userMsg openai.ChatCompletionMessage,
 	messages []openai.ChatCompletionMessage,
@@ -1655,7 +1698,6 @@ func (b *Bot) streamReply(
 	sender *tele.User,
 	usageCtx UsageContext,
 ) {
-	snap := b.snapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
@@ -1684,311 +1726,122 @@ func (b *Bot) streamReply(
 			messages[0].Content += section
 		}
 	}
-	// expandedServers tracks which MCP server groups the LLM has requested
-	// full schemas for (used in summary mode only).
-	expandedServers := map[string]bool{}
-
-	// ── Tool-call loop ──────────────────────────────────────────────────
-	// If tools are enabled, we do non-streaming requests in a loop so the
-	// LLM can call tools repeatedly. Once all tool calls are resolved, the
-	// conversation (including tool results) is sent to the streaming path
-	// so the LLM can summarise/present the results fluently.
-	if toolView != nil && toolView.Count() > 0 {
-		maxIter := snap.cfg.ToolsMaxIterations
-		hitMaxIter := false
-		for i := 0; i < maxIter; i++ {
-			req := openai.ChatCompletionRequest{
-				Model:    snap.cfg.OpenAIModel,
-				Messages: messages,
-				Tools:    buildActiveTools(toolView, expandedServers, summaryMode),
-			}
-			applyMaxTokens(&req, snap.cfg.MaxTokens)
-			sanitizeBetaRequest(&req)
-
-			started := time.Now()
-			resp, err := snap.ai.CreateChatCompletion(ctx, req)
-			b.recordUsageEvent(usageEvent(usageCtx, UsageCallToolRound, firstNonEmpty(resp.Model, snap.cfg.OpenAIModel), false, i+1, started, &resp.Usage, err == nil))
-			if err != nil {
-				b.editOrLog(placeholder, fmt.Sprintf("\u274c Error: %v", err))
-				return
-			}
-			if len(resp.Choices) == 0 {
-				// No choices returned — fall through to streaming with accumulated context.
-				break
-			}
-
-			choice := resp.Choices[0]
-
-			// If the model chose to call tool(s):
-			if len(choice.Message.ToolCalls) > 0 {
-				// Append the assistant's tool-call message to the conversation.
-				messages = append(messages, choice.Message)
-
-				// Show the user which tools are being called (skip internal virtual tool).
-				var toolNames []string
-				for _, tc := range choice.Message.ToolCalls {
-					if tc.Function.Name != "get_tool_details" {
-						toolNames = append(toolNames, tc.Function.Name)
-					}
-				}
-				if len(toolNames) > 0 {
-					b.editOrLog(placeholder, fmt.Sprintf("\U0001f527 Calling tools: %s…", strings.Join(toolNames, ", ")))
-				}
-
-				// Execute each tool call and append the results.
-				for _, tc := range choice.Message.ToolCalls {
-					// Handle the virtual get_tool_details call in summary mode.
-					if summaryMode && tc.Function.Name == "get_tool_details" {
-						var args struct {
-							Groups []string `json:"groups"`
-						}
-						_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
-						for _, g := range args.Groups {
-							resolved := g
-							for _, actual := range toolView.ServerNames() {
-								if strings.EqualFold(actual, g) {
-									resolved = actual
-									break
-								}
-							}
-							expandedServers[resolved] = true
-						}
-						log.Printf("[mcp_summary] schemas expanded for: %s", strings.Join(args.Groups, ", "))
-						messages = append(messages, openai.ChatCompletionMessage{
-							Role:       openai.ChatMessageRoleTool,
-							Content:    "Tool schemas loaded for: " + strings.Join(args.Groups, ", ") + ". You can now call those tools.",
-							ToolCallID: tc.ID,
-						})
-						continue
-					}
-
-					log.Printf("[tools] executing %s", tc.Function.Name)
-					b.recordDashboardEvent(DashboardEvent{
-						Type:      DashboardEventToolCallStarted,
-						ChatID:    chatID,
-						UserID:    usageCtx.UserID,
-						RequestID: usageCtx.RequestID,
-						ToolName:  tc.Function.Name,
-						Summary:   "executing tool " + tc.Function.Name,
-					})
-					result := toolView.ExecuteToolCall(tc)
-					log.Printf("[tools] %s done (%d bytes)", tc.Function.Name, len(result))
-					b.recordDashboardEvent(DashboardEvent{
-						Type:      DashboardEventToolCallFinished,
-						ChatID:    chatID,
-						UserID:    usageCtx.UserID,
-						RequestID: usageCtx.RequestID,
-						ToolName:  tc.Function.Name,
-						Summary:   fmt.Sprintf("tool %s completed", tc.Function.Name),
-						Detail:    truncateDashboardText(result, 200),
-						Success:   true,
-					})
-					messages = append(messages, openai.ChatCompletionMessage{
-						Role:       openai.ChatMessageRoleTool,
-						Content:    result,
-						ToolCallID: tc.ID,
-					})
-				}
-				if i == maxIter-1 {
-					// Last iteration and model still wants more tool calls — mark exhausted.
-					hitMaxIter = true
-				}
-				continue // loop back to let the LLM process tool results
-			}
-
-			// No more tool calls — break out to the streaming path below
-			// so the LLM's final answer is streamed to the user.
-			break
-		}
-
-		// If the tool-call budget was exhausted, explicitly ask the model to
-		// answer with whatever information it has gathered so far.
-		if hitMaxIter {
-			messages = append(messages, openai.ChatCompletionMessage{
-				Role: openai.ChatMessageRoleUser,
-				Content: "(You have reached the maximum number of tool calls. " +
-					"Based on the information gathered so far, please provide the best answer you can. " +
-					"If some information is uncertain or incomplete, clearly say so.)",
-			})
-		}
+	finalText := b.streamEinoReply(ctx, snap, messages, placeholder, toolView, summaryMode, usageCtx)
+	if finalText != "" {
+		b.postReply(snap, chatID, userMsg, finalText, sender, placeholder.Chat, placeholder)
 	}
-
-	// ── Streaming path ──────────────────────────────────────────────────
-	// Streams the LLM's final response to the user. When tools were used,
-	// the messages slice now contains the full tool-call conversation, so
-	// the LLM will summarise the tool results into a natural reply.
-	finalText := b.doStream(ctx, messages, placeholder, toolView, expandedServers, summaryMode, usageCtx)
-	if finalText == "" {
-		return // error already reported by doStream
-	}
-	b.postReply(chatID, userMsg, finalText, sender, placeholder.Chat, placeholder)
 }
 
-// doStream performs the streaming LLM call and returns the final text.
-// Returns empty string if an error was already reported to the user.
-// toolView may be nil if tools are disabled.
-// expandedServers and summaryMode are forwarded from the tool-call loop so
-// the streaming request uses the same active tool set.
-func (b *Bot) doStream(
-	ctx context.Context,
-	messages []openai.ChatCompletionMessage,
-	placeholder *tele.Message,
-	toolView *MergedToolView,
-	expandedServers map[string]bool,
-	summaryMode bool,
-	usageCtx UsageContext,
-) string {
-	snap := b.snapshot()
-	showText := true
-	if placeholder != nil && placeholder.Chat != nil {
-		showText = b.shouldSendSpeechText(placeholder.Chat.ID)
+const replyPreviewResetTimeout = 500 * time.Millisecond
+
+// startReplyPreview serializes Telegram edits. Clearing a draft cancels its
+// outstanding edit, and recovery can wait briefly for the reset. Stop joins
+// the worker before the final edit.
+func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *tele.Message, showText bool) (update func(string), waitForReset func(context.Context), stop func()) {
+	if !showText {
+		return func(string) {}, func(context.Context) {}, func() {}
 	}
 
-	req := openai.ChatCompletionRequest{
-		Model:    snap.cfg.OpenAIModel,
-		Messages: messages,
-		Stream:   true,
-		StreamOptions: &openai.StreamOptions{
-			IncludeUsage: true,
-		},
-	}
-	applyMaxTokens(&req, snap.cfg.MaxTokens)
-	sanitizeBetaRequest(&req)
-
-	// If tools are available, include them so the model knows about them
-	// even in streaming mode. In summary mode use the same active tool set
-	// that the tool-call loop settled on (virtual tool + expanded schemas).
-	if toolView != nil && toolView.Count() > 0 {
-		req.Tools = buildActiveTools(toolView, expandedServers, summaryMode)
-	}
-
-	started := time.Now()
-	stream, err := snap.ai.CreateChatCompletionStream(ctx, req)
-	if err != nil {
-		b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, nil, false))
-		b.recordDashboardEvent(DashboardEvent{
-			Type:      DashboardEventConversationError,
-			ChatID:    usageCtx.ChatID,
-			UserID:    usageCtx.UserID,
-			Model:     snap.cfg.OpenAIModel,
-			RequestID: usageCtx.RequestID,
-			Summary:   "failed to start stream",
-			Detail:    err.Error(),
-		})
-		b.editOrLog(placeholder, fmt.Sprintf("❌ Error starting stream: %v", err))
-		return ""
-	}
-	defer stream.Close()
-
-	var (
-		fullResponse strings.Builder
-		mu           sync.Mutex // guards fullResponse
-
-		ticker   = time.NewTicker(1500 * time.Millisecond)
-		lastSent string
-	)
-	defer ticker.Stop()
-
-	// Cancel context for ticker goroutine.
-	streamCtx, streamCancel := context.WithCancel(ctx)
-
-	// Goroutine: periodically push intermediate updates to Telegram.
+	ctx, cancel := context.WithCancel(ctx)
+	var mu sync.Mutex
+	var current string
+	var cancelDraft context.CancelFunc
+	var resetDone chan struct{}
+	clear := make(chan struct{}, 1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		ticker := time.NewTicker(1500 * time.Millisecond)
+		defer ticker.Stop()
+		var lastSent string
 		for {
+			tick := false
 			select {
-			case <-ticker.C:
-				mu.Lock()
-				current := fullResponse.String()
-				mu.Unlock()
-				if showText && current != lastSent && current != "" {
-					b.editOrLog(placeholder, current+"▌")
-					lastSent = current
-				}
-			case <-streamCtx.Done():
+			case <-ctx.Done():
 				return
+			case <-ticker.C:
+				tick = true
+			case <-clear:
 			}
-		}
-	}()
-
-	// Main loop: consume stream tokens.
-	var streamUsage *openai.Usage
-	streamErr := func() error {
-		for {
-			resp, err := stream.Recv()
-			if err == io.EOF {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if resp.Usage != nil {
-				usage := *resp.Usage
-				streamUsage = &usage
-			}
-			if len(resp.Choices) == 0 {
+			mu.Lock()
+			if resetDone != nil {
+				mu.Unlock()
+				if lastSent != "" {
+					resetCtx, cancelReset := context.WithTimeout(ctx, replyPreviewResetTimeout)
+					snap.editReplyPreview(resetCtx, placeholder, replyPlaceholderText)
+					cancelReset()
+					lastSent = ""
+				}
+				mu.Lock()
+				close(resetDone)
+				resetDone = nil
+				mu.Unlock()
 				continue
 			}
-			delta := resp.Choices[0].Delta.Content
-			mu.Lock()
-			fullResponse.WriteString(delta)
+			text := current
+			if !tick || text == "" || text == lastSent {
+				mu.Unlock()
+				continue
+			}
+			editCtx, cancelEdit := context.WithCancel(ctx)
+			cancelDraft = cancelEdit
 			mu.Unlock()
+			snap.editReplyPreview(editCtx, placeholder, text+"▌")
+			cancelEdit()
+			mu.Lock()
+			cancelDraft = nil
+			mu.Unlock()
+			lastSent = text
 		}
 	}()
-
-	// Stop the ticker goroutine.
-	streamCancel()
-	<-done
-
-	finalText := fullResponse.String()
-
-	if streamErr != nil {
-		b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, false))
-		b.recordDashboardEvent(DashboardEvent{
-			Type:      DashboardEventConversationError,
-			ChatID:    usageCtx.ChatID,
-			UserID:    usageCtx.UserID,
-			Model:     snap.cfg.OpenAIModel,
-			RequestID: usageCtx.RequestID,
-			Summary:   "stream failed",
-			Detail:    streamErr.Error(),
-		})
-		errMsg := fmt.Sprintf("❌ Stream error: %v", streamErr)
-		if finalText != "" {
-			errMsg = finalText + "\n\n" + errMsg
+	update = func(text string) {
+		mu.Lock()
+		defer mu.Unlock()
+		current = text
+		if text == "" && resetDone == nil {
+			resetDone = make(chan struct{})
+			if cancelDraft != nil {
+				cancelDraft()
+			}
+			select {
+			case clear <- struct{}{}:
+			default:
+			}
 		}
-		b.editOrLog(placeholder, errMsg)
-		return ""
 	}
-
-	if finalText == "" {
-		finalText = buildFallbackFromMessages(messages)
+	waitForReset = func(streamCtx context.Context) {
+		mu.Lock()
+		pending := resetDone
+		mu.Unlock()
+		if pending == nil {
+			return
+		}
+		waitCtx, cancelWait := context.WithTimeout(streamCtx, replyPreviewResetTimeout)
+		defer cancelWait()
+		select {
+		case <-pending:
+		case <-waitCtx.Done():
+		case <-ctx.Done():
+		}
 	}
-	b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, true))
-	b.recordDashboardEvent(DashboardEvent{
-		Type:      DashboardEventConversationFinished,
-		ChatID:    usageCtx.ChatID,
-		UserID:    usageCtx.UserID,
-		Model:     snap.cfg.OpenAIModel,
-		RequestID: usageCtx.RequestID,
-		LatencyMs: time.Since(started).Milliseconds(),
-		Success:   true,
-		Summary:   truncateDashboardText(finalText, 200),
-	})
+	return update, waitForReset, func() {
+		cancel()
+		<-done
+	}
+}
 
+func (snap runtimeSnapshot) editReplyResult(placeholder *tele.Message, finalText string, showText bool) {
 	if showText {
-		// One final edit with the complete text, rendered as Telegram HTML.
-		b.editFinalResponse(placeholder, finalText)
+		snap.editFinalResponse(placeholder, finalText)
 	} else {
-		b.editOrLog(placeholder, "🔊 正在发送语音…")
+		snap.editOrLog(placeholder, "🔊 正在发送语音…")
 	}
-	return finalText
 }
 
 // postReply handles post-response bookkeeping: history persistence, summary
 // triggering, and profile extraction.
 func (b *Bot) postReply(
+	snap runtimeSnapshot,
 	chatID int64,
 	userMsg openai.ChatCompletionMessage,
 	finalText string,
@@ -1996,7 +1849,6 @@ func (b *Bot) postReply(
 	chat *tele.Chat,
 	placeholder *tele.Message,
 ) {
-	snap := b.snapshot()
 	// Atomically persist the user message and assistant reply as a pair
 	// so concurrent requests never interleave between them.
 	snap.store.AppendBatch(chatID, []openai.ChatCompletionMessage{
@@ -2018,7 +1870,7 @@ func (b *Bot) postReply(
 		}
 	}
 
-	b.finalizeSpeechReply(chatID, chat, sender, finalText, placeholder)
+	snap.finalizeSpeechReply(chatID, chat, sender, finalText, placeholder)
 	b.finalizeStickerReply(chatID, chat, userMsg, finalText, placeholder)
 }
 
@@ -2031,18 +1883,20 @@ func truncate(s string, maxRunes int) string {
 	return string(r[:maxRunes]) + "\u2026"
 }
 
-// editOrLog edits a Telegram message, falling back to a log on error.
-func (b *Bot) editOrLog(msg *tele.Message, text string) {
+func truncateTelegramMessage(text string) string {
 	// Telegram has a 4096-character limit per message.
-	if len([]rune(text)) > 4096 {
-		runes := []rune(text)
-		text = string(runes[:4093]) + "…"
+	if runes := []rune(text); len(runes) > 4096 {
+		return string(runes[:4093]) + "…"
 	}
-	tg := b.snapshot().tg
-	if _, err := tg.Edit(msg, text); err != nil {
+	return text
+}
+
+// editOrLog edits a Telegram message, falling back to a log on error.
+func (snap runtimeSnapshot) editOrLog(msg *tele.Message, text string) {
+	if _, err := snap.tg.Edit(msg, truncateTelegramMessage(text)); err != nil {
 		// Ignore "message not modified" – it's benign.
 		if !strings.Contains(err.Error(), "message is not modified") {
-			log.Printf("editOrLog error: %v", err)
+			log.Printf("editOrLog error: %s", snap.telegramEditError(err))
 		}
 	}
 }
@@ -2068,12 +1922,10 @@ func Run() {
 	if bot.profiles != nil {
 		defer bot.profiles.Close()
 	}
-	if bot.mcpClients != nil {
-		defer bot.mcpClients.Close()
-	}
-	if bot.userTools != nil {
-		defer bot.userTools.Close()
-	}
+	defer func() {
+		snap := bot.snapshot()
+		closeToolResources(snap.mcpClients, snap.userTools)
+	}()
 
 	bot.Run()
 }

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -217,7 +218,17 @@ func (m *MCPClientManager) connectOne(
 		if err != nil {
 			return fmt.Errorf("create SSE client: %w", err)
 		}
-		if err := c.Start(context.Background()); err != nil {
+		// A successful SSE stream stays open after the connection budget ends.
+		// Until startup returns, cancel it if the connection budget expires.
+		streamCtx, cancelStream := context.WithCancel(context.Background())
+		stopStartupCancel := context.AfterFunc(ctx, cancelStream)
+		err := c.Start(streamCtx)
+		if !stopStartupCancel() || err != nil {
+			cancelStream()
+			_ = c.Close()
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			}
 			return fmt.Errorf("start SSE client: %w", err)
 		}
 
@@ -360,15 +371,36 @@ func sanitizeSchema(v any) {
 
 // Execute calls the remote MCP tool and returns the text result.
 func (t *MCPRemoteTool) Execute(args string) (string, error) {
+	result, err := t.call(context.Background(), args)
+	if err != nil {
+		return "", err
+	}
+	return extractTextFromContent(result), nil
+}
+
+// ExecuteContext reports MCP tool errors and uses the caller's context.
+func (t *MCPRemoteTool) ExecuteContext(ctx context.Context, args string) (string, error) {
+	result, err := t.call(ctx, args)
+	if err != nil {
+		return "", err
+	}
+	text := extractTextFromContent(result)
+	if result != nil && result.IsError {
+		return "", errors.New(text)
+	}
+	return text, nil
+}
+
+func (t *MCPRemoteTool) call(ctx context.Context, args string) (*mcp.CallToolResult, error) {
 	// Parse the JSON arguments from the LLM into a map.
 	var arguments map[string]any
 	if args != "" && args != "{}" {
 		if err := json.Unmarshal([]byte(args), &arguments); err != nil {
-			return "", fmt.Errorf("invalid arguments JSON: %w", err)
+			return nil, fmt.Errorf("invalid arguments JSON: %w", err)
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	req := mcp.CallToolRequest{}
@@ -377,11 +409,9 @@ func (t *MCPRemoteTool) Execute(args string) (string, error) {
 
 	result, err := t.client.CallTool(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("MCP tool %q call failed: %w", t.tool.Name, err)
+		return nil, fmt.Errorf("MCP tool %q call failed: %w", t.tool.Name, err)
 	}
-
-	// Extract text from the result content.
-	return extractTextFromContent(result), nil
+	return result, nil
 }
 
 // extractTextFromContent concatenates all text content pieces from a CallToolResult.

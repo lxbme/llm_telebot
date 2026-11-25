@@ -82,6 +82,8 @@ type UsageEvent struct {
 	MessageID        int           `json:"message_id,omitempty"`
 	ToolIterations   int           `json:"tool_iterations,omitempty"`
 	Streamed         bool          `json:"streamed,omitempty"`
+
+	requestedModel string // Pricing fallback for this attempt when Model has no price.
 }
 
 func (e *UsageEvent) normalize() {

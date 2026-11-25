@@ -66,29 +66,6 @@ func (r *ToolRegistry) Get(name string) MCPTool {
 	return r.tools[name]
 }
 
-// OpenAITools converts all registered tools into the []openai.Tool format
-// expected by the ChatCompletionRequest.
-func (r *ToolRegistry) OpenAITools() []openai.Tool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if len(r.order) == 0 {
-		return nil
-	}
-	tools := make([]openai.Tool, 0, len(r.order))
-	for _, name := range r.order {
-		t := r.tools[name]
-		tools = append(tools, openai.Tool{
-			Type: openai.ToolTypeFunction,
-			Function: &openai.FunctionDefinition{
-				Name:        t.Name(),
-				Description: t.Description(),
-				Parameters:  t.Parameters(),
-			},
-		})
-	}
-	return tools
-}
-
 // Count returns the number of registered tools.
 func (r *ToolRegistry) Count() int {
 	r.mu.RLock()
@@ -145,23 +122,6 @@ func (r *ToolRegistry) CountForServer(serverName string) int {
 		}
 	}
 	return n
-}
-
-// ─── Tool Execution ──────────────────────────────────────────────────────────
-
-// ExecuteToolCall looks up and executes a single tool call, returning the
-// result string. On any error the result contains the error message so the
-// LLM can self-correct.
-func (r *ToolRegistry) ExecuteToolCall(call openai.ToolCall) string {
-	tool := r.Get(call.Function.Name)
-	if tool == nil {
-		return fmt.Sprintf("error: unknown tool %q", call.Function.Name)
-	}
-	result, err := tool.Execute(call.Function.Arguments)
-	if err != nil {
-		return fmt.Sprintf("error: %v", err)
-	}
-	return result
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

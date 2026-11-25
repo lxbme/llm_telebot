@@ -2,9 +2,13 @@ package app
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"log"
+	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/yuin/goldmark"
@@ -378,13 +382,57 @@ func isLooseListItem(node ast.Node) bool {
 
 // ─── Bot Integration ──────────────────────────────────────────────────────────
 
+// Telebot's Raw method owns its context. Send previews directly so the reply
+// can cancel a pending edit and wait for it before issuing the terminal edit.
+func (snap runtimeSnapshot) editReplyPreview(ctx context.Context, msg *tele.Message, text string) {
+	if ctx.Err() != nil {
+		return
+	}
+	messageID, chatID := msg.MessageSig()
+	payload, err := json.Marshal(map[string]string{
+		"chat_id": strconv.FormatInt(chatID, 10), "message_id": messageID, "text": truncateTelegramMessage(text),
+	})
+	if err != nil {
+		log.Print("Telegram preview edit could not encode its request")
+		return
+	}
+	url := snap.tg.URL + "/bot" + snap.tg.Token + "/editMessageText"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		log.Print("Telegram preview edit could not create its request")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := snap.telegramHTTP
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Print("Telegram preview edit request failed")
+		}
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	if ctx.Err() == nil && (err != nil || !result.OK && !strings.Contains(result.Description, "message is not modified")) {
+		log.Printf("Telegram preview edit failed (HTTP %d)", resp.StatusCode)
+	}
+}
+
 // editFinalResponse edits the placeholder with the LLM's final Markdown
 // response, converting it to Telegram HTML.  If the HTML exceeds Telegram's
 // 4096-char limit or the API rejects it, it falls back to plain text.
-func (b *Bot) editFinalResponse(msg *tele.Message, markdownText string) {
+func (snap runtimeSnapshot) editFinalResponse(msg *tele.Message, markdownText string) {
 	htmlText := mdToTgHTML(markdownText)
 	if len([]rune(htmlText)) <= 4096 {
-		_, err := b.tg.Edit(msg, htmlText, tele.ModeHTML)
+		_, err := snap.tg.Edit(msg, htmlText, tele.ModeHTML)
 		if err == nil {
 			return
 		}
@@ -392,7 +440,15 @@ func (b *Bot) editFinalResponse(msg *tele.Message, markdownText string) {
 			return
 		}
 		// HTML edit failed (e.g., malformed tags); fall back to plain text.
-		log.Printf("HTML edit failed, falling back to plain text: %v", err)
+		log.Printf("HTML edit failed, falling back to plain text: %s", snap.telegramEditError(err))
 	}
-	b.editOrLog(msg, markdownText)
+	snap.editOrLog(msg, markdownText)
+}
+
+func (snap runtimeSnapshot) telegramEditError(err error) string {
+	message := err.Error()
+	if token := snap.tg.Token; token != "" {
+		message = strings.ReplaceAll(message, token, "[redacted]")
+	}
+	return message
 }
