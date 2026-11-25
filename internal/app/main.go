@@ -1603,7 +1603,7 @@ func (b *Bot) startChatFlowWithInstruction(chat *tele.Chat, sender *tele.User, u
 	chatID := chat.ID
 	snap := b.snapshot()
 	var history []openai.ChatCompletionMessage
-	systemPrompt := snap.cfg.SystemPrompt + b.speechInstruction(chatID)
+	systemPrompt := snap.cfg.SystemPrompt + telegramReplyFormatInstruction + b.speechInstruction(chatID)
 	if includeContext {
 		history = snap.store.Get(chatID)
 		systemPrompt += b.buildProfileSection(append(history, userMsg))

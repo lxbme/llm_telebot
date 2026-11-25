@@ -18,6 +18,10 @@ import (
 
 // ─── Markdown → Telegram HTML ─────────────────────────────────────────────────
 
+const telegramReplyFormatInstruction = "\n\nFormat text replies for Telegram using plain paragraphs, **bold**, *italic*, ~~strikethrough~~, " +
+	"bullet or numbered lists, > block quotes, `inline code`, fenced code blocks, and [links](https://example.com) as needed. " +
+	"Do not use Markdown tables or raw HTML. Present tabular fields as a bullet list, one `- **Label**: value` per line."
+
 // mdToTgHTML converts Markdown text (as produced by LLMs) into
 // Telegram-compatible HTML.  It uses goldmark to parse the Markdown AST
 // and a custom renderer that emits only the HTML subset Telegram supports:
