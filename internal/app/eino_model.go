@@ -2,10 +2,13 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
@@ -16,37 +19,49 @@ import (
 var (
 	errEinoNoChoices           = errors.New("chat completion returned no choices")
 	errEinoUnexpectedToolCalls = errors.New("chat completion returned tool calls for a tool-free request")
+	errEinoToolProtocol        = errors.New("chat completion returned invalid tool calls")
+	errEinoStreamProtocol      = errors.New("chat completion returned an invalid stream")
+	errEinoStreamInterrupted   = fmt.Errorf("chat completion stream was interrupted: %w", io.ErrUnexpectedEOF)
 )
 
 var _ model.BaseChatModel = (*einoChatModel)(nil)
 
 // einoChatModel serves one bot request, including all of its model calls.
 type einoChatModel struct {
-	client      *openai.Client
-	modelName   string
-	maxTokens   int
-	tools       map[string]openai.Tool
-	usageCtx    UsageContext
-	recordUsage func(UsageEvent)
+	client              *openai.Client
+	modelName           string
+	maxTokens           int
+	retry               bool
+	backupModel         string
+	onPreview           func(string)
+	waitForPreviewReset func()
+	tools               map[string]openai.Tool
+	usageCtx            UsageContext
+	recordUsage         func(UsageEvent)
 
-	callIndex atomic.Int64
+	logicalCalls atomic.Int64
 }
 
-func (m *einoChatModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (message *schema.Message, err error) {
+func (m *einoChatModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
 	req, err := m.request(input, opts)
 	if err != nil {
 		return nil, err
 	}
+	round := int(m.logicalCalls.Add(1))
+	return runEinoModelAttempts(ctx, m, req, func(req openai.ChatCompletionRequest) (*schema.Message, error) {
+		return m.generateOnce(ctx, req, round)
+	})
+}
 
+func (m *einoChatModel) generateOnce(ctx context.Context, req openai.ChatCompletionRequest, round int) (message *schema.Message, err error) {
 	started := time.Now()
-	callIndex := int(m.callIndex.Add(1))
 	resp, err := m.client.CreateChatCompletion(ctx, req)
 	hasToolCalls := false
 	defer func() {
-		m.recordCall(req, callIndex, started, resp.Model, &resp.Usage, hasToolCalls, err)
+		m.recordCall(req, round, started, resp.Model, &resp.Usage, hasToolCalls, err)
 	}()
 	if err != nil {
-		return nil, err
+		return nil, safeEinoRequestError(ctx, err)
 	}
 	if len(resp.Choices) == 0 {
 		return nil, errEinoNoChoices
@@ -58,7 +73,10 @@ func (m *einoChatModel) Generate(ctx context.Context, input []*schema.Message, o
 	}
 	message, err = toEinoMessage(choice.Message)
 	if err != nil {
-		return nil, err
+		return nil, errEinoStreamProtocol
+	}
+	if choice.Message.FunctionCall != nil || !validEinoToolCalls(message.ToolCalls, choice.FinishReason) {
+		return nil, errEinoToolProtocol
 	}
 	message.ResponseMeta = einoResponseMeta(choice.FinishReason, &resp.Usage)
 	return message, nil
@@ -71,19 +89,11 @@ func (m *einoChatModel) Stream(ctx context.Context, input []*schema.Message, opt
 	}
 	req.Stream = true
 	req.StreamOptions = &openai.StreamOptions{IncludeUsage: true}
-
-	started := time.Now()
-	callIndex := int(m.callIndex.Add(1))
+	round := int(m.logicalCalls.Add(1))
 	streamCtx, cancel := context.WithCancel(ctx)
-	upstream, err := m.client.CreateChatCompletionStream(streamCtx, req)
-	if err != nil {
-		cancel()
-		m.recordCall(req, callIndex, started, "", nil, false, err)
-		return nil, err
-	}
 
-	// Keep a Send pending while the HTTP reader is in Recv or waiting to deliver
-	// a chunk. Eino signals early reader closure through Send's return value.
+	// Keep a Send pending while HTTP is in progress. Eino signals early reader
+	// closure through Send's return value.
 	permits, writer := schema.Pipe[struct{}](0)
 	permits.SetAutomaticClose() // Allow both producer shutdown and reader Close.
 	go func() {
@@ -98,7 +108,20 @@ func (m *einoChatModel) Stream(ctx context.Context, input []*schema.Message, opt
 	go func() {
 		defer permits.Close()
 		defer close(chunks)
-		terminalErr = m.receiveStream(streamCtx, upstream, req, callIndex, started, chunks)
+		// Publish only the completed attempt to ADK. The Telegram preview is
+		// driven directly while reading each attempt, independent of tool execution.
+		result, err := runEinoModelAttempts(streamCtx, m, req, func(req openai.ChatCompletionRequest) ([]*schema.Message, error) {
+			return m.streamOnce(streamCtx, req, round)
+		})
+		terminalErr = err
+		for _, chunk := range result {
+			select {
+			case chunks <- chunk:
+			case <-streamCtx.Done():
+				terminalErr = streamCtx.Err()
+				return
+			}
+		}
 	}()
 
 	next := func(struct{}) (*schema.Message, error) {
@@ -118,85 +141,142 @@ func (m *einoChatModel) Stream(ctx context.Context, input []*schema.Message, opt
 	})), nil
 }
 
-func (m *einoChatModel) receiveStream(
-	ctx context.Context,
-	upstream *openai.ChatCompletionStream,
-	req openai.ChatCompletionRequest,
-	callIndex int,
-	started time.Time,
-	chunks chan<- *schema.Message,
-) (err error) {
+func (m *einoChatModel) streamOnce(ctx context.Context, req openai.ChatCompletionRequest, round int) (_ []*schema.Message, err error) {
+	started := time.Now()
 	var (
+		chunks       []*schema.Message
 		usage        *openai.Usage
 		actualModel  string
 		sawChoice    bool
-		completed    bool
+		usageTail    bool
 		hasToolCalls bool
-		rejected     bool
+		finish       openai.FinishReason
+		protocolErr  error
+		preview      strings.Builder
 	)
+	clearPreview := func() {
+		if preview.Len() != 0 {
+			m.onPreview("")
+			preview.Reset()
+		}
+	}
 	defer func() {
-		_ = upstream.Close()
-		m.recordCall(req, callIndex, started, actualModel, usage, hasToolCalls, err)
+		m.recordCall(req, round, started, actualModel, usage, hasToolCalls, err)
+		if err != nil {
+			clearPreview()
+		}
 	}()
+	upstream, err := m.client.CreateChatCompletionStream(ctx, req)
+	if err != nil {
+		return nil, safeEinoRequestError(ctx, err)
+	}
+	defer upstream.Close()
 
 	for {
-		resp, err := upstream.Recv()
+		data, readErr := upstream.RecvRaw()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if readErr != nil {
+			if protocolErr != nil {
+				return nil, protocolErr
+			}
+			completed := finish != "" || usageTail
+			if hasToolCalls || finish == openai.FinishReasonToolCalls {
+				msg, concatErr := schema.ConcatMessages(chunks)
+				if concatErr != nil || completed && !validEinoToolCalls(msg.ToolCalls, finish) {
+					return nil, errEinoToolProtocol
+				}
+			}
+			switch {
+			case readErr == io.EOF && !sawChoice:
+				return nil, errEinoNoChoices
+			case readErr == io.EOF && !completed:
+				return nil, io.ErrUnexpectedEOF
+			case readErr == io.EOF:
+				return chunks, nil
+			case errors.Is(readErr, io.ErrUnexpectedEOF), errors.Is(readErr, syscall.ECONNRESET):
+				return nil, errEinoStreamInterrupted
+			default:
+				return nil, errEinoStreamProtocol
+			}
+		}
+
+		var resp struct {
+			openai.ChatCompletionStreamResponse
+			Error json.RawMessage `json:"error"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil || string(data) == "null" {
+			return nil, errEinoStreamProtocol
+		}
 		actualModel = firstNonEmpty(resp.Model, actualModel)
 		if resp.Usage != nil {
 			usage = resp.Usage
 		}
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if len(resp.Error) != 0 && string(resp.Error) != "null" {
+			return nil, errEinoStreamProtocol
 		}
-		if err == io.EOF {
-			switch {
-			case rejected:
-				return errEinoUnexpectedToolCalls
-			case !sawChoice:
-				return errEinoNoChoices
-			case !completed:
-				return io.ErrUnexpectedEOF
-			default:
-				return nil
+		if len(resp.Choices) == 0 {
+			if resp.Usage != nil && sawChoice {
+				usageTail = true
+				chunks = append(chunks, &schema.Message{ResponseMeta: einoResponseMeta("", resp.Usage)})
 			}
-		}
-		if err != nil {
-			return err
+			continue
 		}
 
-		var chunk *schema.Message
-		if len(resp.Choices) != 0 {
-			sawChoice = true
-			choice := resp.Choices[0]
-			completed = completed || choice.FinishReason != ""
-			delta := choice.Delta
-			hasToolCalls = hasToolCalls || len(delta.ToolCalls) != 0
-			if len(req.Tools) == 0 && (hasToolCalls || delta.FunctionCall != nil) {
-				rejected = true
+		sawChoice = true
+		choice := resp.Choices[0]
+		if choice.FinishReason != "" {
+			finish = choice.FinishReason
+		}
+		delta := choice.Delta
+		if delta.Role != "" && delta.Role != openai.ChatMessageRoleAssistant {
+			return nil, errEinoStreamProtocol
+		}
+		hasToolCalls = hasToolCalls || len(delta.ToolCalls) != 0
+		if protocolErr == nil {
+			switch {
+			case len(req.Tools) == 0 && (hasToolCalls || delta.FunctionCall != nil):
+				protocolErr = errEinoUnexpectedToolCalls
+			case delta.FunctionCall != nil:
+				protocolErr = errEinoToolProtocol
 			}
-			chunk = &schema.Message{
-				Role:             schema.RoleType(firstNonEmpty(delta.Role, string(schema.Assistant))),
+		}
+		if hasToolCalls || protocolErr != nil {
+			clearPreview()
+		} else if m.onPreview != nil && delta.Content != "" {
+			preview.WriteString(delta.Content)
+			m.onPreview(preview.String())
+		}
+
+		// Drain rejected responses for the provider's usage tail.
+		if protocolErr == nil {
+			chunks = append(chunks, &schema.Message{
+				Role:             schema.Assistant,
 				Content:          delta.Content,
 				ReasoningContent: delta.ReasoningContent,
 				ToolCalls:        toEinoToolCalls(delta.ToolCalls),
 				ResponseMeta:     einoResponseMeta(choice.FinishReason, resp.Usage),
-			}
-		} else if resp.Usage != nil && sawChoice {
-			completed = true
-			chunk = &schema.Message{ResponseMeta: einoResponseMeta("", resp.Usage)}
-		}
-
-		// Drain the rest of a rejected response so the provider's usage tail is
-		// still accounted for, without handing its tool calls to the consumer.
-		if rejected || chunk == nil {
-			continue
-		}
-		select {
-		case chunks <- chunk:
-		case <-ctx.Done():
-			return ctx.Err()
+			})
 		}
 	}
+}
+
+func validEinoToolCalls(calls []schema.ToolCall, finish openai.FinishReason) bool {
+	if len(calls) == 0 {
+		return finish != openai.FinishReasonToolCalls
+	}
+	ids := make(map[string]bool, len(calls))
+	for _, call := range calls {
+		if call.ID == "" || ids[call.ID] || call.Function.Name == "" ||
+			call.Type != "" && call.Type != string(openai.ToolTypeFunction) ||
+			call.Function.Arguments != "" && (!strings.HasPrefix(strings.TrimSpace(call.Function.Arguments), "{") ||
+				!json.Valid([]byte(call.Function.Arguments))) {
+			return false
+		}
+		ids[call.ID] = true
+	}
+	return true
 }
 
 func (m *einoChatModel) request(input []*schema.Message, opts []model.Option) (openai.ChatCompletionRequest, error) {
@@ -206,7 +286,9 @@ func (m *einoChatModel) request(input []*schema.Message, opts []model.Option) (o
 	}
 
 	options := model.GetCommonOptions(&model.Options{Model: &m.modelName, MaxTokens: &m.maxTokens}, opts...)
-	req := openai.ChatCompletionRequest{Model: *options.Model, Messages: messages, Stop: options.Stop}
+	req := openai.ChatCompletionRequest{
+		Model: *options.Model, Messages: messages, Stop: options.Stop, MaxTokens: *options.MaxTokens,
+	}
 	if options.Temperature != nil {
 		req.Temperature = *options.Temperature
 	}
@@ -224,18 +306,16 @@ func (m *einoChatModel) request(input []*schema.Message, opts []model.Option) (o
 		req.Tools = append(req.Tools, canonical)
 	}
 
-	applyMaxTokens(&req, *options.MaxTokens)
-	sanitizeBetaRequest(&req)
 	return req, nil
 }
 
-func (m *einoChatModel) recordCall(req openai.ChatCompletionRequest, callIndex int, started time.Time, actualModel string, usage *openai.Usage, hasToolCalls bool, err error) {
+func (m *einoChatModel) recordCall(req openai.ChatCompletionRequest, logicalRound int, started time.Time, actualModel string, usage *openai.Usage, hasToolCalls bool, err error) {
 	if m.recordUsage == nil {
 		return
 	}
 	callType, round := UsageCallMainChat, 0
 	if (err == nil && hasToolCalls) || (err != nil && len(req.Tools) != 0) {
-		callType, round = UsageCallToolRound, callIndex
+		callType, round = UsageCallToolRound, logicalRound
 	}
 	m.recordUsage(usageEvent(m.usageCtx, callType, firstNonEmpty(actualModel, req.Model), req.Stream, round, started, usage, err == nil))
 }

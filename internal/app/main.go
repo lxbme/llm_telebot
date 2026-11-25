@@ -35,7 +35,9 @@ type Config struct {
 	ContextMode    string // "at" = only @bot messages as context; "global" = all group messages as context
 	AutoDetect     bool   // true = use LLM to judge if an un-mentioned message is relevant and should trigger a reply
 
-	EinoChatEnabled bool
+	EinoChatEnabled       bool
+	EinoModelRetryEnabled bool
+	EinoFallbackModel     string
 
 	// Separate (optional) model config for the AUTO_DETECT relevance classifier.
 	// When empty, falls back to the main OpenAI settings above.
@@ -304,6 +306,8 @@ func loadConfig() Config {
 		ContextMaxMsgs:                 maxMsgs,
 		MaxTokens:                      maxTokens,
 		EinoChatEnabled:                strings.EqualFold(strings.TrimSpace(os.Getenv("EINO_CHAT_ENABLED")), "true"),
+		EinoModelRetryEnabled:          strings.EqualFold(strings.TrimSpace(os.Getenv("EINO_MODEL_RETRY_ENABLED")), "true"),
+		EinoFallbackModel:              strings.TrimSpace(os.Getenv("EINO_FALLBACK_MODEL")),
 		BotUsername:                    get("BOT_USERNAME", ""),
 		ContextMode:                    contextMode,
 		AutoDetect:                     autoDetect,
@@ -1940,7 +1944,7 @@ func (b *Bot) doStream(
 	defer stream.Close()
 
 	var fullResponse strings.Builder
-	preview, stopPreview := snap.startReplyPreview(ctx, placeholder, showText)
+	preview, _, stopPreview := snap.startReplyPreview(ctx, placeholder, showText)
 
 	// Main loop: consume stream tokens.
 	var streamUsage *openai.Usage
@@ -2012,17 +2016,18 @@ func (b *Bot) doStream(
 }
 
 // startReplyPreview throttles Telegram edits and allows a tool round to clear
-// a text preview that is already visible. Stop it before the final edit.
-func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *tele.Message, showText bool) (update func(string), stop func()) {
+// a text preview that is already visible. Recovery can wait for the reset.
+// Stop it before the final edit.
+func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *tele.Message, showText bool) (update func(string), waitForReset func(), stop func()) {
 	if !showText {
-		return func(string) {}, func() {}
+		return func(string) {}, func() {}, func() {}
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	var mu sync.Mutex
 	var current string
 	var clearPending bool
-	clear := make(chan struct{}, 1)
+	clear := make(chan chan struct{}, 1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -2031,12 +2036,13 @@ func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *
 		var lastSent string
 		for {
 			tick := false
+			var resetDone chan struct{}
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				tick = true
-			case <-clear:
+			case resetDone = <-clear:
 			}
 			mu.Lock()
 			text, reset := current, clearPending
@@ -2046,27 +2052,43 @@ func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *
 				snap.editReplyPreview(ctx, placeholder, replyPlaceholderText)
 				lastSent = ""
 			}
+			if resetDone != nil {
+				close(resetDone)
+			}
 			if tick && text != "" && text != lastSent {
 				snap.editReplyPreview(ctx, placeholder, text+"▌")
 				lastSent = text
 			}
 		}
 	}()
-	return func(text string) {
-			mu.Lock()
-			current = text
-			clearPending = clearPending || text == ""
-			mu.Unlock()
-			if text == "" {
-				select {
-				case clear <- struct{}{}:
-				default:
-				}
+	update = func(text string) {
+		mu.Lock()
+		current = text
+		clearPending = clearPending || text == ""
+		mu.Unlock()
+		if text == "" {
+			select {
+			case clear <- nil:
+			default:
 			}
-		}, func() {
-			cancel()
-			<-done
 		}
+	}
+	waitForReset = func() {
+		resetDone := make(chan struct{})
+		select {
+		case clear <- resetDone:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-resetDone:
+		case <-ctx.Done():
+		}
+	}
+	return update, waitForReset, func() {
+		cancel()
+		<-done
+	}
 }
 
 func (snap runtimeSnapshot) editReplyResult(placeholder *tele.Message, finalText string, showText bool) {

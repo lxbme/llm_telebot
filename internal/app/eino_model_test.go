@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -187,13 +188,13 @@ func TestEinoModelStreamFailures(t *testing.T) {
 		wantErr string
 		total   int64
 	}{
-		{name: "startup", status: http.StatusServiceUnavailable, wantErr: "upstream unavailable", tools: true},
+		{name: "startup", status: http.StatusServiceUnavailable, wantErr: "HTTP status 503", tools: true},
 		{
 			name: "clean EOF before completion", wantErr: "unexpected EOF",
 			frames: []string{`{"choices":[{"delta":{"content":"partial"},"finish_reason":null}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`}, total: 2,
 		},
 		{
-			name: "malformed frame after usage", tools: true, total: 9, wantErr: "invalid character",
+			name: "malformed frame after usage", tools: true, total: 9, wantErr: "invalid stream",
 			frames: []string{`{"choices":[{"delta":{"content":"partial"}}]}`, `{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}`, "{broken"},
 		},
 		{
@@ -243,9 +244,14 @@ func TestEinoModelStreamTransportFailure(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		einoModelSSE(w, `{"model":"actual-model","choices":[{"delta":{"content":"partial"},"finish_reason":null}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
 	})
+	var previews []string
+	m.onPreview = func(text string) { previews = append(previews, text) }
 	chunks, err := einoModelReadStream(t, m)
-	if !errors.Is(err, io.ErrUnexpectedEOF) || len(chunks) != 1 || chunks[0].Content != "partial" {
+	if !errors.Is(err, io.ErrUnexpectedEOF) || len(chunks) != 0 {
 		t.Fatalf("interrupted stream = %#v, %v", chunks, err)
+	}
+	if !reflect.DeepEqual(previews, []string{"partial", ""}) {
+		t.Errorf("interrupted previews = %q, want a draft followed by a reset", previews)
 	}
 	einoModelAssertUsage(t, events, "actual-model", UsageCallMainChat, 0, true, false, 5)
 }
@@ -273,6 +279,51 @@ func TestEinoModelGenerateFailures(t *testing.T) {
 	}
 }
 
+func TestEinoModelGenerateFailoverRecordsOneLogicalToolRound(t *testing.T) {
+	var mu sync.Mutex
+	var attempts []string
+	m, events := newEinoModelTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var req openai.ChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		attempts = append(attempts, req.Model)
+		mu.Unlock()
+		if req.Model != "backup" {
+			// Exercise the SDK's non-JSON error response path.
+			http.Error(w, einoErrorSecret, http.StatusServiceUnavailable)
+			return
+		}
+		io.WriteString(w, `{"model":"actual-backup","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"lookup-id","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"total_tokens":10}}`)
+	})
+	m.backupModel = "backup"
+	msg, err := m.Generate(t.Context(), nil, model.WithTools([]*schema.ToolInfo{{Name: "lookup"}}))
+	if err != nil || len(msg.ToolCalls) != 1 || msg.ToolCalls[0].ID != "lookup-id" {
+		t.Fatalf("backup Generate = %#v, %v", msg, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"gpt-4o-mini", "backup"}; !reflect.DeepEqual(attempts, want) {
+		t.Errorf("attempts = %v, want %v", attempts, want)
+	}
+	if len(events) != 2 {
+		t.Fatalf("recorded %d usage events, want 2", len(events))
+	}
+	failed, succeeded := <-events, <-events
+	if failed.Model != "gpt-4o-mini" || failed.Success || failed.TotalTokens != 0 ||
+		succeeded.Model != "actual-backup" || !succeeded.Success || succeeded.TotalTokens != 10 {
+		t.Errorf("unexpected failover usage: %+v and %+v", failed, succeeded)
+	}
+	for _, event := range []UsageEvent{failed, succeeded} {
+		if event.RequestID != "bot-request" || event.ToolIterations != 1 || event.CallType != UsageCallToolRound || event.Streamed {
+			t.Errorf("expected one logical tool round, got %+v", event)
+		}
+	}
+}
+
 func TestEinoModelStreamClosesConnection(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -285,6 +336,7 @@ func TestEinoModelStreamClosesConnection(t *testing.T) {
 		{name: "cancel without consuming text", cancel: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			connected := make(chan struct{})
 			disconnected := make(chan struct{})
 			stop := make(chan struct{})
 			m, events := newEinoModelTestServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -294,6 +346,7 @@ func TestEinoModelStreamClosesConnection(t *testing.T) {
 				} else {
 					w.(http.Flusher).Flush()
 				}
+				close(connected)
 				select {
 				case <-r.Context().Done():
 					close(disconnected)
@@ -304,14 +357,26 @@ func TestEinoModelStreamClosesConnection(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 
+			previewed := make(chan struct{})
+			m.onPreview = func(text string) {
+				if text == "partial" {
+					close(previewed)
+				}
+			}
 			reader, err := m.Stream(ctx, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
+			select {
+			case <-connected:
+			case <-time.After(3 * time.Second):
+				t.Fatal("provider did not receive the request")
+			}
 			if tc.readFirst {
-				msg, err := einoModelRecvWithTimeout(t, reader)
-				if err != nil || msg.Content != "partial" {
-					t.Fatalf("first chunk = %#v, %v", msg, err)
+				select {
+				case <-previewed:
+				case <-time.After(3 * time.Second):
+					t.Fatal("provider text was not previewed")
 				}
 			}
 			if tc.cancel {

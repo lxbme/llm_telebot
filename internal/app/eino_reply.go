@@ -3,9 +3,7 @@ package app
 import (
 	"context"
 	"errors"
-	"io"
 	"math"
-	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/adk"
@@ -52,19 +50,26 @@ func (b *Bot) runEinoReply(
 	tools *einoToolSet,
 	usageCtx UsageContext,
 	onPreview func(string),
+	waitForPreviewReset func(),
 ) (string, error) {
 	input, err := toEinoMessages(messages)
 	if err != nil {
 		return "", err
 	}
 	model := &einoChatModel{
-		client:    snap.ai,
-		modelName: snap.cfg.OpenAIModel,
-		maxTokens: snap.cfg.MaxTokens,
-		usageCtx:  usageCtx,
+		client:              snap.ai,
+		modelName:           snap.cfg.OpenAIModel,
+		maxTokens:           snap.cfg.MaxTokens,
+		usageCtx:            usageCtx,
+		onPreview:           onPreview,
+		waitForPreviewReset: waitForPreviewReset,
 		recordUsage: func(event UsageEvent) {
 			b.recordUsageEventFor(snap, event)
 		},
+	}
+	if snap.cfg.EinoChatEnabled {
+		model.retry = snap.cfg.EinoModelRetryEnabled
+		model.backupModel = snap.cfg.EinoFallbackModel
 	}
 	rounds := &einoReplyRounds{tools: tools}
 	if tools != nil && len(tools.rawTools) > 0 {
@@ -110,7 +115,12 @@ func (b *Bot) runEinoReply(
 		}
 		switch message.Role {
 		case schema.Assistant:
-			finalText, err = readEinoAssistant(message, onPreview)
+			var reply *schema.Message
+			reply, err = message.GetMessage()
+			finalText = ""
+			if err == nil && len(reply.ToolCalls) == 0 {
+				finalText = reply.Content
+			}
 		case schema.Tool:
 			_, err = message.GetMessage()
 		default:
@@ -139,47 +149,6 @@ func (b *Bot) runEinoReply(
 	return finalText, nil
 }
 
-func readEinoAssistant(message *adk.MessageVariant, onPreview func(string)) (string, error) {
-	var text strings.Builder
-	var hasTools bool
-	consume := func(chunk *schema.Message) {
-		if hasTools {
-			return
-		}
-		if len(chunk.ToolCalls) > 0 {
-			hasTools = true
-			if text.Len() > 0 && onPreview != nil {
-				onPreview("")
-			}
-			text.Reset()
-			return
-		}
-		if chunk.Content != "" {
-			text.WriteString(chunk.Content)
-			if onPreview != nil {
-				onPreview(text.String())
-			}
-		}
-	}
-	if !message.IsStreaming {
-		consume(message.Message)
-		return text.String(), nil
-	}
-
-	stream := message.MessageStream
-	defer stream.Close()
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			return text.String(), nil
-		}
-		if err != nil {
-			return "", err
-		}
-		consume(chunk)
-	}
-}
-
 func (b *Bot) streamEinoReply(
 	ctx context.Context,
 	snap runtimeSnapshot,
@@ -195,8 +164,8 @@ func (b *Bot) streamEinoReply(
 
 	var finalText string
 	if err == nil {
-		preview, stopPreview := snap.startReplyPreview(ctx, placeholder, showText)
-		finalText, err = b.runEinoReply(ctx, snap, messages, tools, usageCtx, preview)
+		preview, waitForPreviewReset, stopPreview := snap.startReplyPreview(ctx, placeholder, showText)
+		finalText, err = b.runEinoReply(ctx, snap, messages, tools, usageCtx, preview, waitForPreviewReset)
 		stopPreview()
 	}
 

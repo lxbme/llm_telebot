@@ -89,7 +89,7 @@ func TestEinoReplyRounds(t *testing.T) {
 			b := &Bot{dashboardEvents: NewDashboardEventHub(0)}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			got, err := b.runEinoReply(ctx, server.snapshot(tt.max), newEinoReplyMessages(), set, einoReplyUsageContext(), nil)
+			got, err := b.runEinoReply(ctx, server.snapshot(tt.max), newEinoReplyMessages(), set, einoReplyUsageContext(), nil, nil)
 			if tt.rejected {
 				if got != "" || !errors.Is(err, errEinoUnexpectedToolCalls) {
 					t.Fatalf("reply = %q, %v, want tool-free request rejection", got, err)
@@ -157,7 +157,7 @@ func TestEinoReplyClearsProvisionalText(t *testing.T) {
 		if text == "draft" {
 			close(provisionalSeen)
 		}
-	})
+	}, nil)
 	if reply != "final answer" || err != nil {
 		t.Fatalf("reply = %q, %v", reply, err)
 	}
@@ -204,7 +204,7 @@ func TestEinoReplyErrorsStopExecution(t *testing.T) {
 				if tt.cancel {
 					cancel()
 				}
-			})
+			}, nil)
 			if reply != "" || !errors.Is(err, tt.want) {
 				t.Fatalf("reply = %q, %v, want %v", reply, err, tt.want)
 			}
@@ -257,7 +257,7 @@ func TestEinoReplySummaryTools(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	b := &Bot{}
-	reply, err := b.runEinoReply(ctx, server.snapshot(2), newEinoReplyMessages(), set, einoReplyUsageContext(), nil)
+	reply, err := b.runEinoReply(ctx, server.snapshot(2), newEinoReplyMessages(), set, einoReplyUsageContext(), nil, nil)
 	if reply != "answer" || err != nil || server.calls.Load() != 3 || toolRuns.Load() != 1 {
 		t.Fatalf("reply = %q, %v, model requests = %d, MCP calls = %d", reply, err, server.calls.Load(), toolRuns.Load())
 	}
@@ -288,7 +288,7 @@ func TestEinoReplyFallbackAfterUnknownTool(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	b := &Bot{}
-	reply, err := b.runEinoReply(ctx, server.snapshot(3), newEinoReplyMessages(), set, einoReplyUsageContext(), nil)
+	reply, err := b.runEinoReply(ctx, server.snapshot(3), newEinoReplyMessages(), set, einoReplyUsageContext(), nil, nil)
 	if err != nil || !strings.HasSuffix(reply, "\n\n"+`error: unknown tool "missing"`) {
 		t.Fatalf("reply = %q, %v, want fallback with unknown tool result", reply, err)
 	}
