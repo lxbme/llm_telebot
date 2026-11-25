@@ -54,7 +54,7 @@ func TestEinoGroupTextUsesPersistedPhotoHistory(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	snap := model.snapshot(3)
-	snap.cfg.EinoChatEnabled, snap.cfg.VisionEnabled = true, true
+	snap.cfg.VisionEnabled = true
 	snap.cfg.BotUsername, snap.cfg.ContextMode, snap.cfg.VisionMaxImageBytes = "@testbot", "global", 1024
 	b := &Bot{
 		cfg: snap.cfg, ai: snap.ai, tg: telegram.bot, store: NewHistoryStore(db),
@@ -177,7 +177,6 @@ func TestEinoTaskRunnerUsesGlobalToolsAndRequestedContext(t *testing.T) {
 
 	telegram := newEinoReplyTelegram(t, nil)
 	snap := model.snapshot(3)
-	snap.cfg.EinoChatEnabled = true
 	b := &Bot{
 		cfg: snap.cfg, ai: snap.ai, tg: telegram.bot, store: NewHistoryStore(nil),
 		tools: global, userTools: userTools, reminders: NewReminderStore(nil),

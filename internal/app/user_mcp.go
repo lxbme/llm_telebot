@@ -478,32 +478,6 @@ func (v *MergedToolView) Count() int {
 	return n
 }
 
-// Get looks up a tool by name, checking user tools first (higher priority),
-// then global tools.
-func (v *MergedToolView) Get(name string) MCPTool {
-	if v.user != nil {
-		if t := v.user.Get(name); t != nil {
-			return t
-		}
-	}
-	if v.global != nil {
-		return v.global.Get(name)
-	}
-	return nil
-}
-
-// OpenAITools returns the combined tool definitions for the OpenAI API.
-func (v *MergedToolView) OpenAITools() []openai.Tool {
-	var tools []openai.Tool
-	if v.global != nil {
-		tools = append(tools, v.global.OpenAITools()...)
-	}
-	if v.user != nil {
-		tools = append(tools, v.user.OpenAITools()...)
-	}
-	return tools
-}
-
 // ServerNames returns distinct server names from global then user registries.
 func (v *MergedToolView) ServerNames() []string {
 	seen := map[string]bool{}
@@ -539,31 +513,6 @@ func (v *MergedToolView) OpenAIToolsForServer(serverName string) []openai.Tool {
 		return v.global.OpenAIToolsForServer(serverName)
 	}
 	return nil
-}
-
-// CountForServer returns the tool count for a specific server across both registries.
-func (v *MergedToolView) CountForServer(serverName string) int {
-	n := 0
-	if v.global != nil {
-		n += v.global.CountForServer(serverName)
-	}
-	if v.user != nil {
-		n += v.user.CountForServer(serverName)
-	}
-	return n
-}
-
-// ExecuteToolCall looks up and executes a tool call from either registry.
-func (v *MergedToolView) ExecuteToolCall(call openai.ToolCall) string {
-	tool := v.Get(call.Function.Name)
-	if tool == nil {
-		return fmt.Sprintf("error: unknown tool %q", call.Function.Name)
-	}
-	result, err := tool.Execute(call.Function.Arguments)
-	if err != nil {
-		return fmt.Sprintf("error: %v", err)
-	}
-	return result
 }
 
 // ─── JSON Detection Helper ──────────────────────────────────────────────────

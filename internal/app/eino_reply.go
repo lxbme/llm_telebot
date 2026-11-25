@@ -60,16 +60,14 @@ func (b *Bot) runEinoReply(
 		client:              snap.ai,
 		modelName:           snap.cfg.OpenAIModel,
 		maxTokens:           snap.cfg.MaxTokens,
+		retry:               snap.cfg.EinoModelRetryEnabled,
+		backupModel:         snap.cfg.EinoFallbackModel,
 		usageCtx:            usageCtx,
 		onPreview:           onPreview,
 		waitForPreviewReset: waitForPreviewReset,
 		recordUsage: func(event UsageEvent) {
 			b.recordUsageEventFor(snap, event)
 		},
-	}
-	if snap.cfg.EinoChatEnabled {
-		model.retry = snap.cfg.EinoModelRetryEnabled
-		model.backupModel = snap.cfg.EinoFallbackModel
 	}
 	rounds := &einoReplyRounds{tools: tools}
 	if tools != nil && len(tools.rawTools) > 0 {

@@ -280,24 +280,3 @@ var getToolDetailsVirtualTool = openai.Tool{
 		},
 	},
 }
-
-// ─── Active Tool Builder ──────────────────────────────────────────────────────
-
-// buildActiveTools returns the []openai.Tool slice for a single LLM request.
-//
-//   - summaryMode=false: returns all tool schemas (original behaviour).
-//   - summaryMode=true:  returns the virtual get_tool_details tool plus full
-//     schemas for any servers the LLM has already expanded.
-func buildActiveTools(toolView *MergedToolView, expanded map[string]bool, summaryMode bool) []openai.Tool {
-	if toolView == nil {
-		return nil
-	}
-	if !summaryMode {
-		return toolView.OpenAITools()
-	}
-	tools := []openai.Tool{getToolDetailsVirtualTool}
-	for srv := range expanded {
-		tools = append(tools, toolView.OpenAIToolsForServer(srv)...)
-	}
-	return tools
-}

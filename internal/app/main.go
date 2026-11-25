@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -35,7 +34,6 @@ type Config struct {
 	ContextMode    string // "at" = only @bot messages as context; "global" = all group messages as context
 	AutoDetect     bool   // true = use LLM to judge if an un-mentioned message is relevant and should trigger a reply
 
-	EinoChatEnabled       bool
 	EinoModelRetryEnabled bool
 	EinoFallbackModel     string
 
@@ -305,7 +303,6 @@ func loadConfig() Config {
 		SystemPrompt:                   get("SYSTEM_PROMPT", "You are a helpful assistant."),
 		ContextMaxMsgs:                 maxMsgs,
 		MaxTokens:                      maxTokens,
-		EinoChatEnabled:                strings.EqualFold(strings.TrimSpace(os.Getenv("EINO_CHAT_ENABLED")), "true"),
 		EinoModelRetryEnabled:          strings.EqualFold(strings.TrimSpace(os.Getenv("EINO_MODEL_RETRY_ENABLED")), "true"),
 		EinoFallbackModel:              strings.TrimSpace(os.Getenv("EINO_FALLBACK_MODEL")),
 		BotUsername:                    get("BOT_USERNAME", ""),
@@ -1729,287 +1726,10 @@ func (b *Bot) streamReply(
 			messages[0].Content += section
 		}
 	}
-	var finalText string
-	if snap.cfg.EinoChatEnabled {
-		finalText = b.streamEinoReply(ctx, snap, messages, placeholder, toolView, summaryMode, usageCtx)
-	} else {
-		finalText = b.streamLegacyReply(ctx, snap, messages, placeholder, toolView, summaryMode, usageCtx)
-	}
+	finalText := b.streamEinoReply(ctx, snap, messages, placeholder, toolView, summaryMode, usageCtx)
 	if finalText != "" {
 		b.postReply(snap, chatID, userMsg, finalText, sender, placeholder.Chat, placeholder)
 	}
-}
-
-func (b *Bot) streamLegacyReply(
-	ctx context.Context,
-	snap runtimeSnapshot,
-	messages []openai.ChatCompletionMessage,
-	placeholder *tele.Message,
-	toolView *MergedToolView,
-	summaryMode bool,
-	usageCtx UsageContext,
-) string {
-	chatID := usageCtx.ChatID
-	// expandedServers tracks which MCP server groups the LLM has requested
-	// full schemas for (used in summary mode only).
-	expandedServers := map[string]bool{}
-
-	// ── Tool-call loop ──────────────────────────────────────────────────
-	// If tools are enabled, we do non-streaming requests in a loop so the
-	// LLM can call tools repeatedly. Once all tool calls are resolved, the
-	// conversation (including tool results) is sent to the streaming path
-	// so the LLM can summarise/present the results fluently.
-	if toolView != nil && toolView.Count() > 0 {
-		maxIter := snap.cfg.ToolsMaxIterations
-		hitMaxIter := false
-		for i := 0; i < maxIter; i++ {
-			req := openai.ChatCompletionRequest{
-				Model:    snap.cfg.OpenAIModel,
-				Messages: messages,
-				Tools:    buildActiveTools(toolView, expandedServers, summaryMode),
-			}
-			applyMaxTokens(&req, snap.cfg.MaxTokens)
-			sanitizeBetaRequest(&req)
-
-			started := time.Now()
-			resp, err := snap.ai.CreateChatCompletion(ctx, req)
-			b.recordUsageEventFor(snap, usageEvent(usageCtx, UsageCallToolRound, firstNonEmpty(resp.Model, snap.cfg.OpenAIModel), false, i+1, started, &resp.Usage, err == nil))
-			if err != nil {
-				snap.editOrLog(placeholder, fmt.Sprintf("\u274c Error: %v", err))
-				return ""
-			}
-			if len(resp.Choices) == 0 {
-				// No choices returned — fall through to streaming with accumulated context.
-				break
-			}
-
-			choice := resp.Choices[0]
-
-			// If the model chose to call tool(s):
-			if len(choice.Message.ToolCalls) > 0 {
-				// Append the assistant's tool-call message to the conversation.
-				messages = append(messages, choice.Message)
-
-				// Show the user which tools are being called (skip internal virtual tool).
-				var toolNames []string
-				for _, tc := range choice.Message.ToolCalls {
-					if tc.Function.Name != "get_tool_details" {
-						toolNames = append(toolNames, tc.Function.Name)
-					}
-				}
-				if len(toolNames) > 0 {
-					snap.editOrLog(placeholder, fmt.Sprintf("\U0001f527 Calling tools: %s…", strings.Join(toolNames, ", ")))
-				}
-
-				// Execute each tool call and append the results.
-				for _, tc := range choice.Message.ToolCalls {
-					// Handle the virtual get_tool_details call in summary mode.
-					if summaryMode && tc.Function.Name == "get_tool_details" {
-						var args struct {
-							Groups []string `json:"groups"`
-						}
-						_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
-						for _, g := range args.Groups {
-							resolved := g
-							for _, actual := range toolView.ServerNames() {
-								if strings.EqualFold(actual, g) {
-									resolved = actual
-									break
-								}
-							}
-							expandedServers[resolved] = true
-						}
-						log.Printf("[mcp_summary] schemas expanded for: %s", strings.Join(args.Groups, ", "))
-						messages = append(messages, openai.ChatCompletionMessage{
-							Role:       openai.ChatMessageRoleTool,
-							Content:    "Tool schemas loaded for: " + strings.Join(args.Groups, ", ") + ". You can now call those tools.",
-							ToolCallID: tc.ID,
-						})
-						continue
-					}
-
-					log.Printf("[tools] executing %s", tc.Function.Name)
-					b.recordDashboardEvent(DashboardEvent{
-						Type:      DashboardEventToolCallStarted,
-						ChatID:    chatID,
-						UserID:    usageCtx.UserID,
-						RequestID: usageCtx.RequestID,
-						ToolName:  tc.Function.Name,
-						Summary:   "executing tool " + tc.Function.Name,
-					})
-					result := toolView.ExecuteToolCall(tc)
-					log.Printf("[tools] %s done (%d bytes)", tc.Function.Name, len(result))
-					b.recordDashboardEvent(DashboardEvent{
-						Type:      DashboardEventToolCallFinished,
-						ChatID:    chatID,
-						UserID:    usageCtx.UserID,
-						RequestID: usageCtx.RequestID,
-						ToolName:  tc.Function.Name,
-						Summary:   fmt.Sprintf("tool %s completed", tc.Function.Name),
-						Detail:    truncateDashboardText(result, 200),
-						Success:   true,
-					})
-					messages = append(messages, openai.ChatCompletionMessage{
-						Role:       openai.ChatMessageRoleTool,
-						Content:    result,
-						ToolCallID: tc.ID,
-					})
-				}
-				if i == maxIter-1 {
-					// Last iteration and model still wants more tool calls — mark exhausted.
-					hitMaxIter = true
-				}
-				continue // loop back to let the LLM process tool results
-			}
-
-			// No more tool calls — break out to the streaming path below
-			// so the LLM's final answer is streamed to the user.
-			break
-		}
-
-		// If the tool-call budget was exhausted, explicitly ask the model to
-		// answer with whatever information it has gathered so far.
-		if hitMaxIter {
-			messages = append(messages, openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleUser,
-				Content: toolRoundLimitPrompt,
-			})
-		}
-	}
-
-	// ── Streaming path ──────────────────────────────────────────────────
-	// Streams the LLM's final response to the user. When tools were used,
-	// the messages slice now contains the full tool-call conversation, so
-	// the LLM will summarise the tool results into a natural reply.
-	return b.doStream(ctx, snap, messages, placeholder, toolView, expandedServers, summaryMode, usageCtx)
-}
-
-// doStream performs the streaming LLM call and returns the final text.
-// Returns empty string if an error was already reported to the user.
-// toolView may be nil if tools are disabled.
-// expandedServers and summaryMode are forwarded from the tool-call loop so
-// the streaming request uses the same active tool set.
-func (b *Bot) doStream(
-	ctx context.Context,
-	snap runtimeSnapshot,
-	messages []openai.ChatCompletionMessage,
-	placeholder *tele.Message,
-	toolView *MergedToolView,
-	expandedServers map[string]bool,
-	summaryMode bool,
-	usageCtx UsageContext,
-) string {
-	showText := true
-	if placeholder != nil && placeholder.Chat != nil {
-		showText = snap.shouldSendSpeechText(placeholder.Chat.ID)
-	}
-
-	req := openai.ChatCompletionRequest{
-		Model:    snap.cfg.OpenAIModel,
-		Messages: messages,
-		Stream:   true,
-		StreamOptions: &openai.StreamOptions{
-			IncludeUsage: true,
-		},
-	}
-	applyMaxTokens(&req, snap.cfg.MaxTokens)
-	sanitizeBetaRequest(&req)
-
-	// If tools are available, include them so the model knows about them
-	// even in streaming mode. In summary mode use the same active tool set
-	// that the tool-call loop settled on (virtual tool + expanded schemas).
-	if toolView != nil && toolView.Count() > 0 {
-		req.Tools = buildActiveTools(toolView, expandedServers, summaryMode)
-	}
-
-	started := time.Now()
-	stream, err := snap.ai.CreateChatCompletionStream(ctx, req)
-	if err != nil {
-		b.recordUsageEventFor(snap, usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, nil, false))
-		b.recordDashboardEvent(DashboardEvent{
-			Type:      DashboardEventConversationError,
-			ChatID:    usageCtx.ChatID,
-			UserID:    usageCtx.UserID,
-			Model:     snap.cfg.OpenAIModel,
-			RequestID: usageCtx.RequestID,
-			Summary:   "failed to start stream",
-			Detail:    err.Error(),
-		})
-		snap.editOrLog(placeholder, fmt.Sprintf("❌ Error starting stream: %v", err))
-		return ""
-	}
-	defer stream.Close()
-
-	var fullResponse strings.Builder
-	preview, _, stopPreview := snap.startReplyPreview(ctx, placeholder, showText)
-
-	// Main loop: consume stream tokens.
-	var streamUsage *openai.Usage
-	streamErr := func() error {
-		for {
-			resp, err := stream.Recv()
-			if err == io.EOF {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if resp.Usage != nil {
-				usage := *resp.Usage
-				streamUsage = &usage
-			}
-			if len(resp.Choices) == 0 {
-				continue
-			}
-			delta := resp.Choices[0].Delta.Content
-			if delta != "" {
-				fullResponse.WriteString(delta)
-				preview(fullResponse.String())
-			}
-		}
-	}()
-
-	// Stop the ticker goroutine.
-	stopPreview()
-
-	finalText := fullResponse.String()
-
-	if streamErr != nil {
-		b.recordUsageEventFor(snap, usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, false))
-		b.recordDashboardEvent(DashboardEvent{
-			Type:      DashboardEventConversationError,
-			ChatID:    usageCtx.ChatID,
-			UserID:    usageCtx.UserID,
-			Model:     snap.cfg.OpenAIModel,
-			RequestID: usageCtx.RequestID,
-			Summary:   "stream failed",
-			Detail:    streamErr.Error(),
-		})
-		errMsg := fmt.Sprintf("❌ Stream error: %v", streamErr)
-		if finalText != "" {
-			errMsg = finalText + "\n\n" + errMsg
-		}
-		snap.editOrLog(placeholder, errMsg)
-		return ""
-	}
-
-	if finalText == "" {
-		finalText = buildFallbackFromMessages(messages)
-	}
-	b.recordUsageEventFor(snap, usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, true))
-	b.recordDashboardEvent(DashboardEvent{
-		Type:      DashboardEventConversationFinished,
-		ChatID:    usageCtx.ChatID,
-		UserID:    usageCtx.UserID,
-		Model:     snap.cfg.OpenAIModel,
-		RequestID: usageCtx.RequestID,
-		LatencyMs: time.Since(started).Milliseconds(),
-		Success:   true,
-		Summary:   truncateDashboardText(finalText, 200),
-	})
-
-	snap.editReplyResult(placeholder, finalText, showText)
-	return finalText
 }
 
 const replyPreviewResetTimeout = 500 * time.Millisecond

@@ -299,38 +299,21 @@ func TestEinoReplyFallbackAfterUnknownTool(t *testing.T) {
 
 func TestEinoReplyBotRouting(t *testing.T) {
 	t.Setenv("CONFIG_FILE", filepath.Join(t.TempDir(), "config.yaml"))
-	t.Setenv("EINO_CHAT_ENABLED", "")
-	initiallyEnabled := loadConfig().EinoChatEnabled
-	if initiallyEnabled {
-		t.Fatal("Eino must be off by default")
-	}
-	t.Setenv("EINO_CHAT_ENABLED", "true")
-	enabled := loadConfig().EinoChatEnabled
-	if !enabled {
-		t.Fatal("EINO_CHAT_ENABLED=true did not enable Eino")
-	}
+	// Existing deployments may still have the retired setting.
+	t.Setenv("EINO_CHAT_ENABLED", "false")
 
 	var toolRuns atomic.Int32
 	registry := newEinoReplyRegistry(t, &toolRuns)
-	legacy := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, round int, req openai.ChatCompletionRequest) {
-		if req.Model != "legacy-model" || !strings.HasPrefix(req.Messages[0].Content, "old prompt\n\n") ||
+	beforeReload := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, round int, req openai.ChatCompletionRequest) {
+		if round != 0 || !req.Stream || req.Model != "old-model" || !strings.HasPrefix(req.Messages[0].Content, "old prompt\n\n") ||
 			!reflect.DeepEqual(einoReplyToolNames(req), []string{"lookup", "personal"}) {
-			t.Errorf("legacy request used the wrong snapshot: %+v", req)
+			t.Errorf("first request did not use the original snapshot and a single stream: %+v", req)
 		}
 		if !strings.Contains(req.Messages[0].Content, "Do not use Markdown tables") {
-			t.Error("legacy request lacks Telegram formatting instructions")
+			t.Error("request lacks Telegram formatting instructions")
 		}
-		switch {
-		case round == 0 && !req.Stream:
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"model":"legacy-model","choices":[{"index":0,"message":{"role":"assistant","content":"ignored"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`)
-		case round == 1 && req.Stream:
-			einoModelSSE(w, einoReplyTextFrame("**legacy**"))
-			einoReplyFinish(w, "stop")
-		default:
-			t.Errorf("legacy request %d stream = %t", round+1, req.Stream)
-			http.Error(w, "unexpected request", http.StatusBadRequest)
-		}
+		einoModelSSE(w, einoReplyTextFrame("**before reload**"))
+		einoReplyFinish(w, "stop")
 	})
 	var previewSeen, previewCleared <-chan struct{}
 	eino := newEinoReplyProvider(t, func(w http.ResponseWriter, r *http.Request, round int, req openai.ChatCompletionRequest) {
@@ -384,13 +367,11 @@ func TestEinoReplyBotRouting(t *testing.T) {
 	userTools := NewUserToolManager(nil, nil, nil)
 	userTools.registries[42] = personal
 
-	snap := legacy.snapshot(3)
-	snap.cfg.EinoChatEnabled = initiallyEnabled
-	snap.cfg.OpenAIModel, snap.cfg.SystemPrompt, snap.cfg.ContextMaxMsgs = "legacy-model", "old prompt", 20
+	snap := beforeReload.snapshot(3)
+	snap.cfg.OpenAIModel, snap.cfg.SystemPrompt, snap.cfg.ContextMaxMsgs = "old-model", "old prompt", 20
 	snap.cfg.ChatDBPath = filepath.Join(t.TempDir(), "unused.db")
 	snap.cfg.StickerRulesPath = filepath.Join(t.TempDir(), "sticker_rules.json")
 	next := snap.cfg
-	next.EinoChatEnabled = enabled
 	next.OpenAIKey, next.OpenAIBase, next.OpenAIModel, next.SystemPrompt = "test-key", eino.url+"/v1", "eino-model", "fresh prompt {literal}"
 
 	b := &Bot{
@@ -415,7 +396,7 @@ func TestEinoReplyBotRouting(t *testing.T) {
 		final  string
 		calls  []UsageCallType
 	}{
-		{sender, "legacy", []UsageCallType{UsageCallToolRound, UsageCallMainChat}},
+		{sender, "before reload", []UsageCallType{UsageCallMainChat}},
 		{sender, "direct", []UsageCallType{UsageCallMainChat}},
 		{nil, "final", []UsageCallType{UsageCallToolRound, UsageCallMainChat}},
 	} {
@@ -449,13 +430,13 @@ func TestEinoReplyBotRouting(t *testing.T) {
 			t.Errorf("request %d usage events = %q, want %q", id, usageSummaries, wantUsage)
 		}
 	}
-	if legacy.calls.Load() != 2 || eino.calls.Load() != 3 || toolRuns.Load() != 1 {
-		t.Errorf("legacy requests = %d, Eino requests = %d, MCP runs = %d", legacy.calls.Load(), eino.calls.Load(), toolRuns.Load())
+	if beforeReload.calls.Load() != 1 || eino.calls.Load() != 3 || toolRuns.Load() != 1 {
+		t.Errorf("requests before reload = %d, after reload = %d, MCP runs = %d", beforeReload.calls.Load(), eino.calls.Load(), toolRuns.Load())
 	}
 	telegram.mu.Lock()
 	defer telegram.mu.Unlock()
 	wantEdits := []einoReplyEdit{
-		{MessageID: "1", Text: "<b>legacy</b>", ParseMode: "HTML"},
+		{MessageID: "1", Text: "<b>before reload</b>", ParseMode: "HTML"},
 		{MessageID: "2", Text: "<b>direct</b>", ParseMode: "HTML"},
 		{MessageID: "3", Text: "draft▌"},
 		{MessageID: "3", Text: "⏳ Thinking…"},
@@ -470,7 +451,7 @@ func TestEinoReplyBotDoesNotReplayAfterError(t *testing.T) {
 	var toolRuns atomic.Int32
 	server := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, round int, req openai.ChatCompletionRequest) {
 		if !req.Stream {
-			t.Error("failed Eino request was replayed through legacy route")
+			t.Error("failed reply unexpectedly sent a non-streaming request")
 		}
 		switch round {
 		case 0:
@@ -485,7 +466,6 @@ func TestEinoReplyBotDoesNotReplayAfterError(t *testing.T) {
 	})
 	telegram := newEinoReplyTelegram(t, nil)
 	snap := server.snapshot(3)
-	snap.cfg.EinoChatEnabled = true
 	b := &Bot{
 		cfg: snap.cfg, ai: snap.ai, tools: newEinoReplyRegistry(t, &toolRuns), tg: telegram.bot,
 		store: NewHistoryStore(nil), dashboardEvents: NewDashboardEventHub(0),
@@ -543,7 +523,6 @@ func TestEinoReplyBotSpeechMode(t *testing.T) {
 		return nil
 	})
 	snap := server.snapshot(3)
-	snap.cfg.EinoChatEnabled = true
 	b := &Bot{
 		cfg: snap.cfg, ai: snap.ai, tg: telegram.bot, store: NewHistoryStore(nil),
 		speechModes: NewSpeechModeStore(),

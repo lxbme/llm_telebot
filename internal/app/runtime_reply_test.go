@@ -26,13 +26,12 @@ import (
 func TestReplyKeepsMCPGenerationAcrossReload(t *testing.T) {
 	for _, tt := range []struct {
 		name            string
-		eino            bool
 		reuseDB         bool
 		failPlaceholder bool
 	}{
-		{name: "Eino same personal database", eino: true, reuseDB: true},
-		{name: "legacy new personal database"},
-		{name: "failed placeholder", eino: true, failPlaceholder: true},
+		{name: "same personal database", reuseDB: true},
+		{name: "different personal database"},
+		{name: "failed placeholder", failPlaceholder: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -45,13 +44,13 @@ func TestReplyKeepsMCPGenerationAcrossReload(t *testing.T) {
 			cfg := Config{
 				OpenAIKey: "test-key", OpenAIModel: "old-model", SystemPrompt: "old prompt",
 				ChatDBPath: filepath.Join(dir, "chat.db"), StickerRulesPath: filepath.Join(dir, "sticker.json"),
-				ToolsEnabled: true, ToolsMaxIterations: 1, EinoChatEnabled: tt.eino, ContextMaxMsgs: 20,
+				ToolsEnabled: true, ToolsMaxIterations: 1, ContextMaxMsgs: 20,
 				MCPConfigPath: filepath.Join(dir, "old-mcp.json"), UserMCPDBPath: filepath.Join(dir, "old-users.db"),
 			}
 			writeReplyMCPConfig(t, cfg.MCPConfigPath, oldGlobal.url)
 			seedReplyUserMCP(t, cfg.UserMCPDBPath, userID, oldPersonal.url)
 			next := cfg
-			next.OpenAIModel, next.SystemPrompt, next.EinoChatEnabled = "new-model", "new prompt", true
+			next.OpenAIModel, next.SystemPrompt = "new-model", "new prompt"
 			next.MCPConfigPath = filepath.Join(dir, "new-mcp.json")
 			writeReplyMCPConfig(t, next.MCPConfigPath, newGlobal.url)
 			newPersonalName := "old_personal"
@@ -68,16 +67,11 @@ func TestReplyKeepsMCPGenerationAcrossReload(t *testing.T) {
 				switch round {
 				case 0:
 					assertReplyMCPNames(t, req, "old_global", "old_personal")
-					if req.Stream != tt.eino {
-						t.Errorf("old-model stream = %t, want %t", req.Stream, tt.eino)
+					if !req.Stream {
+						t.Error("old-model request was not streamed")
 					}
-					if tt.eino {
-						einoModelSSE(w, einoReplyToolFrame("call-g", "old_global", 0), einoReplyToolFrame("call-p", "old_personal", 1))
-						einoReplyFinish(w, "tool_calls")
-					} else {
-						w.Header().Set("Content-Type", "application/json")
-						fmt.Fprint(w, `{"choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call-g","type":"function","function":{"name":"old_global","arguments":"{}"}},{"id":"call-p","type":"function","function":{"name":"old_personal","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
-					}
+					einoModelSSE(w, einoReplyToolFrame("call-g", "old_global", 0), einoReplyToolFrame("call-p", "old_personal", 1))
+					einoReplyFinish(w, "tool_calls")
 				case 1:
 					var results []string
 					for _, message := range req.Messages {
@@ -235,7 +229,7 @@ func TestMCPClearWaitsForSamePathReload(t *testing.T) {
 		OpenAIKey: "test-key", OpenAIModel: "test-model", OpenAIBase: provider.url + "/v1",
 		ChatDBPath: filepath.Join(dir, "chat.db"), StickerRulesPath: filepath.Join(dir, "stickers.json"),
 		UserMCPDBPath: filepath.Join(dir, "users.db"), ToolsEnabled: true, ToolsMaxIterations: 1,
-		EinoChatEnabled: true, ContextMaxMsgs: 20,
+		ContextMaxMsgs: 20,
 	}
 	seedReplyUserMCP(t, cfg.UserMCPDBPath, userID, personal.url)
 	b := &Bot{cfg: Config{ChatDBPath: cfg.ChatDBPath}, store: NewHistoryStore(nil), tg: telegram.bot}
@@ -448,7 +442,6 @@ func TestReplyFinalEditCancelsBlockedPreview(t *testing.T) {
 		einoReplyFinish(w, "tool_calls")
 	})
 	snap := provider.snapshot(3)
-	snap.cfg.EinoChatEnabled = true
 	var toolRuns atomic.Int32
 	b := &Bot{
 		cfg: snap.cfg, ai: snap.ai, tg: tg, telegramHTTP: server.Client(),

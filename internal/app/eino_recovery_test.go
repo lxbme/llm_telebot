@@ -33,7 +33,6 @@ func einoTestProviderError(w http.ResponseWriter, status int) {
 func einoRecoveryConfig(t *testing.T, retry, backup string) Config {
 	t.Helper()
 	t.Setenv("CONFIG_FILE", filepath.Join(t.TempDir(), "config.yaml"))
-	t.Setenv("EINO_CHAT_ENABLED", "true")
 	t.Setenv("EINO_MODEL_RETRY_ENABLED", retry)
 	t.Setenv("EINO_FALLBACK_MODEL", backup)
 	t.Setenv("OPENAI_MODEL", "test-model")
@@ -134,7 +133,7 @@ func TestEinoReplyPricesReportedModelWithAttemptFallback(t *testing.T) {
 				t.Fatal(err)
 			}
 			cfg := Config{
-				EinoChatEnabled: true, OpenAIModel: "test-model", EinoFallbackModel: tc.backup,
+				OpenAIModel: "test-model", EinoFallbackModel: tc.backup,
 				ModelPriceTable: priceTable,
 			}
 			server := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, i int, req openai.ChatCompletionRequest) {
