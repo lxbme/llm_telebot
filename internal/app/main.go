@@ -2093,7 +2093,7 @@ func (snap runtimeSnapshot) editOrLog(msg *tele.Message, text string) {
 	if _, err := snap.tg.Edit(msg, text); err != nil {
 		// Ignore "message not modified" – it's benign.
 		if !strings.Contains(err.Error(), "message is not modified") {
-			log.Printf("editOrLog error: %v", err)
+			log.Printf("editOrLog error: %s", snap.telegramEditError(err))
 		}
 	}
 }

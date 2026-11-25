@@ -388,7 +388,15 @@ func (snap runtimeSnapshot) editFinalResponse(msg *tele.Message, markdownText st
 			return
 		}
 		// HTML edit failed (e.g., malformed tags); fall back to plain text.
-		log.Printf("HTML edit failed, falling back to plain text: %v", err)
+		log.Printf("HTML edit failed, falling back to plain text: %s", snap.telegramEditError(err))
 	}
 	snap.editOrLog(msg, markdownText)
+}
+
+func (snap runtimeSnapshot) telegramEditError(err error) string {
+	message := err.Error()
+	if token := snap.tg.Token; token != "" {
+		message = strings.ReplaceAll(message, token, "[redacted]")
+	}
+	return message
 }
