@@ -406,11 +406,11 @@ func TestEinoReplyBotRouting(t *testing.T) {
 	for i, tt := range []struct {
 		sender *tele.User
 		final  string
-		calls  int
+		calls  []UsageCallType
 	}{
-		{sender, "legacy", 2},
-		{sender, "direct", 1},
-		{nil, "final", 2},
+		{sender, "legacy", []UsageCallType{UsageCallToolRound, UsageCallMainChat}},
+		{sender, "direct", []UsageCallType{UsageCallMainChat}},
+		{nil, "final", []UsageCallType{UsageCallToolRound, UsageCallMainChat}},
 	} {
 		id := i + 1
 		if err := b.startChatFlow(chat, tt.sender, input, false); err != nil {
@@ -428,14 +428,18 @@ func TestEinoReplyBotRouting(t *testing.T) {
 		if len(finished) != id {
 			t.Fatalf("conversation finishes = %d, want %d", len(finished), id)
 		}
-		count := 0
-		for _, usage := range einoReplyDashboardEvents(b, DashboardEventUsageRecorded) {
-			if usage.RequestID == finished[i].RequestID {
-				count++
+		var usageSummaries []string
+		for _, event := range einoReplyDashboardEvents(b, DashboardEventUsageRecorded) {
+			if event.RequestID == finished[i].RequestID {
+				usageSummaries = append(usageSummaries, event.Summary)
 			}
 		}
-		if count != tt.calls {
-			t.Errorf("request %d made %d model calls, want %d", id, count, tt.calls)
+		var wantUsage []string
+		for _, callType := range tt.calls {
+			wantUsage = append(wantUsage, fmt.Sprintf("%s prompt=7 completion=3 total=10 success=true", callType))
+		}
+		if !reflect.DeepEqual(usageSummaries, wantUsage) {
+			t.Errorf("request %d usage events = %q, want %q", id, usageSummaries, wantUsage)
 		}
 	}
 	if legacy.calls.Load() != 2 || eino.calls.Load() != 3 || toolRuns.Load() != 1 {
@@ -717,6 +721,11 @@ type einoReplyTelegram struct {
 
 func newEinoReplyTelegram(t *testing.T, onSend func(int) error) *einoReplyTelegram {
 	t.Helper()
+	return newEinoReplyTelegramForChat(t, tele.Chat{ID: 41, Type: tele.ChatPrivate}, onSend, nil)
+}
+
+func newEinoReplyTelegramForChat(t *testing.T, chat tele.Chat, onSend func(int) error, extraRoutes http.Handler) *einoReplyTelegram {
+	t.Helper()
 	tg := &einoReplyTelegram{
 		final:          make(chan einoReplyEdit, 8),
 		previewSeen:    make(chan struct{}),
@@ -728,6 +737,14 @@ func newEinoReplyTelegram(t *testing.T, onSend func(int) error) *einoReplyTelegr
 		var id string
 		switch r.URL.Path {
 		case "/bottest-token/sendMessage":
+			var send struct {
+				ChatID string `json:"chat_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&send); err != nil || send.ChatID != chat.Recipient() {
+				t.Errorf("Telegram send chat_id = %q, want %q, decode error: %v", send.ChatID, chat.Recipient(), err)
+				http.Error(w, "invalid send", http.StatusBadRequest)
+				return
+			}
 			messageID := int(messages.Add(1))
 			id = fmt.Sprint(messageID)
 			if onSend != nil {
@@ -738,12 +755,16 @@ func newEinoReplyTelegram(t *testing.T, onSend func(int) error) *einoReplyTelegr
 				}
 			}
 		case "/bottest-token/editMessageText":
-			var edit einoReplyEdit
-			if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
-				t.Errorf("decode Telegram edit: %v", err)
+			var payload struct {
+				einoReplyEdit
+				ChatID string `json:"chat_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.ChatID != chat.Recipient() {
+				t.Errorf("Telegram edit chat_id = %q, want %q, decode error: %v", payload.ChatID, chat.Recipient(), err)
 				http.Error(w, "invalid edit", http.StatusBadRequest)
 				return
 			}
+			edit := payload.einoReplyEdit
 			id = edit.MessageID
 			tg.mu.Lock()
 			tg.edits = append(tg.edits, edit)
@@ -758,11 +779,15 @@ func newEinoReplyTelegram(t *testing.T, onSend func(int) error) *einoReplyTelegr
 				tg.final <- edit
 			}
 		default:
+			if extraRoutes != nil {
+				extraRoutes.ServeHTTP(w, r)
+				return
+			}
 			t.Errorf("unexpected Telegram API request %s", r.URL.Path)
 			http.Error(w, "unexpected Telegram request", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%s,"chat":{"id":41,"type":"private"}}}`, id)
+		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%s,"chat":{"id":%d,"type":%q}}}`, id, chat.ID, chat.Type)
 	}))
 	t.Cleanup(server.Close)
 	var err error
