@@ -132,7 +132,7 @@ func TestEinoTaskRunnerUsesGlobalToolsAndRequestedContext(t *testing.T) {
 		ID: "daily", Prompt: "Summarize the archive", CronExpr: "0 8 * * *",
 		Timezone: "UTC", Context: true, Enabled: true, CreatedBy: ownerID,
 	}
-	rem := Reminder{ID: "archive", UserID: ownerID, ChatID: chatID, Prompt: "Check the archive", CreatedBy: "Alice"}
+	rem := Reminder{ID: "archive", UserID: ownerID, ChatID: chatID, Prompt: "请复核测试单 EINO-7319。", CreatedBy: "Alice"}
 	previous := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Name: "user_42", Content: "Prior archive context"}
 	model := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, round int, req openai.ChatCompletionRequest) {
 		if !req.Stream || !slices.Equal(einoReplyToolNames(req), []string{"global_lookup"}) {
@@ -144,8 +144,17 @@ func TestEinoTaskRunnerUsesGlobalToolsAndRequestedContext(t *testing.T) {
 			if len(req.Messages) > 1 && !reflect.DeepEqual(req.Messages[1], previous) {
 				t.Errorf("schedule context = %+v, want %+v", req.Messages[1], previous)
 			}
+			if len(req.Messages) != 0 && strings.Contains(req.Messages[0].Content, "deliver a scheduled reminder") {
+				t.Error("scheduled task received reminder delivery instructions")
+			}
 		case 1:
 			wantMessages, wantName, wantPrefix, wantPrompt = 2, "reminder", `[reminder id:"archive" user:"Alice" triggered_at:`, rem.Prompt
+			if len(req.Messages) == 0 || req.Messages[0].Role != openai.ChatMessageRoleSystem ||
+				!strings.Contains(req.Messages[0].Content, "deliver a scheduled reminder") ||
+				!strings.Contains(req.Messages[0].Content, "Do not perform the action") ||
+				!strings.Contains(req.Messages[0].Content, "Preserve identifiers exactly") {
+				t.Errorf("reminder system message does not define delivery and identifier preservation: %+v", req.Messages)
+			}
 		default:
 			t.Errorf("unexpected automated model request %d", round+1)
 			http.Error(w, "unexpected request", http.StatusBadRequest)

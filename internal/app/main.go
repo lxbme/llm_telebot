@@ -1628,6 +1628,10 @@ func (b *Bot) handleDocument(c tele.Context) error {
 }
 
 func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.ChatCompletionMessage, includeContext bool) error {
+	return b.startChatFlowWithInstruction(chat, sender, userMsg, includeContext, "")
+}
+
+func (b *Bot) startChatFlowWithInstruction(chat *tele.Chat, sender *tele.User, userMsg openai.ChatCompletionMessage, includeContext bool, instruction string) error {
 	if chat == nil {
 		return fmt.Errorf("chat is nil")
 	}
@@ -1644,6 +1648,9 @@ func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.C
 				systemPrompt += "\n\n=== Previous Conversation Summary ===\n" + summary
 			}
 		}
+	}
+	if instruction != "" {
+		systemPrompt += "\n\n" + instruction
 	}
 
 	messages := []openai.ChatCompletionMessage{
