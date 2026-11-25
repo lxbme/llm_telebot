@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,6 +34,8 @@ type Config struct {
 	BotUsername    string // e.g. "@mybot"
 	ContextMode    string // "at" = only @bot messages as context; "global" = all group messages as context
 	AutoDetect     bool   // true = use LLM to judge if an un-mentioned message is relevant and should trigger a reply
+
+	EinoChatEnabled bool
 
 	// Separate (optional) model config for the AUTO_DETECT relevance classifier.
 	// When empty, falls back to the main OpenAI settings above.
@@ -300,6 +303,7 @@ func loadConfig() Config {
 		SystemPrompt:                   get("SYSTEM_PROMPT", "You are a helpful assistant."),
 		ContextMaxMsgs:                 maxMsgs,
 		MaxTokens:                      maxTokens,
+		EinoChatEnabled:                strings.EqualFold(strings.TrimSpace(os.Getenv("EINO_CHAT_ENABLED")), "true"),
 		BotUsername:                    get("BOT_USERNAME", ""),
 		ContextMode:                    contextMode,
 		AutoDetect:                     autoDetect,
@@ -882,7 +886,10 @@ func (b *Bot) Run() {
 }
 
 func (b *Bot) recordUsageEvent(event UsageEvent) {
-	snap := b.snapshot()
+	b.recordUsageEventFor(b.snapshot(), event)
+}
+
+func (b *Bot) recordUsageEventFor(snap runtimeSnapshot, event UsageEvent) {
 	event.CostUSD = computeCostUSD(event, snap.cfg.ModelPriceTable)
 	if snap.stats != nil {
 		countsForQuota := event.CallType == UsageCallMainChat || event.CallType == UsageCallToolRound
@@ -1599,10 +1606,10 @@ func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.C
 	chatID := chat.ID
 	snap := b.snapshot()
 	var history []openai.ChatCompletionMessage
-	systemPrompt := snap.cfg.SystemPrompt + b.speechInstruction(chatID)
+	systemPrompt := snap.cfg.SystemPrompt + snap.speechInstruction(chatID)
 	if includeContext {
 		history = snap.store.Get(chatID)
-		systemPrompt += b.buildProfileSection(append(history, userMsg))
+		systemPrompt += snap.buildProfileSection(append(history, userMsg))
 		if snap.cfg.SummaryEnabled {
 			if summary := snap.summaries.Get(chatID); summary != "" {
 				systemPrompt += "\n\n=== Previous Conversation Summary ===\n" + summary
@@ -1616,7 +1623,7 @@ func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.C
 	messages = append(messages, history...)
 	messages = append(messages, userMsg)
 
-	placeholder, err := snap.tg.Send(chat, "⏳ Thinking…")
+	placeholder, err := snap.tg.Send(chat, replyPlaceholderText)
 	if err != nil {
 		return fmt.Errorf("failed to send placeholder: %w", err)
 	}
@@ -1633,13 +1640,20 @@ func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.C
 		RequestID: usageCtx.RequestID,
 		Summary:   truncateDashboardText(userMessageText(userMsg), 180),
 	})
-	go b.streamReply(chatID, userMsg, messages, placeholder, sender, usageCtx)
+	go b.streamReply(snap, chatID, userMsg, messages, placeholder, sender, usageCtx)
 	return nil
 }
 
 // ─── Streaming ────────────────────────────────────────────────────────────────
 
+const replyPlaceholderText = "⏳ Thinking…"
+
+const toolRoundLimitPrompt = "(You have reached the maximum number of tool calls. " +
+	"Based on the information gathered so far, please provide the best answer you can. " +
+	"If some information is uncertain or incomplete, clearly say so.)"
+
 func (b *Bot) streamReply(
+	snap runtimeSnapshot,
 	chatID int64,
 	userMsg openai.ChatCompletionMessage,
 	messages []openai.ChatCompletionMessage,
@@ -1647,7 +1661,6 @@ func (b *Bot) streamReply(
 	sender *tele.User,
 	usageCtx UsageContext,
 ) {
-	snap := b.snapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
@@ -1676,6 +1689,27 @@ func (b *Bot) streamReply(
 			messages[0].Content += section
 		}
 	}
+	var finalText string
+	if snap.cfg.EinoChatEnabled {
+		finalText = b.streamEinoReply(ctx, snap, messages, placeholder, toolView, summaryMode, usageCtx)
+	} else {
+		finalText = b.streamLegacyReply(ctx, snap, messages, placeholder, toolView, summaryMode, usageCtx)
+	}
+	if finalText != "" {
+		b.postReply(snap, chatID, userMsg, finalText, sender, placeholder.Chat, placeholder)
+	}
+}
+
+func (b *Bot) streamLegacyReply(
+	ctx context.Context,
+	snap runtimeSnapshot,
+	messages []openai.ChatCompletionMessage,
+	placeholder *tele.Message,
+	toolView *MergedToolView,
+	summaryMode bool,
+	usageCtx UsageContext,
+) string {
+	chatID := usageCtx.ChatID
 	// expandedServers tracks which MCP server groups the LLM has requested
 	// full schemas for (used in summary mode only).
 	expandedServers := map[string]bool{}
@@ -1699,10 +1733,10 @@ func (b *Bot) streamReply(
 
 			started := time.Now()
 			resp, err := snap.ai.CreateChatCompletion(ctx, req)
-			b.recordUsageEvent(usageEvent(usageCtx, UsageCallToolRound, firstNonEmpty(resp.Model, snap.cfg.OpenAIModel), false, i+1, started, &resp.Usage, err == nil))
+			b.recordUsageEventFor(snap, usageEvent(usageCtx, UsageCallToolRound, firstNonEmpty(resp.Model, snap.cfg.OpenAIModel), false, i+1, started, &resp.Usage, err == nil))
 			if err != nil {
-				b.editOrLog(placeholder, fmt.Sprintf("\u274c Error: %v", err))
-				return
+				snap.editOrLog(placeholder, fmt.Sprintf("\u274c Error: %v", err))
+				return ""
 			}
 			if len(resp.Choices) == 0 {
 				// No choices returned — fall through to streaming with accumulated context.
@@ -1724,7 +1758,7 @@ func (b *Bot) streamReply(
 					}
 				}
 				if len(toolNames) > 0 {
-					b.editOrLog(placeholder, fmt.Sprintf("\U0001f527 Calling tools: %s…", strings.Join(toolNames, ", ")))
+					snap.editOrLog(placeholder, fmt.Sprintf("\U0001f527 Calling tools: %s…", strings.Join(toolNames, ", ")))
 				}
 
 				// Execute each tool call and append the results.
@@ -1797,10 +1831,8 @@ func (b *Bot) streamReply(
 		// answer with whatever information it has gathered so far.
 		if hitMaxIter {
 			messages = append(messages, openai.ChatCompletionMessage{
-				Role: openai.ChatMessageRoleUser,
-				Content: "(You have reached the maximum number of tool calls. " +
-					"Based on the information gathered so far, please provide the best answer you can. " +
-					"If some information is uncertain or incomplete, clearly say so.)",
+				Role:    openai.ChatMessageRoleUser,
+				Content: toolRoundLimitPrompt,
 			})
 		}
 	}
@@ -1809,11 +1841,7 @@ func (b *Bot) streamReply(
 	// Streams the LLM's final response to the user. When tools were used,
 	// the messages slice now contains the full tool-call conversation, so
 	// the LLM will summarise the tool results into a natural reply.
-	finalText := b.doStream(ctx, messages, placeholder, toolView, expandedServers, summaryMode, usageCtx)
-	if finalText == "" {
-		return // error already reported by doStream
-	}
-	b.postReply(chatID, userMsg, finalText, sender, placeholder.Chat, placeholder)
+	return b.doStream(ctx, snap, messages, placeholder, toolView, expandedServers, summaryMode, usageCtx)
 }
 
 // doStream performs the streaming LLM call and returns the final text.
@@ -1823,6 +1851,7 @@ func (b *Bot) streamReply(
 // the streaming request uses the same active tool set.
 func (b *Bot) doStream(
 	ctx context.Context,
+	snap runtimeSnapshot,
 	messages []openai.ChatCompletionMessage,
 	placeholder *tele.Message,
 	toolView *MergedToolView,
@@ -1830,10 +1859,9 @@ func (b *Bot) doStream(
 	summaryMode bool,
 	usageCtx UsageContext,
 ) string {
-	snap := b.snapshot()
 	showText := true
 	if placeholder != nil && placeholder.Chat != nil {
-		showText = b.shouldSendSpeechText(placeholder.Chat.ID)
+		showText = snap.shouldSendSpeechText(placeholder.Chat.ID)
 	}
 
 	req := openai.ChatCompletionRequest{
@@ -1857,7 +1885,7 @@ func (b *Bot) doStream(
 	started := time.Now()
 	stream, err := snap.ai.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, nil, false))
+		b.recordUsageEventFor(snap, usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, nil, false))
 		b.recordDashboardEvent(DashboardEvent{
 			Type:      DashboardEventConversationError,
 			ChatID:    usageCtx.ChatID,
@@ -1867,42 +1895,13 @@ func (b *Bot) doStream(
 			Summary:   "failed to start stream",
 			Detail:    err.Error(),
 		})
-		b.editOrLog(placeholder, fmt.Sprintf("❌ Error starting stream: %v", err))
+		snap.editOrLog(placeholder, fmt.Sprintf("❌ Error starting stream: %v", err))
 		return ""
 	}
 	defer stream.Close()
 
-	var (
-		fullResponse strings.Builder
-		mu           sync.Mutex // guards fullResponse
-
-		ticker   = time.NewTicker(1500 * time.Millisecond)
-		lastSent string
-	)
-	defer ticker.Stop()
-
-	// Cancel context for ticker goroutine.
-	streamCtx, streamCancel := context.WithCancel(ctx)
-
-	// Goroutine: periodically push intermediate updates to Telegram.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			select {
-			case <-ticker.C:
-				mu.Lock()
-				current := fullResponse.String()
-				mu.Unlock()
-				if showText && current != lastSent && current != "" {
-					b.editOrLog(placeholder, current+"▌")
-					lastSent = current
-				}
-			case <-streamCtx.Done():
-				return
-			}
-		}
-	}()
+	var fullResponse strings.Builder
+	preview, stopPreview := snap.startReplyPreview(ctx, placeholder, showText)
 
 	// Main loop: consume stream tokens.
 	var streamUsage *openai.Usage
@@ -1923,20 +1922,20 @@ func (b *Bot) doStream(
 				continue
 			}
 			delta := resp.Choices[0].Delta.Content
-			mu.Lock()
-			fullResponse.WriteString(delta)
-			mu.Unlock()
+			if delta != "" {
+				fullResponse.WriteString(delta)
+				preview(fullResponse.String())
+			}
 		}
 	}()
 
 	// Stop the ticker goroutine.
-	streamCancel()
-	<-done
+	stopPreview()
 
 	finalText := fullResponse.String()
 
 	if streamErr != nil {
-		b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, false))
+		b.recordUsageEventFor(snap, usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, false))
 		b.recordDashboardEvent(DashboardEvent{
 			Type:      DashboardEventConversationError,
 			ChatID:    usageCtx.ChatID,
@@ -1950,14 +1949,14 @@ func (b *Bot) doStream(
 		if finalText != "" {
 			errMsg = finalText + "\n\n" + errMsg
 		}
-		b.editOrLog(placeholder, errMsg)
+		snap.editOrLog(placeholder, errMsg)
 		return ""
 	}
 
 	if finalText == "" {
 		finalText = buildFallbackFromMessages(messages)
 	}
-	b.recordUsageEvent(usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, true))
+	b.recordUsageEventFor(snap, usageEvent(usageCtx, UsageCallMainChat, snap.cfg.OpenAIModel, true, 0, started, streamUsage, true))
 	b.recordDashboardEvent(DashboardEvent{
 		Type:      DashboardEventConversationFinished,
 		ChatID:    usageCtx.ChatID,
@@ -1969,18 +1968,80 @@ func (b *Bot) doStream(
 		Summary:   truncateDashboardText(finalText, 200),
 	})
 
-	if showText {
-		// One final edit with the complete text, rendered as Telegram HTML.
-		b.editFinalResponse(placeholder, finalText)
-	} else {
-		b.editOrLog(placeholder, "🔊 正在发送语音…")
-	}
+	snap.editReplyResult(placeholder, finalText, showText)
 	return finalText
+}
+
+// startReplyPreview throttles Telegram edits and allows a tool round to clear
+// a text preview that is already visible. Stop it before the final edit.
+func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *tele.Message, showText bool) (update func(string), stop func()) {
+	if !showText {
+		return func(string) {}, func() {}
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	var mu sync.Mutex
+	var current string
+	var clearPending bool
+	clear := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(1500 * time.Millisecond)
+		defer ticker.Stop()
+		var lastSent string
+		for {
+			tick := false
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				tick = true
+			case <-clear:
+			}
+			mu.Lock()
+			text, reset := current, clearPending
+			clearPending = false
+			mu.Unlock()
+			if reset && lastSent != "" {
+				snap.editOrLog(placeholder, replyPlaceholderText)
+				lastSent = ""
+			}
+			if tick && text != "" && text != lastSent {
+				snap.editOrLog(placeholder, text+"▌")
+				lastSent = text
+			}
+		}
+	}()
+	return func(text string) {
+			mu.Lock()
+			current = text
+			clearPending = clearPending || text == ""
+			mu.Unlock()
+			if text == "" {
+				select {
+				case clear <- struct{}{}:
+				default:
+				}
+			}
+		}, func() {
+			cancel()
+			<-done
+		}
+}
+
+func (snap runtimeSnapshot) editReplyResult(placeholder *tele.Message, finalText string, showText bool) {
+	if showText {
+		snap.editFinalResponse(placeholder, finalText)
+	} else {
+		snap.editOrLog(placeholder, "🔊 正在发送语音…")
+	}
 }
 
 // postReply handles post-response bookkeeping: history persistence, summary
 // triggering, and profile extraction.
 func (b *Bot) postReply(
+	snap runtimeSnapshot,
 	chatID int64,
 	userMsg openai.ChatCompletionMessage,
 	finalText string,
@@ -1988,7 +2049,6 @@ func (b *Bot) postReply(
 	chat *tele.Chat,
 	placeholder *tele.Message,
 ) {
-	snap := b.snapshot()
 	// Atomically persist the user message and assistant reply as a pair
 	// so concurrent requests never interleave between them.
 	snap.store.AppendBatch(chatID, []openai.ChatCompletionMessage{
@@ -2010,7 +2070,7 @@ func (b *Bot) postReply(
 		}
 	}
 
-	b.finalizeSpeechReply(chatID, chat, sender, finalText, placeholder)
+	snap.finalizeSpeechReply(chatID, chat, sender, finalText, placeholder)
 	b.finalizeStickerReply(chatID, chat, userMsg, finalText, placeholder)
 }
 
@@ -2024,14 +2084,13 @@ func truncate(s string, maxRunes int) string {
 }
 
 // editOrLog edits a Telegram message, falling back to a log on error.
-func (b *Bot) editOrLog(msg *tele.Message, text string) {
+func (snap runtimeSnapshot) editOrLog(msg *tele.Message, text string) {
 	// Telegram has a 4096-character limit per message.
 	if len([]rune(text)) > 4096 {
 		runes := []rune(text)
 		text = string(runes[:4093]) + "…"
 	}
-	tg := b.snapshot().tg
-	if _, err := tg.Edit(msg, text); err != nil {
+	if _, err := snap.tg.Edit(msg, text); err != nil {
 		// Ignore "message not modified" – it's benign.
 		if !strings.Contains(err.Error(), "message is not modified") {
 			log.Printf("editOrLog error: %v", err)

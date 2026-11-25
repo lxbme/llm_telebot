@@ -421,24 +421,21 @@ func ffmpegInputFormat(format string) (string, error) {
 	}
 }
 
-func (b *Bot) speechInstruction(chatID int64) string {
-	snap := b.snapshot()
+func (snap runtimeSnapshot) speechInstruction(chatID int64) string {
 	if snap.speechModes == nil || !snap.speechModes.Enabled(chatID) {
 		return ""
 	}
 	return speechModePrompt
 }
 
-func (b *Bot) shouldSendSpeechText(chatID int64) bool {
-	snap := b.snapshot()
+func (snap runtimeSnapshot) shouldSendSpeechText(chatID int64) bool {
 	if snap.speechModes == nil || !snap.speechModes.Enabled(chatID) {
 		return true
 	}
 	return snap.cfg.VolcengineTTSSendText
 }
 
-func (b *Bot) sendSpeechReply(chat *tele.Chat, sender *tele.User, text string) error {
-	snap := b.snapshot()
+func (snap runtimeSnapshot) sendSpeechReply(chat *tele.Chat, sender *tele.User, text string) error {
 	if snap.tts == nil || snap.speechModes == nil || chat == nil || !snap.speechModes.Enabled(chat.ID) {
 		return nil
 	}
@@ -457,22 +454,21 @@ func (b *Bot) sendSpeechReply(chat *tele.Chat, sender *tele.User, text string) e
 	return nil
 }
 
-func (b *Bot) finalizeSpeechReply(chatID int64, chat *tele.Chat, sender *tele.User, text string, placeholder *tele.Message) {
-	snap := b.snapshot()
+func (snap runtimeSnapshot) finalizeSpeechReply(chatID int64, chat *tele.Chat, sender *tele.User, text string, placeholder *tele.Message) {
 	if chat == nil || snap.speechModes == nil || !snap.speechModes.Enabled(chatID) {
 		return
 	}
 
-	if err := b.sendSpeechReply(chat, sender, text); err != nil {
+	if err := snap.sendSpeechReply(chat, sender, text); err != nil {
 		log.Printf("[tts] telegram send error: %v", err)
-		if !b.shouldSendSpeechText(chatID) && placeholder != nil {
-			b.editFinalResponse(placeholder, text)
+		if !snap.shouldSendSpeechText(chatID) && placeholder != nil {
+			snap.editFinalResponse(placeholder, text)
 		}
 		_, _ = snap.tg.Send(chat, telegramTTSFailureReply)
 		return
 	}
 
-	if !b.shouldSendSpeechText(chatID) && placeholder != nil {
+	if !snap.shouldSendSpeechText(chatID) && placeholder != nil {
 		if err := snap.tg.Delete(placeholder); err != nil {
 			log.Printf("[tts] delete placeholder error: %v", err)
 		}

@@ -162,8 +162,7 @@ func parseJSONArray(s string) ([]string, error) {
 // buildProfileSection builds a text block describing the profiles of all users
 // who appear in the given message history. It is appended to the system prompt
 // so the LLM knows who the participants are.
-func (b *Bot) buildProfileSection(history []openai.ChatCompletionMessage) string {
-	snap := b.snapshot()
+func (snap runtimeSnapshot) buildProfileSection(history []openai.ChatCompletionMessage) string {
 	if snap.profiles == nil {
 		return ""
 	}

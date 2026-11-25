@@ -377,10 +377,10 @@ func isLooseListItem(node ast.Node) bool {
 // editFinalResponse edits the placeholder with the LLM's final Markdown
 // response, converting it to Telegram HTML.  If the HTML exceeds Telegram's
 // 4096-char limit or the API rejects it, it falls back to plain text.
-func (b *Bot) editFinalResponse(msg *tele.Message, markdownText string) {
+func (snap runtimeSnapshot) editFinalResponse(msg *tele.Message, markdownText string) {
 	htmlText := mdToTgHTML(markdownText)
 	if len([]rune(htmlText)) <= 4096 {
-		_, err := b.tg.Edit(msg, htmlText, tele.ModeHTML)
+		_, err := snap.tg.Edit(msg, htmlText, tele.ModeHTML)
 		if err == nil {
 			return
 		}
@@ -390,5 +390,5 @@ func (b *Bot) editFinalResponse(msg *tele.Message, markdownText string) {
 		// HTML edit failed (e.g., malformed tags); fall back to plain text.
 		log.Printf("HTML edit failed, falling back to plain text: %v", err)
 	}
-	b.editOrLog(msg, markdownText)
+	snap.editOrLog(msg, markdownText)
 }
