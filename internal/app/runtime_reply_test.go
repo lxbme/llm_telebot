@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	openai "github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
@@ -206,6 +208,109 @@ func TestReplyKeepsMCPGenerationAcrossReload(t *testing.T) {
 	}
 }
 
+func TestMCPClearWaitsForSamePathReload(t *testing.T) {
+	const userID = 42
+	restoreStarted := make(chan struct{})
+	resumeRestore := make(chan struct{})
+	releaseRestore := sync.OnceFunc(func() { close(resumeRestore) })
+	var lists atomic.Int32
+	personal := newReplyMCPServer(t, "personal_tool", server.WithToolFilter(func(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
+		if lists.Add(1) == 2 {
+			close(restoreStarted)
+			select {
+			case <-resumeRestore:
+			case <-ctx.Done():
+			}
+		}
+		return tools
+	}))
+	provider := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, _ int, req openai.ChatCompletionRequest) {
+		assertReplyMCPNames(t, req, "personal_tool")
+		einoModelSSE(w, einoReplyTextFrame("reply during reload"))
+		einoReplyFinish(w, "stop")
+	})
+	telegram := newEinoReplyTelegram(t, nil)
+	dir := t.TempDir()
+	cfg := Config{
+		OpenAIKey: "test-key", OpenAIModel: "test-model", OpenAIBase: provider.url + "/v1",
+		ChatDBPath: filepath.Join(dir, "chat.db"), StickerRulesPath: filepath.Join(dir, "stickers.json"),
+		UserMCPDBPath: filepath.Join(dir, "users.db"), ToolsEnabled: true, ToolsMaxIterations: 1,
+		EinoChatEnabled: true, ContextMaxMsgs: 20,
+	}
+	seedReplyUserMCP(t, cfg.UserMCPDBPath, userID, personal.url)
+	b := &Bot{cfg: Config{ChatDBPath: cfg.ChatDBPath}, store: NewHistoryStore(nil), tg: telegram.bot}
+	if err := b.applyRuntimeConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var reloadDone, clearDone, sendDone chan struct{}
+	t.Cleanup(func() {
+		releaseRestore()
+		for name, done := range map[string]chan struct{}{"reload": reloadDone, "clear": clearDone, "send": sendDone} {
+			if done != nil {
+				waitReplySignal(t, done, name+" cleanup")
+			}
+		}
+		current := b.snapshot()
+		closeToolResources(current.mcpClients, current.userTools)
+	})
+	next := cfg
+	next.MCPConfigPath = filepath.Join(dir, "new-mcp.json")
+	if err := os.WriteFile(next.MCPConfigPath, []byte(`{"mcpServers":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var reloadErr, clearErr, sendErr error
+	reloadDone = make(chan struct{})
+	go func() {
+		defer close(reloadDone)
+		reloadErr = b.applyRuntimeConfig(next)
+	}()
+	waitReplySignal(t, restoreStarted, "personal MCP restore after reading the saved config")
+
+	chat := &tele.Chat{ID: 41, Type: tele.ChatPrivate}
+	user := &tele.User{ID: userID}
+	sendDone = make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		sendErr = b.startChatFlow(chat, user, newEinoReplyMessages()[1], false)
+	}()
+	waitReplySignal(t, sendDone, "reply start during reload")
+	if sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	if edit := telegram.nextFinal(t); edit.Text != "reply during reload" {
+		t.Fatalf("unexpected reply during reload: %+v", edit)
+	}
+	waitEinoReplyHistory(t, b, chat.ID, 2)
+
+	cmd := telegram.bot.NewContext(tele.Update{Message: &tele.Message{ID: 2, Chat: chat, Sender: user, Text: "/mcp_clear"}})
+	clearStarted := make(chan struct{})
+	clearDone = make(chan struct{})
+	go func() {
+		defer close(clearDone)
+		close(clearStarted)
+		clearErr = b.handleMCPClear(cmd)
+	}()
+	waitReplySignal(t, clearStarted, "/mcp_clear start")
+	select {
+	case <-clearDone:
+		t.Error("/mcp_clear completed before the restored manager was published")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseRestore()
+	waitReplySignal(t, reloadDone, "configuration reload")
+	waitReplySignal(t, clearDone, "/mcp_clear completion")
+	if reloadErr != nil || clearErr != nil {
+		t.Fatalf("reload error = %v, clear error = %v", reloadErr, clearErr)
+	}
+	manager := b.snapshot().userTools
+	if reg := manager.GetRegistry(userID); reg != nil {
+		t.Errorf("current registry still contains %d tools after /mcp_clear", reg.Count())
+	}
+	if persisted, err := manager.store.Get(userID); err != nil || persisted != nil {
+		t.Errorf("persisted configuration after /mcp_clear = %+v, %v", persisted, err)
+	}
+}
+
 func assertReplyMCPNames(t *testing.T, req openai.ChatCompletionRequest, want ...string) {
 	t.Helper()
 	got := einoReplyToolNames(req)
@@ -221,9 +326,9 @@ type replyMCPServer struct {
 	closed chan struct{}
 }
 
-func newReplyMCPServer(t *testing.T, toolName string) replyMCPServer {
+func newReplyMCPServer(t *testing.T, toolName string, opts ...server.ServerOption) replyMCPServer {
 	t.Helper()
-	s := server.NewMCPServer(toolName, "test")
+	s := server.NewMCPServer(toolName, "test", opts...)
 	tool := einoTestMCPTool(toolName, toolName+" result", "")
 	s.AddTool(tool.info, tool.run)
 	handler := server.NewStreamableHTTPServer(s, server.WithStateful(true))

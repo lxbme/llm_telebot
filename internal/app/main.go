@@ -1156,6 +1156,19 @@ func (b *Bot) handleDisplayProfile(c tele.Context) error {
 
 // ─── MCP Management Commands ─────────────────────────────────────────────────
 
+// withPersonalMCP keeps the manager selection and use in the same critical
+// section as runtime config reload, which restores before publishing.
+func (b *Bot) withPersonalMCP(use func(*UserToolManager)) bool {
+	b.runtimeConfigMu.Lock()
+	defer b.runtimeConfigMu.Unlock()
+	manager := b.snapshot().userTools
+	if manager == nil {
+		return false
+	}
+	use(manager)
+	return true
+}
+
 func (b *Bot) handleMCPList(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
@@ -1177,16 +1190,20 @@ func (b *Bot) handleMCPDel(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
 	}
-	snap := b.snapshot()
-	if snap.userTools == nil {
+	name := strings.TrimSpace(c.Message().Payload)
+	userID := c.Sender().ID
+	var found bool
+	var err error
+	if !b.withPersonalMCP(func(manager *UserToolManager) {
+		if name != "" {
+			found, err = manager.RemoveServer(userID, name)
+		}
+	}) {
 		return c.Reply("⚠️ Tool calling is disabled.")
 	}
-	name := strings.TrimSpace(c.Message().Payload)
 	if name == "" {
 		return c.Reply("Usage: /mcp_del <server_name>\n\nUse /mcp_list to see your servers.")
 	}
-	userID := c.Sender().ID
-	found, err := snap.userTools.RemoveServer(userID, name)
 	if err != nil {
 		log.Printf("[user-mcp] remove error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to remove MCP server.")
@@ -1208,12 +1225,14 @@ func (b *Bot) handleMCPClear(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
 	}
-	snap := b.snapshot()
-	if snap.userTools == nil {
+	userID := c.Sender().ID
+	var err error
+	if !b.withPersonalMCP(func(manager *UserToolManager) {
+		err = manager.ClearAll(userID)
+	}) {
 		return c.Reply("⚠️ Tool calling is disabled.")
 	}
-	userID := c.Sender().ID
-	if err := snap.userTools.ClearAll(userID); err != nil {
+	if err != nil {
 		log.Printf("[user-mcp] clear error for user %d: %v", userID, err)
 		return c.Reply("❌ Failed to clear MCP servers.")
 	}
@@ -1258,18 +1277,25 @@ func (b *Bot) handleText(c tele.Context) error {
 	// import command rather than a normal chat message.
 	if strings.HasPrefix(text, "{") {
 		if mcpCfg, ok := TryParseMCPConfig(text); ok {
-			snap := b.snapshot()
-			if snap.userTools == nil {
+			userID := c.Sender().ID
+			var result *MCPAddResult
+			var err error
+			var rejected []string
+			if !b.withPersonalMCP(func(manager *UserToolManager) {
+				// Non-admin users may only add network-based (HTTP/SSE) MCP servers.
+				if !b.isAdmin(userID) {
+					rejected = filterCommandMCPs(mcpCfg)
+					if len(rejected) > 0 {
+						return
+					}
+				}
+				result, err = manager.AddServers(userID, mcpCfg.MCPServers)
+			}) {
 				return c.Reply("⚠️ Tool calling is disabled. Cannot import MCP servers.")
 			}
-			userID := c.Sender().ID
-			// Non-admin users may only add network-based (HTTP/SSE) MCP servers.
-			if !b.isAdmin(userID) {
-				if rejected := filterCommandMCPs(mcpCfg); len(rejected) > 0 {
-					return c.Reply(fmt.Sprintf("🚫 Only admins can add command-based (stdio) MCP servers.\nRejected: %s", strings.Join(rejected, ", ")))
-				}
+			if len(rejected) > 0 {
+				return c.Reply(fmt.Sprintf("🚫 Only admins can add command-based (stdio) MCP servers.\nRejected: %s", strings.Join(rejected, ", ")))
 			}
-			result, err := snap.userTools.AddServers(userID, mcpCfg.MCPServers)
 			if err != nil {
 				log.Printf("[user-mcp] add error for user %d: %v", userID, err)
 				return c.Reply(fmt.Sprintf("❌ Failed to add MCP servers: %v", err))

@@ -16,13 +16,16 @@ import (
 
 var mcpSummaryBucket = []byte("mcp_summaries")
 
+const mcpSummarySchemaPrefix = "schema:"
+
 type mcpSummaryEntry struct {
 	Hash    string `json:"hash"`    // SHA-256 of tool schemas to detect changes
 	Summary string `json:"summary"` // compact paragraph injected into system prompt
 }
 
 // MCPSummaryStore persists per-server summaries in the existing user_mcp.db.
-// Keys: "{prefix}:{serverName}" where prefix = "g" (global) or "u{userID}" (per-user).
+// Keys are "schema:{scope}:{serverName}:{hash}", where scope is "g" or "u{userID}".
+// Legacy keys are "{scope}:{serverName}".
 type MCPSummaryStore struct {
 	db *bolt.DB
 }
@@ -51,6 +54,18 @@ func (s *MCPSummaryStore) get(key string) (mcpSummaryEntry, bool) {
 	return entry, err == nil && entry.Hash != ""
 }
 
+func mcpSummarySchemaKey(serverKey, hash string) string {
+	return mcpSummarySchemaPrefix + serverKey + ":" + hash
+}
+
+func (s *MCPSummaryStore) getForSchema(serverKey, hash string) (mcpSummaryEntry, bool) {
+	if entry, ok := s.get(mcpSummarySchemaKey(serverKey, hash)); ok && entry.Hash == hash {
+		return entry, true
+	}
+	entry, ok := s.get(serverKey)
+	return entry, ok && entry.Hash == hash
+}
+
 func (s *MCPSummaryStore) set(key string, entry mcpSummaryEntry) {
 	_ = s.db.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists(mcpSummaryBucket)
@@ -65,7 +80,7 @@ func (s *MCPSummaryStore) set(key string, entry mcpSummaryEntry) {
 	})
 }
 
-// deleteByPrefix removes all keys that start with the given prefix string.
+// deleteByPrefix removes legacy and schema-specific entries matching a server key prefix.
 func (s *MCPSummaryStore) deleteByPrefix(prefix string) {
 	_ = s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(mcpSummaryBucket)
@@ -73,8 +88,9 @@ func (s *MCPSummaryStore) deleteByPrefix(prefix string) {
 			return nil
 		}
 		var keys [][]byte
+		schemaPrefix := mcpSummarySchemaPrefix + prefix
 		_ = b.ForEach(func(k, _ []byte) error {
-			if strings.HasPrefix(string(k), prefix) {
+			if strings.HasPrefix(string(k), prefix) || strings.HasPrefix(string(k), schemaPrefix) {
 				keys = append(keys, append([]byte{}, k...))
 			}
 			return nil
@@ -86,9 +102,12 @@ func (s *MCPSummaryStore) deleteByPrefix(prefix string) {
 	})
 }
 
-// GetSummary returns the cached summary text for a server, or "" if not found / not yet generated.
-func (s *MCPSummaryStore) GetSummary(prefix, serverName string) string {
-	entry, ok := s.get(prefix + ":" + serverName)
+// GetSummary returns the cached summary for the given tools, or "" on a cache miss.
+func (s *MCPSummaryStore) GetSummary(prefix, serverName string, tools []openai.Tool) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	entry, ok := s.getForSchema(prefix+":"+serverName, mcpToolsHash(tools))
 	if !ok {
 		return ""
 	}
@@ -148,15 +167,15 @@ func NewMCPSummaryGenerator(cfg Config, store *MCPSummaryStore) *MCPSummaryGener
 	}
 }
 
-// EnsureSummary checks the cache; regenerates if missing or stale.
+// EnsureSummary generates a summary if the tool schema is missing from the cache.
 // Designed to be called in a goroutine — runs synchronously and logs errors.
 func (g *MCPSummaryGenerator) EnsureSummary(ctx context.Context, prefix, serverName string, tools []openai.Tool) {
 	if g == nil || len(tools) == 0 {
 		return
 	}
 	hash := mcpToolsHash(tools)
-	key := prefix + ":" + serverName
-	if entry, ok := g.store.get(key); ok && entry.Hash == hash {
+	serverKey := prefix + ":" + serverName
+	if _, ok := g.store.getForSchema(serverKey, hash); ok {
 		return // cache hit
 	}
 
@@ -186,7 +205,7 @@ func (g *MCPSummaryGenerator) EnsureSummary(ctx context.Context, prefix, serverN
 		return
 	}
 	summary := strings.TrimSpace(resp.Choices[0].Message.Content)
-	g.store.set(key, mcpSummaryEntry{Hash: hash, Summary: summary})
+	g.store.set(mcpSummarySchemaKey(serverKey, hash), mcpSummaryEntry{Hash: hash, Summary: summary})
 	log.Printf("[mcp_summary] cached summary for %q (%d chars)", serverName, len(summary))
 }
 
@@ -209,9 +228,10 @@ func buildMCPSummarySection(toolView *MergedToolView, store *MCPSummaryStore, us
 	// Global servers
 	if toolView.global != nil {
 		for _, srv := range toolView.global.ServerNames() {
-			summary := store.GetSummary("g", srv)
+			tools := toolView.global.OpenAIToolsForServer(srv)
+			summary := store.GetSummary("g", srv, tools)
 			if summary == "" {
-				summary = fmt.Sprintf("**%s** (%d tools)", srv, toolView.global.CountForServer(srv))
+				summary = fmt.Sprintf("**%s** (%d tools)", srv, len(tools))
 			}
 			sb.WriteString("• " + summary + "\n")
 			wrote++
@@ -222,9 +242,10 @@ func buildMCPSummarySection(toolView *MergedToolView, store *MCPSummaryStore, us
 	if toolView.user != nil {
 		prefix := fmt.Sprintf("u%d", userID)
 		for _, srv := range toolView.user.ServerNames() {
-			summary := store.GetSummary(prefix, srv)
+			tools := toolView.user.OpenAIToolsForServer(srv)
+			summary := store.GetSummary(prefix, srv, tools)
 			if summary == "" {
-				summary = fmt.Sprintf("**%s** (%d tools)", srv, toolView.user.CountForServer(srv))
+				summary = fmt.Sprintf("**%s** (%d tools)", srv, len(tools))
 			}
 			sb.WriteString("• " + summary + " _(personal)_\n")
 			wrote++

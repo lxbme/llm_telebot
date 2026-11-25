@@ -422,9 +422,9 @@ func (m *UserToolManager) ListServers(userID int64) ([]ServerInfo, error) {
 		}
 		if reg != nil {
 			info.ToolCount = reg.CountForServer(name)
-		}
-		if m.summaryStore != nil {
-			info.Summary = m.summaryStore.GetSummary(prefix, name)
+			if m.summaryStore != nil {
+				info.Summary = m.summaryStore.GetSummary(prefix, name, reg.OpenAIToolsForServer(name))
+			}
 		}
 		infos = append(infos, info)
 	}
