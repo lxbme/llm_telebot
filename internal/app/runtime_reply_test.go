@@ -382,7 +382,8 @@ func TestReplyFinalEditCancelsBlockedPreview(t *testing.T) {
 	previewCanceled := make(chan struct{})
 	releaseHandler := make(chan struct{})
 	finalEdit := make(chan einoReplyEdit, 1)
-	var previews atomic.Int32
+	var previews, resets atomic.Int32
+	var finalized atomic.Bool
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/botpreview-test-token/sendMessage":
@@ -394,6 +395,12 @@ func TestReplyFinalEditCancelsBlockedPreview(t *testing.T) {
 				return
 			}
 			if edit.ParseMode == "" {
+				if edit.Text == replyPlaceholderText {
+					if edit.MessageID != "1" || finalized.Load() || resets.Add(1) != 1 {
+						t.Errorf("unexpected reset edit: %+v", edit)
+					}
+					break
+				}
 				if previews.Add(1) != 1 {
 					t.Errorf("unexpected edit after the blocked preview: %+v", edit)
 					http.Error(w, "unexpected edit", http.StatusBadRequest)
@@ -410,6 +417,7 @@ func TestReplyFinalEditCancelsBlockedPreview(t *testing.T) {
 				}
 				return
 			}
+			finalized.Store(true)
 			finalEdit <- edit
 		default:
 			t.Errorf("unexpected Telegram route %s", r.URL.Path)

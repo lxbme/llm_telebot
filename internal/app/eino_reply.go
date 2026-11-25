@@ -50,7 +50,7 @@ func (b *Bot) runEinoReply(
 	tools *einoToolSet,
 	usageCtx UsageContext,
 	onPreview func(string),
-	waitForPreviewReset func(),
+	waitForPreviewReset func(context.Context),
 ) (string, error) {
 	input, err := toEinoMessages(messages)
 	if err != nil {

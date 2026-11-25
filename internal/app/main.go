@@ -2015,19 +2015,22 @@ func (b *Bot) doStream(
 	return finalText
 }
 
-// startReplyPreview throttles Telegram edits and allows a tool round to clear
-// a text preview that is already visible. Recovery can wait for the reset.
-// Stop it before the final edit.
-func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *tele.Message, showText bool) (update func(string), waitForReset func(), stop func()) {
+const replyPreviewResetTimeout = 500 * time.Millisecond
+
+// startReplyPreview serializes Telegram edits. Clearing a draft cancels its
+// outstanding edit, and recovery can wait briefly for the reset. Stop joins
+// the worker before the final edit.
+func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *tele.Message, showText bool) (update func(string), waitForReset func(context.Context), stop func()) {
 	if !showText {
-		return func(string) {}, func() {}, func() {}
+		return func(string) {}, func(context.Context) {}, func() {}
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	var mu sync.Mutex
 	var current string
-	var clearPending bool
-	clear := make(chan chan struct{}, 1)
+	var cancelDraft context.CancelFunc
+	var resetDone chan struct{}
+	clear := make(chan struct{}, 1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -2036,52 +2039,71 @@ func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *
 		var lastSent string
 		for {
 			tick := false
-			var resetDone chan struct{}
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				tick = true
-			case resetDone = <-clear:
+			case <-clear:
 			}
 			mu.Lock()
-			text, reset := current, clearPending
-			clearPending = false
-			mu.Unlock()
-			if reset && lastSent != "" {
-				snap.editReplyPreview(ctx, placeholder, replyPlaceholderText)
-				lastSent = ""
-			}
 			if resetDone != nil {
+				mu.Unlock()
+				if lastSent != "" {
+					resetCtx, cancelReset := context.WithTimeout(ctx, replyPreviewResetTimeout)
+					snap.editReplyPreview(resetCtx, placeholder, replyPlaceholderText)
+					cancelReset()
+					lastSent = ""
+				}
+				mu.Lock()
 				close(resetDone)
+				resetDone = nil
+				mu.Unlock()
+				continue
 			}
-			if tick && text != "" && text != lastSent {
-				snap.editReplyPreview(ctx, placeholder, text+"▌")
-				lastSent = text
+			text := current
+			if !tick || text == "" || text == lastSent {
+				mu.Unlock()
+				continue
 			}
+			editCtx, cancelEdit := context.WithCancel(ctx)
+			cancelDraft = cancelEdit
+			mu.Unlock()
+			snap.editReplyPreview(editCtx, placeholder, text+"▌")
+			cancelEdit()
+			mu.Lock()
+			cancelDraft = nil
+			mu.Unlock()
+			lastSent = text
 		}
 	}()
 	update = func(text string) {
 		mu.Lock()
+		defer mu.Unlock()
 		current = text
-		clearPending = clearPending || text == ""
-		mu.Unlock()
-		if text == "" {
+		if text == "" && resetDone == nil {
+			resetDone = make(chan struct{})
+			if cancelDraft != nil {
+				cancelDraft()
+			}
 			select {
-			case clear <- nil:
+			case clear <- struct{}{}:
 			default:
 			}
 		}
 	}
-	waitForReset = func() {
-		resetDone := make(chan struct{})
-		select {
-		case clear <- resetDone:
-		case <-ctx.Done():
+	waitForReset = func(streamCtx context.Context) {
+		mu.Lock()
+		pending := resetDone
+		mu.Unlock()
+		if pending == nil {
 			return
 		}
+		waitCtx, cancelWait := context.WithTimeout(streamCtx, replyPreviewResetTimeout)
+		defer cancelWait()
 		select {
-		case <-resetDone:
+		case <-pending:
+		case <-waitCtx.Done():
 		case <-ctx.Done():
 		}
 	}

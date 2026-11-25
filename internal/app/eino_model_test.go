@@ -279,6 +279,23 @@ func TestEinoModelGenerateFailures(t *testing.T) {
 	}
 }
 
+func TestEinoModelGenerateRejectsIncompleteToolBatch(t *testing.T) {
+	for _, finish := range []string{"length", "content_filter"} {
+		t.Run(finish, func(t *testing.T) {
+			m, events := newEinoModelTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"model":"actual-model","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-a","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":%q}],"usage":{"prompt_tokens":6,"completion_tokens":2,"total_tokens":8}}`, finish)
+			})
+			m.retry, m.backupModel = true, "backup"
+			msg, err := m.Generate(t.Context(), nil, model.WithTools([]*schema.ToolInfo{{Name: "lookup"}}))
+			if msg != nil || !errors.Is(err, errEinoToolProtocol) {
+				t.Errorf("Generate = %#v, %v, want an invalid tool batch", msg, err)
+			}
+			einoModelAssertUsage(t, events, "actual-model", UsageCallToolRound, 1, false, false, 8)
+		})
+	}
+}
+
 func TestEinoModelGenerateFailoverRecordsOneLogicalToolRound(t *testing.T) {
 	var mu sync.Mutex
 	var attempts []string

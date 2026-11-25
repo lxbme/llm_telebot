@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,7 +13,10 @@ import (
 
 const einoModelRetryDelay = 100 * time.Millisecond
 
-type einoRequestError struct{ status int }
+type einoRequestError struct {
+	status    int
+	hardQuota bool
+}
 
 func (e einoRequestError) Error() string {
 	if e.status != 0 {
@@ -32,22 +36,46 @@ func safeEinoRequestError(ctx context.Context, err error) error {
 	case errors.Is(err, context.DeadlineExceeded):
 		return context.DeadlineExceeded
 	}
-	var apiErr *openai.APIError
-	if errors.As(err, &apiErr) {
-		return einoRequestError{status: apiErr.HTTPStatusCode}
-	}
+	// RequestError can wrap a partly decoded APIError without an HTTP status.
 	var reqErr *openai.RequestError
 	if errors.As(err, &reqErr) {
-		return einoRequestError{status: reqErr.HTTPStatusCode}
+		safe := einoRequestError{status: reqErr.HTTPStatusCode}
+		if safe.status == http.StatusTooManyRequests {
+			var body struct {
+				Error struct{ Code, Type any }
+			}
+			if json.Unmarshal(reqErr.Body, &body) == nil {
+				safe.hardQuota = einoHardQuota(body.Error.Code) || einoHardQuota(body.Error.Type)
+			}
+		}
+		return safe
+	}
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		return einoRequestError{
+			status: apiErr.HTTPStatusCode,
+			hardQuota: apiErr.HTTPStatusCode == http.StatusTooManyRequests &&
+				(einoHardQuota(apiErr.Code) || einoHardQuota(apiErr.Type)),
+		}
 	}
 	return einoRequestError{}
+}
+
+func einoHardQuota(value any) bool {
+	category, _ := value.(string)
+	switch category {
+	case "insufficient_quota", "billing_hard_limit_reached":
+		return true
+	default:
+		return false
+	}
 }
 
 func einoModelCanRecover(err error) bool {
 	if err == errEinoStreamInterrupted {
 		return true
 	}
-	if reqErr, ok := err.(einoRequestError); ok {
+	if reqErr, ok := err.(einoRequestError); ok && !reqErr.hardQuota {
 		switch reqErr.status {
 		case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
 			http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
@@ -83,7 +111,7 @@ func runEinoModelAttempts[T any](
 			}
 		}
 		if i != 0 && req.Stream && m.waitForPreviewReset != nil {
-			m.waitForPreviewReset()
+			m.waitForPreviewReset(ctx)
 		}
 		if ctx.Err() != nil {
 			return result, ctx.Err()

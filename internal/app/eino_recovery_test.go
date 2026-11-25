@@ -3,13 +3,17 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -103,6 +107,47 @@ func TestEinoReplyRecoveryPolicy(t *testing.T) {
 				if event.Model != model || event.Summary != summary || event.RequestID != "reply-test" {
 					t.Errorf("usage event %d = %+v, want %q for %q", i, event, summary, model)
 				}
+			}
+		})
+	}
+}
+
+func TestEinoReplyRecoveryStopsAtHardQuota(t *testing.T) {
+	for _, tc := range []struct {
+		name, payload string
+	}{
+		{"insufficient quota code", `{"error":{"message":"sk-provider-error-secret","type":"rate_limit_error","code":"insufficient_quota"}}`},
+		{"billing type", `{"error":{"message":"sk-provider-error-secret","type":"billing_hard_limit_reached","code":"sk-provider-error-secret"}}`},
+		{"quota code without message", `{"error":{"code":"insufficient_quota","type":"sk-provider-error-secret"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := einoRecoveryConfig(t, "true", "backup-model")
+			server := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, _ int, _ openai.ChatCompletionRequest) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				fmt.Fprint(w, tc.payload)
+			})
+			snap := server.snapshot(0)
+			snap.cfg = cfg
+			var logs bytes.Buffer
+			logOutput := log.Writer()
+			log.SetOutput(&logs)
+			t.Cleanup(func() { log.SetOutput(logOutput) })
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			b := &Bot{dashboardEvents: NewDashboardEventHub(0)}
+			reply, err := b.runEinoReply(ctx, snap, newEinoReplyMessages(), nil, einoReplyUsageContext(), nil, nil)
+			if reply != "" || err == nil || !strings.Contains(err.Error(), "HTTP status 429") {
+				t.Errorf("reply = %q, error = %v, want terminal 429", reply, err)
+			}
+			if strings.Contains(fmt.Sprint(err), einoErrorSecret) || strings.Contains(logs.String(), einoErrorSecret) {
+				t.Error("upstream error payload escaped")
+			}
+			if n := server.calls.Load(); n != 1 {
+				t.Errorf("model requests = %d, want 1", n)
+			}
+			events := einoReplyDashboardEvents(b, DashboardEventUsageRecorded)
+			if len(events) != 1 || events[0].Model != "test-model" || events[0].Success {
+				t.Errorf("usage = %+v, want one failure for the primary", events)
 			}
 		})
 	}
@@ -206,6 +251,107 @@ func TestEinoReplyRecoveryClearsTelegramAndKeepsToolSideEffectOnce(t *testing.T)
 	}
 }
 
+func TestEinoReplyRecoveryCancelsStalledTelegramEdits(t *testing.T) {
+	draftStarted := make(chan struct{})
+	draftCanceled := make(chan struct{})
+	resetCanceled := make(chan struct{})
+	backupStarted := make(chan struct{})
+	var mu sync.Mutex
+	var edits []einoReplyEdit
+	telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/bottest-token/editMessageText" {
+			t.Errorf("unexpected Telegram path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		var edit einoReplyEdit
+		if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
+			t.Errorf("decode Telegram edit: %v", err)
+			http.Error(w, "invalid edit", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		edits = append(edits, edit)
+		mu.Unlock()
+		switch edit.Text {
+		case "draft▌":
+			close(draftStarted)
+			<-r.Context().Done()
+			close(draftCanceled)
+		case replyPlaceholderText:
+			<-r.Context().Done()
+			close(resetCanceled)
+		case "<b>recovered</b>":
+			fmt.Fprint(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":41,"type":"private"}}}`)
+		default:
+			t.Errorf("unexpected Telegram edit: %+v", edit)
+			http.Error(w, "unexpected edit", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(telegram.Close)
+	tg, err := tele.NewBot(tele.Settings{URL: telegram.URL, Token: "test-token", Client: telegram.Client(), Offline: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := newEinoReplyProvider(t, func(w http.ResponseWriter, r *http.Request, i int, req openai.ChatCompletionRequest) {
+		switch {
+		case i == 0 && req.Model == "test-model":
+			w.Header().Set("Content-Length", "4096")
+			einoModelSSE(w, einoReplyTextFrame("draft"))
+			select {
+			case <-draftStarted:
+			case <-r.Context().Done():
+			}
+		case i == 1 && req.Model == "backup-model":
+			close(backupStarted)
+			einoModelSSE(w, einoReplyTextFrame("**recovered**"))
+			einoReplyFinish(w, "stop")
+		default:
+			t.Errorf("unexpected model request %d for %q", i+1, req.Model)
+			einoTestProviderError(w, http.StatusBadRequest)
+		}
+	})
+	snap := provider.snapshot(0)
+	snap.cfg = einoRecoveryConfig(t, "false", "backup-model")
+	snap.tg, snap.telegramHTTP = tg, telegram.Client()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	reply := make(chan string, 1)
+	go func() {
+		b := &Bot{}
+		placeholder := &tele.Message{ID: 1, Chat: &tele.Chat{ID: 41, Type: tele.ChatPrivate}}
+		reply <- b.streamEinoReply(ctx, snap, newEinoReplyMessages(), placeholder, nil, false, einoReplyUsageContext())
+	}()
+
+	waitReplySignal(t, draftStarted, "stalled Telegram draft")
+	select {
+	case <-backupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("backup model did not start promptly while Telegram was stalled")
+	}
+	waitReplySignal(t, draftCanceled, "canceled draft edit")
+	waitReplySignal(t, resetCanceled, "canceled reset edit")
+	select {
+	case text := <-reply:
+		if text != "**recovered**" {
+			t.Errorf("reply = %q, want the recovered answer", text)
+		}
+	case <-ctx.Done():
+		t.Fatal("stalled Telegram edits prevented the final reply")
+	}
+	want := []einoReplyEdit{
+		{MessageID: "1", Text: "draft▌"},
+		{MessageID: "1", Text: "⏳ Thinking…"},
+		{MessageID: "1", Text: "<b>recovered</b>", ParseMode: "HTML"},
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(edits, want) {
+		t.Errorf("Telegram edits = %+v, want %+v", edits, want)
+	}
+}
+
 func TestEinoReplyRecoveryStopsAtCancellationOrProtocolFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -273,6 +419,74 @@ func TestEinoReplyRecoveryStopsAtCancellationOrProtocolFailure(t *testing.T) {
 			}
 			if toolRuns.Load() != 0 || server.calls.Load() != 1 {
 				t.Errorf("MCP calls = %d, model requests = %d, want 0 and 1", toolRuns.Load(), server.calls.Load())
+			}
+		})
+	}
+}
+
+func TestEinoReplyRecoveryRespectsToolBatchFinish(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		finish      string
+		interrupted bool
+	}{
+		{name: "length with usage tail", finish: "length"},
+		{name: "filter with interrupted transport after usage tail", finish: "content_filter", interrupted: true},
+		{name: "usage tail supplies missing finish"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := einoRecoveryConfig(t, "true", "backup-model")
+			var toolRuns atomic.Int32
+			tools, err := newEinoTools(NewMergedToolView(newEinoReplyRegistry(t, &toolRuns), nil), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, i int, req openai.ChatCompletionRequest) {
+				if i == 1 && tc.finish == "" {
+					assertEinoReplyTranscript(t, req.Messages, []string{"call-a"}, false)
+					einoModelSSE(w, einoReplyTextFrame("answer"))
+					einoReplyFinish(w, "stop")
+					return
+				}
+				if i != 0 {
+					einoTestProviderError(w, http.StatusBadRequest)
+					return
+				}
+				if tc.interrupted {
+					w.Header().Set("Content-Length", "4096")
+				}
+				einoModelSSE(w, einoReplyToolFrame("call-a", "lookup", 0))
+				if tc.finish != "" {
+					einoModelSSE(w, fmt.Sprintf(`{"choices":[{"delta":{},"finish_reason":%q}]}`, tc.finish))
+				}
+				einoModelSSE(w, einoReplyUsageFrame)
+				if !tc.interrupted {
+					einoModelSSE(w, "[DONE]")
+				}
+			})
+			b := &Bot{dashboardEvents: NewDashboardEventHub(0)}
+			snap := server.snapshot(2)
+			snap.cfg = cfg
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			reply, err := b.runEinoReply(ctx, snap, newEinoReplyMessages(), tools, einoReplyUsageContext(), nil, nil)
+			wantTools, wantRequests := int32(0), int32(1)
+			wantUsage := "tool_round prompt=7 completion=3 total=10 success=false"
+			if tc.finish == "" {
+				wantTools, wantRequests = 1, 2
+				wantUsage = "tool_round prompt=7 completion=3 total=10 success=true"
+				if reply != "answer" || err != nil {
+					t.Errorf("reply = %q, error = %v, want completed answer", reply, err)
+				}
+			} else if reply != "" || !errors.Is(err, errEinoToolProtocol) {
+				t.Errorf("reply = %q, error = %v, want an invalid tool batch", reply, err)
+			}
+			if toolRuns.Load() != wantTools || server.calls.Load() != wantRequests {
+				t.Errorf("MCP calls = %d, model requests = %d, want %d and %d", toolRuns.Load(), server.calls.Load(), wantTools, wantRequests)
+			}
+			events := einoReplyDashboardEvents(b, DashboardEventUsageRecorded)
+			if len(events) != int(wantRequests) || events[0].Summary != wantUsage {
+				t.Errorf("usage = %+v, want %d event(s) starting with %q", events, wantRequests, wantUsage)
 			}
 		})
 	}

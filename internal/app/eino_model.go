@@ -34,7 +34,7 @@ type einoChatModel struct {
 	retry               bool
 	backupModel         string
 	onPreview           func(string)
-	waitForPreviewReset func()
+	waitForPreviewReset func(context.Context)
 	tools               map[string]openai.Tool
 	usageCtx            UsageContext
 	recordUsage         func(UsageEvent)
@@ -161,10 +161,10 @@ func (m *einoChatModel) streamOnce(ctx context.Context, req openai.ChatCompletio
 		}
 	}
 	defer func() {
-		m.recordCall(req, round, started, actualModel, usage, hasToolCalls, err)
 		if err != nil {
 			clearPreview()
 		}
+		m.recordCall(req, round, started, actualModel, usage, hasToolCalls, err)
 	}()
 	upstream, err := m.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
@@ -226,7 +226,7 @@ func (m *einoChatModel) streamOnce(ctx context.Context, req openai.ChatCompletio
 
 		sawChoice = true
 		choice := resp.Choices[0]
-		if choice.FinishReason != "" {
+		if choice.FinishReason != "" && !einoIncompleteToolFinish(finish) {
 			finish = choice.FinishReason
 		}
 		delta := choice.Delta
@@ -266,6 +266,9 @@ func validEinoToolCalls(calls []schema.ToolCall, finish openai.FinishReason) boo
 	if len(calls) == 0 {
 		return finish != openai.FinishReasonToolCalls
 	}
+	if einoIncompleteToolFinish(finish) {
+		return false
+	}
 	ids := make(map[string]bool, len(calls))
 	for _, call := range calls {
 		if call.ID == "" || ids[call.ID] || call.Function.Name == "" ||
@@ -277,6 +280,10 @@ func validEinoToolCalls(calls []schema.ToolCall, finish openai.FinishReason) boo
 		ids[call.ID] = true
 	}
 	return true
+}
+
+func einoIncompleteToolFinish(finish openai.FinishReason) bool {
+	return finish == openai.FinishReasonLength || finish == openai.FinishReasonContentFilter
 }
 
 func (m *einoChatModel) request(input []*schema.Message, opts []model.Option) (openai.ChatCompletionRequest, error) {
