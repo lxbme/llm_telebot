@@ -473,7 +473,8 @@ func sanitizeName(id int64) string {
 // ─── Chat History ─────────────────────────────────────────────────────────────
 
 type HistoryStore struct {
-	mu       sync.RWMutex
+	mu sync.RWMutex
+	// A nil value marks a removal that must survive restarts and DB migrations.
 	history  map[int64][]openai.ChatCompletionMessage
 	overflow map[int64][]openai.ChatCompletionMessage // messages trimmed from the sliding window
 	db       *ChatDB                                  // optional persistent backend
@@ -487,14 +488,18 @@ func NewHistoryStore(db *ChatDB) *HistoryStore {
 	}
 	// Restore persisted data on startup.
 	if db != nil {
+		restored := 0
 		for chatID, msgs := range db.LoadAllHistory() {
 			s.history[chatID] = msgs
+			if len(msgs) > 0 {
+				restored++
+			}
 		}
 		for chatID, msgs := range db.LoadAllOverflow() {
 			s.overflow[chatID] = msgs
 		}
-		if len(s.history) > 0 {
-			log.Printf("[chat-db] restored history for %d chat(s)", len(s.history))
+		if restored > 0 {
+			log.Printf("[chat-db] restored history for %d chat(s)", restored)
 		}
 	}
 	return s
@@ -547,12 +552,9 @@ func (s *HistoryStore) AppendBatch(chatID int64, msgs []openai.ChatCompletionMes
 func (s *HistoryStore) Clear(chatID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.history, chatID)
-	delete(s.overflow, chatID)
-	if s.db != nil {
-		s.db.DeleteHistory(chatID)
-		s.db.DeleteOverflow(chatID)
-	}
+	s.history[chatID] = nil
+	s.overflow[chatID] = nil
+	s.persistChat(chatID)
 }
 
 // OverflowCount returns the number of messages in the overflow buffer.
@@ -567,21 +569,9 @@ func (s *HistoryStore) DrainOverflow(chatID int64) []openai.ChatCompletionMessag
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	overflow := s.overflow[chatID]
-	delete(s.overflow, chatID)
-	if s.db != nil {
-		s.db.DeleteOverflow(chatID)
-	}
+	s.overflow[chatID] = nil
+	s.db.markOverflowDrained(chatID)
 	return overflow
-}
-
-// persistChat saves both history and overflow for a chat to the database.
-// Must be called with s.mu held.
-func (s *HistoryStore) persistChat(chatID int64) {
-	if s.db == nil {
-		return
-	}
-	s.db.SaveHistory(chatID, s.history[chatID])
-	s.db.SaveOverflow(chatID, s.overflow[chatID])
 }
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────

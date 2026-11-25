@@ -31,6 +31,9 @@ func computeCostUSD(event UsageEvent, table map[string]ModelPrice) float64 {
 		return 0
 	}
 	price, ok := lookupModelPrice(table, event.Model)
+	if !ok && event.requestedModel != "" {
+		price, ok = lookupModelPrice(table, event.requestedModel)
+	}
 	if !ok {
 		if event.Model != "" {
 			if _, loaded := unknownModelLogOnce.LoadOrStore(strings.ToLower(event.Model), struct{}{}); !loaded {

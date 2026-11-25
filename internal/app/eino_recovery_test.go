@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -107,6 +108,73 @@ func TestEinoReplyRecoveryPolicy(t *testing.T) {
 				if event.Model != model || event.Summary != summary || event.RequestID != "reply-test" {
 					t.Errorf("usage event %d = %+v, want %q for %q", i, event, summary, model)
 				}
+			}
+		})
+	}
+}
+
+func TestEinoReplyPricesReportedModelWithAttemptFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		backup      string
+		reported    string
+		extraPrices string
+		wantUSD     float64
+	}{
+		{name: "primary request price", reported: "test-model-2026-11-25", wantUSD: 1.3},
+		{name: "fallback request price with provider prefix", backup: "vendor/backup-model", reported: "backup-model-2026-11-25", wantUSD: 2.6},
+		{name: "reported model price", backup: "vendor/backup-model", reported: "backup-model-2026-11-25", extraPrices: ",backup-model-2026-11-25:500/600", wantUSD: 5.3},
+		{name: "reported model with provider prefix", reported: "vendor/test-model-2026-11-25", extraPrices: ",test-model-2026-11-25:500/600", wantUSD: 5.3},
+		{name: "reported model explicitly free", reported: "test-model-2026-11-25", extraPrices: ",test-model-2026-11-25:0/0", wantUSD: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			priceTable, err := parseModelPriceTable("test-model:100/200,backup-model:200/400" + tc.extraPrices)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := Config{
+				EinoChatEnabled: true, OpenAIModel: "test-model", EinoFallbackModel: tc.backup,
+				ModelPriceTable: priceTable,
+			}
+			server := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, i int, req openai.ChatCompletionRequest) {
+				if i == 0 && tc.backup != "" && req.Model == "test-model" {
+					einoTestProviderError(w, http.StatusServiceUnavailable)
+					return
+				}
+				if req.Model != firstNonEmpty(tc.backup, "test-model") {
+					t.Errorf("unexpected request for %q", req.Model)
+					einoTestProviderError(w, http.StatusBadRequest)
+					return
+				}
+				einoModelSSE(w,
+					fmt.Sprintf(`{"model":%q,"choices":[{"index":0,"delta":{"role":"assistant","content":"answer"},"finish_reason":"stop"}]}`, tc.reported),
+					fmt.Sprintf(`{"model":%q,"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`, tc.reported),
+					"[DONE]",
+				)
+			})
+			stats := NewStatsManager(nil)
+			t.Cleanup(func() { _ = stats.Close() })
+			b := &Bot{dashboardEvents: NewDashboardEventHub(0)}
+			snap := server.snapshot(0)
+			snap.cfg, snap.stats = cfg, stats
+			usage := einoReplyUsageContext()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if reply, err := b.runEinoReply(ctx, snap, newEinoReplyMessages(), nil, usage, nil, nil); reply != "answer" || err != nil {
+				t.Fatalf("reply = %q, error = %v", reply, err)
+			}
+			events := einoReplyDashboardEvents(b, DashboardEventUsageRecorded)
+			wantEvents := 1
+			if tc.backup != "" {
+				wantEvents++
+			}
+			if len(events) != wantEvents || !events[len(events)-1].Success || events[len(events)-1].Model != tc.reported {
+				t.Errorf("usage events = %+v, want %d with successful attempt attributed to %q", events, wantEvents, tc.reported)
+			}
+			quota := stats.GetQuotaBucket(UsageScopeUser, usage.ChatID, usage.UserID, currentLocalDate(cfg.quotaResetLocation))
+			if quota.QuotaTokens != 10 || math.Abs(quota.QuotaUSD-tc.wantUSD) > 1e-9 {
+				t.Errorf("counted quota = %d tokens and $%g, want 10 tokens and $%g", quota.QuotaTokens, quota.QuotaUSD, tc.wantUSD)
 			}
 		})
 	}

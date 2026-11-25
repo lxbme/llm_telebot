@@ -324,7 +324,9 @@ func (m *einoChatModel) recordCall(req openai.ChatCompletionRequest, logicalRoun
 	if (err == nil && hasToolCalls) || (err != nil && len(req.Tools) != 0) {
 		callType, round = UsageCallToolRound, logicalRound
 	}
-	m.recordUsage(usageEvent(m.usageCtx, callType, firstNonEmpty(actualModel, req.Model), req.Stream, round, started, usage, err == nil))
+	event := usageEvent(m.usageCtx, callType, firstNonEmpty(actualModel, req.Model), req.Stream, round, started, usage, err == nil)
+	event.requestedModel = req.Model
+	m.recordUsage(event)
 }
 
 func einoResponseMeta(finishReason openai.FinishReason, usage *openai.Usage) *schema.ResponseMeta {

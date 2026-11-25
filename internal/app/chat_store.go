@@ -80,7 +80,7 @@ func chatIDKey(chatID int64) []byte {
 
 // ─── History Persistence ─────────────────────────────────────────────────────
 
-// migrateDB copies the in-memory history before redirecting subsequent writes.
+// migrateDB copies the in-memory history, overflow and removals before redirecting writes.
 // Appends, clears and overflow drains all use the same lock.
 func (s *HistoryStore) migrateDB(db *ChatDB) error {
 	s.mu.Lock()
@@ -96,11 +96,7 @@ func (s *HistoryStore) migrateDB(db *ChatDB) error {
 		} {
 			bucket := tx.Bucket(state.bucket)
 			for chatID, messages := range state.messages {
-				data, err := json.Marshal(messages)
-				if err != nil {
-					return err
-				}
-				if err := bucket.Put(chatIDKey(chatID), data); err != nil {
+				if err := putChatMessages(bucket, chatIDKey(chatID), messages); err != nil {
 					return err
 				}
 			}
@@ -113,21 +109,34 @@ func (s *HistoryStore) migrateDB(db *ChatDB) error {
 	return nil
 }
 
-// SaveHistory persists the sliding-window message history for a chat.
-func (c *ChatDB) SaveHistory(chatID int64, msgs []openai.ChatCompletionMessage) {
-	if c == nil {
+// persistChat saves the sliding window and any known overflow state in one transaction.
+// Must be called with s.mu held.
+func (s *HistoryStore) persistChat(chatID int64) {
+	if s.db == nil {
 		return
 	}
-	data, err := json.Marshal(msgs)
-	if err != nil {
-		log.Printf("[chat-db] marshal history error for chat %d: %v", chatID, err)
-		return
-	}
-	if err := c.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(historyBucket).Put(chatIDKey(chatID), data)
+	key := chatIDKey(chatID)
+	if err := s.db.db.Update(func(tx *bolt.Tx) error {
+		if err := putChatMessages(tx.Bucket(historyBucket), key, s.history[chatID]); err != nil {
+			return err
+		}
+		if overflow, known := s.overflow[chatID]; known {
+			return putChatMessages(tx.Bucket(overflowBucket), key, overflow)
+		}
+		return nil
 	}); err != nil {
-		log.Printf("[chat-db] save history error for chat %d: %v", chatID, err)
+		log.Printf("[chat-db] save history and overflow error for chat %d: %v", chatID, err)
 	}
+}
+
+func putChatMessages(bucket *bolt.Bucket, key []byte, messages []openai.ChatCompletionMessage) error {
+	// A nil slice encodes as JSON null. The loaders retain the key with a
+	// nil slice so a removal can overwrite older messages on the next rebind.
+	data, err := json.Marshal(messages)
+	if err != nil {
+		return err
+	}
+	return bucket.Put(key, data)
 }
 
 // LoadAllHistory loads all persisted chat histories into a map.
@@ -155,39 +164,16 @@ func (c *ChatDB) LoadAllHistory() map[int64][]openai.ChatCompletionMessage {
 	return result
 }
 
-// DeleteHistory removes persisted history for a chat.
-func (c *ChatDB) DeleteHistory(chatID int64) {
-	if c == nil {
-		return
-	}
-	c.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(historyBucket).Delete(chatIDKey(chatID))
-	})
-}
-
 // ─── Overflow Persistence ────────────────────────────────────────────────────
 
-// SaveOverflow persists the overflow buffer for a chat.
-// An empty slice deletes the key.
-func (c *ChatDB) SaveOverflow(chatID int64, msgs []openai.ChatCompletionMessage) {
+func (c *ChatDB) markOverflowDrained(chatID int64) {
 	if c == nil {
-		return
-	}
-	if len(msgs) == 0 {
-		c.db.Update(func(tx *bolt.Tx) error {
-			return tx.Bucket(overflowBucket).Delete(chatIDKey(chatID))
-		})
-		return
-	}
-	data, err := json.Marshal(msgs)
-	if err != nil {
-		log.Printf("[chat-db] marshal overflow error for chat %d: %v", chatID, err)
 		return
 	}
 	if err := c.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(overflowBucket).Put(chatIDKey(chatID), data)
+		return putChatMessages(tx.Bucket(overflowBucket), chatIDKey(chatID), nil)
 	}); err != nil {
-		log.Printf("[chat-db] save overflow error for chat %d: %v", chatID, err)
+		log.Printf("[chat-db] mark overflow drained error for chat %d: %v", chatID, err)
 	}
 }
 
@@ -214,16 +200,6 @@ func (c *ChatDB) LoadAllOverflow() map[int64][]openai.ChatCompletionMessage {
 		})
 	})
 	return result
-}
-
-// DeleteOverflow removes persisted overflow for a chat.
-func (c *ChatDB) DeleteOverflow(chatID int64) {
-	if c == nil {
-		return
-	}
-	c.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(overflowBucket).Delete(chatIDKey(chatID))
-	})
 }
 
 // ─── Summary Persistence ─────────────────────────────────────────────────────

@@ -530,3 +530,92 @@ func TestChatHistoryPersistsAcrossConcurrentMigration(t *testing.T) {
 			len(history), len(overflow), len(want))
 	}
 }
+
+func TestChatHistoryRemovalsSurviveMigrationRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		restartB bool
+	}{
+		{name: "live rebind"},
+		{name: "restart before rebind", restartB: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const cleared, appended, drained, destinationOnly = 41, 42, 43, 44
+			dir := t.TempDir()
+			pathA, pathB := filepath.Join(dir, "a.db"), filepath.Join(dir, "b.db")
+			open := func(path string) *ChatDB {
+				t.Helper()
+				db, err := OpenChatDB(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = db.Close() })
+				return db
+			}
+			closeDB := func(db *ChatDB) {
+				t.Helper()
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			msg := func(content string) openai.ChatCompletionMessage {
+				return openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: content}
+			}
+			oldOverflow, oldHistory := msg("old overflow"), msg("old history")
+			newHistory := msg("new history")
+			dbA, dbB := open(pathA), open(pathB)
+			store := NewHistoryStore(dbA)
+			for _, id := range []int64{cleared, appended, drained} {
+				store.AppendBatch(id, []openai.ChatCompletionMessage{oldOverflow, oldHistory}, 1)
+			}
+			NewHistoryStore(dbB).AppendBatch(destinationOnly, []openai.ChatCompletionMessage{oldOverflow, oldHistory}, 1)
+			if err := store.migrateDB(dbB); err != nil {
+				t.Fatal(err)
+			}
+			closeDB(dbA)
+			h, o := dbB.LoadAllHistory()[destinationOnly], dbB.LoadAllOverflow()[destinationOnly]
+			if !reflect.DeepEqual(h, []openai.ChatCompletionMessage{oldHistory}) ||
+				!reflect.DeepEqual(o, []openai.ChatCompletionMessage{oldOverflow}) {
+				t.Errorf("destination-only chat lost messages: history = %v, overflow = %v", h, o)
+			}
+
+			store.Clear(cleared)
+			store.Clear(appended)
+			store.Append(appended, newHistory, 1)
+			if got := store.DrainOverflow(drained); !reflect.DeepEqual(got, []openai.ChatCompletionMessage{oldOverflow}) {
+				t.Fatalf("drained overflow = %v, want one old message", got)
+			}
+			if tc.restartB {
+				closeDB(dbB)
+				dbB = open(pathB)
+				store = NewHistoryStore(dbB)
+			}
+			dbA = open(pathA)
+			if err := store.migrateDB(dbA); err != nil {
+				t.Fatal(err)
+			}
+			closeDB(dbB)
+			closeDB(dbA)
+			store = NewHistoryStore(open(pathA))
+
+			if got := store.Get(cleared); len(got) != 0 {
+				t.Errorf("cleared history reappeared: %v", got)
+			}
+			if got := store.Get(appended); !reflect.DeepEqual(got, []openai.ChatCompletionMessage{newHistory}) {
+				t.Errorf("history after clear and append = %v, want only the new message", got)
+			}
+			if got := store.Get(drained); !reflect.DeepEqual(got, []openai.ChatCompletionMessage{oldHistory}) {
+				t.Errorf("draining overflow changed history: %v", got)
+			}
+			for _, id := range []int64{cleared, appended, drained} {
+				if got := store.OverflowCount(id); got != 0 {
+					t.Errorf("chat %d resurrected %d overflow messages", id, got)
+				}
+			}
+			store.Append(appended, msg("another message"), 1)
+			if got := store.DrainOverflow(appended); !reflect.DeepEqual(got, []openai.ChatCompletionMessage{newHistory}) {
+				t.Errorf("fresh overflow = %v, want only the new message", got)
+			}
+		})
+	}
+}
