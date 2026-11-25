@@ -130,6 +130,7 @@ func (m *einoChatModel) receiveStream(
 		usage        *openai.Usage
 		actualModel  string
 		sawChoice    bool
+		completed    bool
 		hasToolCalls bool
 		rejected     bool
 	)
@@ -153,6 +154,8 @@ func (m *einoChatModel) receiveStream(
 				return errEinoUnexpectedToolCalls
 			case !sawChoice:
 				return errEinoNoChoices
+			case !completed:
+				return io.ErrUnexpectedEOF
 			default:
 				return nil
 			}
@@ -165,6 +168,7 @@ func (m *einoChatModel) receiveStream(
 		if len(resp.Choices) != 0 {
 			sawChoice = true
 			choice := resp.Choices[0]
+			completed = completed || choice.FinishReason != ""
 			delta := choice.Delta
 			hasToolCalls = hasToolCalls || len(delta.ToolCalls) != 0
 			if len(req.Tools) == 0 && (hasToolCalls || delta.FunctionCall != nil) {
@@ -178,6 +182,7 @@ func (m *einoChatModel) receiveStream(
 				ResponseMeta:     einoResponseMeta(choice.FinishReason, resp.Usage),
 			}
 		} else if resp.Usage != nil && sawChoice {
+			completed = true
 			chunk = &schema.Message{ResponseMeta: einoResponseMeta("", resp.Usage)}
 		}
 
@@ -337,7 +342,6 @@ func fromEinoMessage(message *schema.Message) (openai.ChatCompletionMessage, err
 	}
 	for _, call := range message.ToolCalls {
 		result.ToolCalls = append(result.ToolCalls, openai.ToolCall{
-			Index:    call.Index,
 			Type:     openai.ToolType(call.Type),
 			ID:       call.ID,
 			Function: openai.FunctionCall(call.Function),

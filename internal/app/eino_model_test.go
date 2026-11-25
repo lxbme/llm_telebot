@@ -65,7 +65,7 @@ func TestEinoModelRequestCompatibility(t *testing.T) {
 				einoModelAssertPayload(t, r, fmt.Sprintf(`{"model":%q,%s,"messages":[
 					{"role":"system","content":"Keep {\"literal\": \"{value}\"} as written."},
 					{"role":"user","name":"alice","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,dGVzdA==","detail":"high"}}]},
-					{"role":"assistant","tool_calls":[{"index":4,"id":"call_4","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"x\"}"}}]},
+					{"role":"assistant","tool_calls":[{"id":"call_4","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"x\"}"}}]},
 					{"role":"tool","content":"found","tool_call_id":"call_4"},
 					{"role":"developer","name":"bot","content":"Keep roles intact."}
 				]%s}`, tc.modelName, tc.wanted, tc.tools))
@@ -189,6 +189,10 @@ func TestEinoModelStreamFailures(t *testing.T) {
 	}{
 		{name: "startup", status: http.StatusServiceUnavailable, wantErr: "upstream unavailable", tools: true},
 		{
+			name: "clean EOF before completion", wantErr: "unexpected EOF",
+			frames: []string{`{"choices":[{"delta":{"content":"partial"},"finish_reason":null}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`}, total: 2,
+		},
+		{
 			name: "malformed frame after usage", tools: true, total: 9, wantErr: "invalid character",
 			frames: []string{`{"choices":[{"delta":{"content":"partial"}}]}`, `{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}`, "{broken"},
 		},
@@ -305,7 +309,7 @@ func TestEinoModelStreamClosesConnection(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.readFirst {
-				msg, err := reader.Recv()
+				msg, err := einoModelRecvWithTimeout(t, reader)
 				if err != nil || msg.Content != "partial" {
 					t.Fatalf("first chunk = %#v, %v", msg, err)
 				}
@@ -332,13 +336,33 @@ func TestEinoModelStreamClosesConnection(t *testing.T) {
 			}
 			if tc.cancel {
 				defer reader.Close()
-				_, err := reader.Recv()
+				_, err := einoModelRecvWithTimeout(t, reader)
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("Recv after cancellation = %v, want context.Canceled", err)
 				}
 			}
 			einoModelAssertUsage(t, events, "gpt-4o-mini", UsageCallMainChat, 0, true, false, tc.total)
 		})
+	}
+}
+
+func einoModelRecvWithTimeout(t *testing.T, reader *schema.StreamReader[*schema.Message]) (*schema.Message, error) {
+	t.Helper()
+	type outcome struct {
+		message *schema.Message
+		err     error
+	}
+	result := make(chan outcome, 1)
+	go func() {
+		message, err := reader.Recv()
+		result <- outcome{message, err}
+	}()
+	select {
+	case got := <-result:
+		return got.message, got.err
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream read did not finish")
+		return nil, nil
 	}
 }
 
