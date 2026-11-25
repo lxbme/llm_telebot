@@ -390,12 +390,11 @@ func TestEinoReplyBotRouting(t *testing.T) {
 		cfg: snap.cfg, ai: snap.ai, tools: registry, userTools: userTools,
 		store: NewHistoryStore(nil), dashboardEvents: NewDashboardEventHub(0),
 	}
-	telegram := newEinoReplyTelegram(t, func(id int) {
+	telegram := newEinoReplyTelegram(t, func(id int) error {
 		if id == 1 {
-			if err := b.applyRuntimeConfig(next); err != nil {
-				t.Errorf("apply config while sending placeholder: %v", err)
-			}
+			return b.applyRuntimeConfig(next)
 		}
+		return nil
 	})
 	b.tg = telegram.bot
 	previewSeen = telegram.previewSeen
@@ -526,10 +525,11 @@ func TestEinoReplyBotSpeechMode(t *testing.T) {
 	}))
 	t.Cleanup(ttsServer.Close)
 	warningSent := make(chan struct{})
-	telegram := newEinoReplyTelegram(t, func(id int) {
+	telegram := newEinoReplyTelegram(t, func(id int) error {
 		if id == 2 {
 			close(warningSent)
 		}
+		return nil
 	})
 	snap := server.snapshot(3)
 	snap.cfg.EinoChatEnabled = true
@@ -715,7 +715,7 @@ type einoReplyTelegram struct {
 	edits          []einoReplyEdit
 }
 
-func newEinoReplyTelegram(t *testing.T, onSend func(int)) *einoReplyTelegram {
+func newEinoReplyTelegram(t *testing.T, onSend func(int) error) *einoReplyTelegram {
 	t.Helper()
 	tg := &einoReplyTelegram{
 		final:          make(chan einoReplyEdit, 8),
@@ -731,7 +731,11 @@ func newEinoReplyTelegram(t *testing.T, onSend func(int)) *einoReplyTelegram {
 			messageID := int(messages.Add(1))
 			id = fmt.Sprint(messageID)
 			if onSend != nil {
-				onSend(messageID)
+				if err := onSend(messageID); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error_code": 400, "description": err.Error()})
+					return
+				}
 			}
 		case "/bottest-token/editMessageText":
 			var edit einoReplyEdit

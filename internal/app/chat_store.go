@@ -80,6 +80,39 @@ func chatIDKey(chatID int64) []byte {
 
 // ─── History Persistence ─────────────────────────────────────────────────────
 
+// migrateDB copies the in-memory history before redirecting subsequent writes.
+// Appends, clears and overflow drains all use the same lock.
+func (s *HistoryStore) migrateDB(db *ChatDB) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := db.db.Update(func(tx *bolt.Tx) error {
+		for _, state := range []struct {
+			bucket   []byte
+			messages map[int64][]openai.ChatCompletionMessage
+		}{
+			{historyBucket, s.history},
+			{overflowBucket, s.overflow},
+		} {
+			bucket := tx.Bucket(state.bucket)
+			for chatID, messages := range state.messages {
+				data, err := json.Marshal(messages)
+				if err != nil {
+					return err
+				}
+				if err := bucket.Put(chatIDKey(chatID), data); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	s.db = db
+	return nil
+}
+
 // SaveHistory persists the sliding-window message history for a chat.
 func (c *ChatDB) SaveHistory(chatID int64, msgs []openai.ChatCompletionMessage) {
 	if c == nil {

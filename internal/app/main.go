@@ -584,6 +584,7 @@ func (s *HistoryStore) persistChat(chatID int64) {
 
 type Bot struct {
 	mu               sync.RWMutex
+	runtimeConfigMu  sync.Mutex
 	cfg              Config
 	ai               *openai.Client // main LLM client
 	detectorAI       *openai.Client // lighter model for relevance detection (may equal ai)
@@ -602,6 +603,8 @@ type Bot struct {
 	tools            *ToolRegistry     // global registered MCP tools (nil if disabled)
 	mcpClients       *MCPClientManager // global remote MCP server connections (nil if none)
 	userTools        *UserToolManager  // per-user dynamic MCP tools (nil if disabled)
+	replyTools       *replyToolGeneration
+	userMCPStores    *userMCPStorePool
 	tasks            *TaskStore
 	reminders        *ReminderStore
 	reminderAI       *openai.Client // LLM client for reminder NL parsing (may equal ai)
@@ -619,6 +622,7 @@ type Bot struct {
 	dashboardService *DashboardService
 	dashboardSSH     *DashboardSSHServer
 	tg               *tele.Bot
+	telegramHTTP     *http.Client
 }
 
 func NewBot(cfg Config) (*Bot, error) {
@@ -636,9 +640,11 @@ func NewBot(cfg Config) (*Bot, error) {
 	}
 
 	// Build Telegram bot.
+	telegramHTTP := &http.Client{Timeout: time.Minute}
 	pref := tele.Settings{
 		Token:  cfg.TelegramToken,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+		Client: telegramHTTP,
 	}
 	tgBot, err := tele.NewBot(pref)
 	if err != nil {
@@ -692,8 +698,9 @@ func NewBot(cfg Config) (*Bot, error) {
 	var userToolMgr *UserToolManager
 	var toolSummaryStore *MCPSummaryStore
 	var toolSummaryGen *MCPSummaryGenerator
+	userMCPStores := &userMCPStorePool{}
 	if cfg.ToolsEnabled {
-		umcpStore, err := NewUserMCPStore(cfg.UserMCPDBPath)
+		umcpStore, err := userMCPStores.open(cfg.UserMCPDBPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to init user MCP store: %w", err)
 		}
@@ -765,6 +772,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		tools:            toolRegistry,
 		mcpClients:       mcpManager,
 		userTools:        userToolMgr,
+		userMCPStores:    userMCPStores,
 		tasks:            NewTaskStore(chatDB),
 		reminders:        NewReminderStore(chatDB),
 		reminderAI:       reminderClient,
@@ -779,6 +787,7 @@ func NewBot(cfg Config) (*Bot, error) {
 		stickers:         stickerEngine,
 		dashboardEvents:  dashboardEvents,
 		tg:               tgBot,
+		telegramHTTP:     telegramHTTP,
 	}
 	bot.scheduler = NewTaskRunner(bot, bot.tasks)
 	bot.dashboardService = NewDashboardService(bot, dashboardEvents)
@@ -1604,7 +1613,7 @@ func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.C
 	}
 
 	chatID := chat.ID
-	snap := b.snapshot()
+	snap, toolGeneration := b.snapshotForReply()
 	var history []openai.ChatCompletionMessage
 	systemPrompt := snap.cfg.SystemPrompt + snap.speechInstruction(chatID)
 	if includeContext {
@@ -1625,6 +1634,7 @@ func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.C
 
 	placeholder, err := snap.tg.Send(chat, replyPlaceholderText)
 	if err != nil {
+		b.releaseReplyTools(toolGeneration)
 		return fmt.Errorf("failed to send placeholder: %w", err)
 	}
 
@@ -1640,7 +1650,10 @@ func (b *Bot) startChatFlow(chat *tele.Chat, sender *tele.User, userMsg openai.C
 		RequestID: usageCtx.RequestID,
 		Summary:   truncateDashboardText(userMessageText(userMsg), 180),
 	})
-	go b.streamReply(snap, chatID, userMsg, messages, placeholder, sender, usageCtx)
+	go func() {
+		defer b.releaseReplyTools(toolGeneration)
+		b.streamReply(snap, chatID, userMsg, messages, placeholder, sender, usageCtx)
+	}()
 	return nil
 }
 
@@ -2004,11 +2017,11 @@ func (snap runtimeSnapshot) startReplyPreview(ctx context.Context, placeholder *
 			clearPending = false
 			mu.Unlock()
 			if reset && lastSent != "" {
-				snap.editOrLog(placeholder, replyPlaceholderText)
+				snap.editReplyPreview(ctx, placeholder, replyPlaceholderText)
 				lastSent = ""
 			}
 			if tick && text != "" && text != lastSent {
-				snap.editOrLog(placeholder, text+"▌")
+				snap.editReplyPreview(ctx, placeholder, text+"▌")
 				lastSent = text
 			}
 		}
@@ -2083,14 +2096,17 @@ func truncate(s string, maxRunes int) string {
 	return string(r[:maxRunes]) + "\u2026"
 }
 
+func truncateTelegramMessage(text string) string {
+	// Telegram has a 4096-character limit per message.
+	if runes := []rune(text); len(runes) > 4096 {
+		return string(runes[:4093]) + "…"
+	}
+	return text
+}
+
 // editOrLog edits a Telegram message, falling back to a log on error.
 func (snap runtimeSnapshot) editOrLog(msg *tele.Message, text string) {
-	// Telegram has a 4096-character limit per message.
-	if len([]rune(text)) > 4096 {
-		runes := []rune(text)
-		text = string(runes[:4093]) + "…"
-	}
-	if _, err := snap.tg.Edit(msg, text); err != nil {
+	if _, err := snap.tg.Edit(msg, truncateTelegramMessage(text)); err != nil {
 		// Ignore "message not modified" – it's benign.
 		if !strings.Contains(err.Error(), "message is not modified") {
 			log.Printf("editOrLog error: %s", snap.telegramEditError(err))
@@ -2119,12 +2135,10 @@ func Run() {
 	if bot.profiles != nil {
 		defer bot.profiles.Close()
 	}
-	if bot.mcpClients != nil {
-		defer bot.mcpClients.Close()
-	}
-	if bot.userTools != nil {
-		defer bot.userTools.Close()
-	}
+	defer func() {
+		snap := bot.snapshot()
+		closeToolResources(snap.mcpClients, snap.userTools)
+	}()
 
 	bot.Run()
 }

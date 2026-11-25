@@ -2,9 +2,13 @@ package app
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"log"
+	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/yuin/goldmark"
@@ -373,6 +377,50 @@ func isLooseListItem(node ast.Node) bool {
 }
 
 // ─── Bot Integration ──────────────────────────────────────────────────────────
+
+// Telebot's Raw method owns its context. Send previews directly so the reply
+// can cancel a pending edit and wait for it before issuing the terminal edit.
+func (snap runtimeSnapshot) editReplyPreview(ctx context.Context, msg *tele.Message, text string) {
+	if ctx.Err() != nil {
+		return
+	}
+	messageID, chatID := msg.MessageSig()
+	payload, err := json.Marshal(map[string]string{
+		"chat_id": strconv.FormatInt(chatID, 10), "message_id": messageID, "text": truncateTelegramMessage(text),
+	})
+	if err != nil {
+		log.Print("Telegram preview edit could not encode its request")
+		return
+	}
+	url := snap.tg.URL + "/bot" + snap.tg.Token + "/editMessageText"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		log.Print("Telegram preview edit could not create its request")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := snap.telegramHTTP
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Print("Telegram preview edit request failed")
+		}
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	if ctx.Err() == nil && (err != nil || !result.OK && !strings.Contains(result.Description, "message is not modified")) {
+		log.Printf("Telegram preview edit failed (HTTP %d)", resp.StatusCode)
+	}
+}
 
 // editFinalResponse edits the placeholder with the LLM's final Markdown
 // response, converting it to Telegram HTML.  If the HTML exceeds Telegram's

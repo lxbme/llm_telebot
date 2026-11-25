@@ -23,7 +23,8 @@ var mcpBucket = []byte("user_mcp")
 // UserMCPStore persists per-user MCP server configurations in bbolt,
 // keyed by Telegram user ID. Each user's value is a JSON-encoded MCPConfig.
 type UserMCPStore struct {
-	db *bolt.DB
+	db      *bolt.DB
+	release func()
 }
 
 // NewUserMCPStore opens (or creates) the bbolt database for user MCP configs.
@@ -47,7 +48,54 @@ func NewUserMCPStore(path string) (*UserMCPStore, error) {
 
 // Close shuts down the bbolt database.
 func (s *UserMCPStore) Close() error {
+	if s.release != nil {
+		s.release()
+		return nil
+	}
 	return s.db.Close()
+}
+
+// Overlapping tool generations can use the same personal configuration DB.
+// bbolt requires a single open handle to a writable database file.
+type userMCPStorePool struct {
+	mu    sync.Mutex
+	files map[string]*userMCPStoreRef
+}
+
+type userMCPStoreRef struct {
+	store *UserMCPStore
+	refs  int
+}
+
+func (p *userMCPStorePool) open(path string) (*UserMCPStore, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ref := p.files[path]
+	if ref == nil {
+		store, err := NewUserMCPStore(path)
+		if err != nil {
+			return nil, err
+		}
+		if p.files == nil {
+			p.files = make(map[string]*userMCPStoreRef)
+		}
+		ref = &userMCPStoreRef{store: store}
+		p.files[path] = ref
+	}
+	ref.refs++
+	return &UserMCPStore{db: ref.store.db, release: sync.OnceFunc(func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		ref.refs--
+		if ref.refs == 0 {
+			_ = ref.store.Close()
+			delete(p.files, path)
+		}
+	})}, nil
 }
 
 func userKey(userID int64) []byte {
@@ -152,12 +200,12 @@ func (s *UserMCPStore) AllUserIDs() ([]int64, error) {
 // UserToolManager manages per-user MCP client connections and tool registries.
 // Each user has their own set of connected MCP servers and discovered tools.
 type UserToolManager struct {
-	mu          sync.RWMutex
-	store       *UserMCPStore
-	registries  map[int64]*ToolRegistry     // userID → personal tool registry
-	clients     map[int64]*MCPClientManager // userID → personal MCP connections
-	summaryStore *MCPSummaryStore           // nil when summary mode is disabled
-	summaryGen   *MCPSummaryGenerator       // nil when summary mode is disabled
+	mu           sync.RWMutex
+	store        *UserMCPStore
+	registries   map[int64]*ToolRegistry     // userID → personal tool registry
+	clients      map[int64]*MCPClientManager // userID → personal MCP connections
+	summaryStore *MCPSummaryStore            // nil when summary mode is disabled
+	summaryGen   *MCPSummaryGenerator        // nil when summary mode is disabled
 }
 
 // NewUserToolManager creates a new manager backed by the given store.
@@ -390,7 +438,9 @@ func (m *UserToolManager) Close() {
 	for uid := range m.clients {
 		m.disconnectUserLocked(uid)
 	}
-	m.store.Close()
+	if m.store != nil {
+		m.store.Close()
+	}
 }
 
 // ServerInfo holds display information about a configured MCP server.

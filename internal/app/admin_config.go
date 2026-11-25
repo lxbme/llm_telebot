@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -96,11 +97,16 @@ type runtimeSnapshot struct {
 	toolSummaryGen   *MCPSummaryGenerator
 	stickers         *StickerEngine
 	tg               *tele.Bot
+	telegramHTTP     *http.Client
 }
 
 func (b *Bot) snapshot() runtimeSnapshot {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	return b.snapshotLocked()
+}
+
+func (b *Bot) snapshotLocked() runtimeSnapshot {
 	return runtimeSnapshot{
 		cfg:              b.cfg,
 		ai:               b.ai,
@@ -132,6 +138,68 @@ func (b *Bot) snapshot() runtimeSnapshot {
 		toolSummaryGen:   b.toolSummaryGen,
 		stickers:         b.stickers,
 		tg:               b.tg,
+		telegramHTTP:     b.telegramHTTP,
+	}
+}
+
+// A tool generation can outlive the current runtime configuration. The bot
+// mutex protects taking a snapshot, counting its replies and retiring it.
+type replyToolGeneration struct {
+	active  int
+	cleanup func()
+}
+
+func (b *Bot) snapshotForReply() (runtimeSnapshot, *replyToolGeneration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	snap := b.snapshotLocked()
+	if snap.mcpClients == nil && snap.userTools == nil {
+		return snap, nil
+	}
+	if b.replyTools == nil {
+		b.replyTools = &replyToolGeneration{}
+	}
+	b.replyTools.active++
+	return snap, b.replyTools
+}
+
+func (b *Bot) releaseReplyTools(generation *replyToolGeneration) {
+	if generation == nil {
+		return
+	}
+	b.mu.Lock()
+	generation.active--
+	idle := generation.active == 0
+	cleanup := generation.cleanup
+	b.mu.Unlock()
+	if idle && cleanup != nil {
+		go cleanup()
+	}
+}
+
+// retireReplyToolsLocked detaches the current generation. An idle generation
+// can be closed by the caller after unlocking, otherwise its last reply does it.
+func (b *Bot) retireReplyToolsLocked() func() {
+	global, personal := b.mcpClients, b.userTools
+	generation := b.replyTools
+	b.replyTools = nil
+	if global == nil && personal == nil {
+		return nil
+	}
+	cleanup := func() { closeToolResources(global, personal) }
+	if generation != nil && generation.active > 0 {
+		generation.cleanup = cleanup
+		return nil
+	}
+	return cleanup
+}
+
+func closeToolResources(global *MCPClientManager, personal *UserToolManager) {
+	if global != nil {
+		global.Close()
+	}
+	if personal != nil {
+		personal.Close()
 	}
 }
 
@@ -1076,7 +1144,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserToolManager, *MCPSummaryStore, *MCPSummaryGenerator, error) {
+func buildToolResources(cfg Config, stores *userMCPStorePool) (*ToolRegistry, *MCPClientManager, *UserToolManager, *MCPSummaryStore, *MCPSummaryGenerator, error) {
 	if !cfg.ToolsEnabled {
 		return nil, nil, nil, nil, nil, nil
 	}
@@ -1098,7 +1166,7 @@ func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserTool
 		}
 	}
 
-	store, err := NewUserMCPStore(cfg.UserMCPDBPath)
+	store, err := stores.open(cfg.UserMCPDBPath)
 	if err != nil {
 		if mcpManager != nil {
 			mcpManager.Close()
@@ -1124,36 +1192,12 @@ func buildToolResources(cfg Config) (*ToolRegistry, *MCPClientManager, *UserTool
 	return registry, mcpManager, userTools, summaryStore, summaryGen, nil
 }
 
-func (b *Bot) persistRuntimeChatState(db *ChatDB) {
+func (b *Bot) persistRuntimeSummariesAndSchedules(db *ChatDB) {
 	if db == nil {
 		return
 	}
 
 	snap := b.snapshot()
-	if snap.store != nil {
-		snap.store.mu.RLock()
-		historyCopy := make(map[int64][]openai.ChatCompletionMessage, len(snap.store.history))
-		overflowCopy := make(map[int64][]openai.ChatCompletionMessage, len(snap.store.overflow))
-		for chatID, messages := range snap.store.history {
-			cloned := make([]openai.ChatCompletionMessage, len(messages))
-			copy(cloned, messages)
-			historyCopy[chatID] = cloned
-		}
-		for chatID, messages := range snap.store.overflow {
-			cloned := make([]openai.ChatCompletionMessage, len(messages))
-			copy(cloned, messages)
-			overflowCopy[chatID] = cloned
-		}
-		snap.store.mu.RUnlock()
-
-		for chatID, messages := range historyCopy {
-			db.SaveHistory(chatID, messages)
-		}
-		for chatID, messages := range overflowCopy {
-			db.SaveOverflow(chatID, messages)
-		}
-	}
-
 	if snap.summaries != nil {
 		snap.summaries.mu.RLock()
 		summaryCopy := make(map[int64]string, len(snap.summaries.summaries))
@@ -1186,6 +1230,8 @@ func (b *Bot) persistRuntimeChatState(db *ChatDB) {
 }
 
 func (b *Bot) applyRuntimeConfig(next Config) error {
+	b.runtimeConfigMu.Lock()
+	defer b.runtimeConfigMu.Unlock()
 	current := b.snapshot()
 
 	mainAI, detectorAI, profileAI, summaryAI, stickerAI, reminderAI, detectorModel, profileModel, summaryModel, stickerModel, reminderModel, err := buildAIResources(next)
@@ -1229,6 +1275,19 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 		}
 	}
 
+	newTTS := NewVolcengineTTSClient(next)
+	newSTT := NewSTTClient(next)
+	newStickerEngine, err := NewStickerEngine(next.StickerRulesPath)
+	if err != nil {
+		if newProfiles != nil && profilesChanged {
+			_ = newProfiles.Close()
+		}
+		if chatDBChanged {
+			_ = newChatDB.Close()
+		}
+		return fmt.Errorf("failed to load STICKER_RULES_PATH: %w", err)
+	}
+
 	toolsChanged := next.ToolsEnabled != current.cfg.ToolsEnabled ||
 		strings.TrimSpace(next.MCPConfigPath) != strings.TrimSpace(current.cfg.MCPConfigPath) ||
 		strings.TrimSpace(next.UserMCPDBPath) != strings.TrimSpace(current.cfg.UserMCPDBPath) ||
@@ -1242,7 +1301,10 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	newToolSummaryStore := current.toolSummaryStore
 	newToolSummaryGen := current.toolSummaryGen
 	if toolsChanged {
-		newTools, newMCPClients, newUserTools, newToolSummaryStore, newToolSummaryGen, err = buildToolResources(next)
+		if b.userMCPStores == nil {
+			b.userMCPStores = &userMCPStorePool{}
+		}
+		newTools, newMCPClients, newUserTools, newToolSummaryStore, newToolSummaryGen, err = buildToolResources(next, b.userMCPStores)
 		if err != nil {
 			if newProfiles != nil && profilesChanged {
 				_ = newProfiles.Close()
@@ -1254,24 +1316,23 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 		}
 	}
 
-	newTTS := NewVolcengineTTSClient(next)
-	newSTT := NewSTTClient(next)
-	newStickerEngine, err := NewStickerEngine(next.StickerRulesPath)
-	if err != nil {
-		if newProfiles != nil && profilesChanged {
-			_ = newProfiles.Close()
-		}
-		if newChatDB != nil && chatDBChanged {
+	if chatDBChanged && current.store != nil {
+		if err := current.store.migrateDB(newChatDB); err != nil {
 			_ = newChatDB.Close()
+			if newProfiles != nil && profilesChanged {
+				_ = newProfiles.Close()
+			}
+			if toolsChanged {
+				go closeToolResources(newMCPClients, newUserTools)
+			}
+			return fmt.Errorf("failed to migrate chat history: %w", err)
 		}
-		return fmt.Errorf("failed to load STICKER_RULES_PATH: %w", err)
 	}
 
 	b.mu.Lock()
 	oldChatDB := b.chatDB
 	oldProfiles := b.profiles
-	oldMCPClients := b.mcpClients
-	oldUserTools := b.userTools
+	var closeRetiredTools func()
 
 	b.cfg = next
 	b.ai = mainAI
@@ -1291,9 +1352,6 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 
 	if chatDBChanged {
 		b.chatDB = newChatDB
-		if b.store != nil {
-			b.store.db = newChatDB
-		}
 		if b.stats != nil {
 			b.stats.RebindDB(newChatDB)
 		}
@@ -1313,6 +1371,7 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	}
 
 	if toolsChanged {
+		closeRetiredTools = b.retireReplyToolsLocked()
 		b.tools = newTools
 		b.mcpClients = newMCPClients
 		b.userTools = newUserTools
@@ -1321,8 +1380,11 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	}
 	b.mu.Unlock()
 
+	if closeRetiredTools != nil {
+		go closeRetiredTools()
+	}
 	if chatDBChanged {
-		b.persistRuntimeChatState(newChatDB)
+		b.persistRuntimeSummariesAndSchedules(newChatDB)
 		if b.stats != nil {
 			_ = b.stats.Flush()
 		}
@@ -1333,15 +1395,6 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	if profilesChanged && oldProfiles != nil && oldProfiles != newProfiles {
 		_ = oldProfiles.Close()
 	}
-	if toolsChanged {
-		if oldMCPClients != nil && oldMCPClients != newMCPClients {
-			oldMCPClients.Close()
-		}
-		if oldUserTools != nil && oldUserTools != newUserTools {
-			oldUserTools.Close()
-		}
-	}
-
 	log.Printf("[config] runtime config updated")
 	b.recordDashboardEvent(DashboardEvent{
 		Type:    DashboardEventConfigReloaded,
