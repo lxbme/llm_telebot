@@ -269,7 +269,7 @@ func (r *TaskRunner) executeReminder(userID int64, rem Reminder) {
 
 	msg := buildReminderMessage(rem)
 	chat := &tele.Chat{ID: rem.ChatID}
-	if err := r.bot.startChatFlow(chat, nil, msg, false); err != nil {
+	if err := r.bot.startChatFlowWithInstruction(chat, nil, msg, false, reminderDeliveryInstruction); err != nil {
 		log.Printf("[reminder] trigger failed user=%d id=%s: %v", userID, rem.ID, err)
 		r.bot.recordDashboardEvent(DashboardEvent{
 			Type:    DashboardEventScheduleFailed,
@@ -287,6 +287,8 @@ func (r *TaskRunner) executeReminder(userID int64, rem Reminder) {
 	}
 	r.bot.reminders.CompleteFire(userID, rem.ID, time.Now().UTC())
 }
+
+const reminderDeliveryInstruction = `Your task is to deliver a scheduled reminder to the recipient now. The text after the [reminder] metadata line is what the recipient should be reminded to do. Address the recipient directly in the same language as that text. Preserve identifiers exactly, including case, digits, and punctuation. Do not perform the action, call tools, offer advice, or ask follow-up questions. Return only the brief reminder message.`
 
 // buildReminderMessage wraps the reminder prompt in a tagged user message so
 // the LLM knows it was triggered by the reminder subsystem rather than a real
