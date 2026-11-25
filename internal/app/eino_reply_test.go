@@ -313,9 +313,12 @@ func TestEinoReplyBotRouting(t *testing.T) {
 	var toolRuns atomic.Int32
 	registry := newEinoReplyRegistry(t, &toolRuns)
 	legacy := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, round int, req openai.ChatCompletionRequest) {
-		if req.Model != "legacy-model" || req.Messages[0].Content != "old prompt" ||
+		if req.Model != "legacy-model" || !strings.HasPrefix(req.Messages[0].Content, "old prompt\n\n") ||
 			!reflect.DeepEqual(einoReplyToolNames(req), []string{"lookup", "personal"}) {
 			t.Errorf("legacy request used the wrong snapshot: %+v", req)
+		}
+		if !strings.Contains(req.Messages[0].Content, "Do not use Markdown tables") {
+			t.Error("legacy request lacks Telegram formatting instructions")
 		}
 		switch {
 		case round == 0 && !req.Stream:
@@ -333,6 +336,10 @@ func TestEinoReplyBotRouting(t *testing.T) {
 	eino := newEinoReplyProvider(t, func(w http.ResponseWriter, r *http.Request, round int, req openai.ChatCompletionRequest) {
 		if !req.Stream || req.Model != "eino-model" || !strings.HasPrefix(req.Messages[0].Content, "fresh prompt {literal}") {
 			t.Errorf("Eino request used the wrong snapshot: %+v", req)
+		}
+		if !strings.Contains(req.Messages[0].Content, "Do not use Markdown tables") ||
+			!strings.Contains(req.Messages[0].Content, "bullet list") {
+			t.Error("Eino request lacks instructions to use a bullet list instead of a table")
 		}
 		switch round {
 		case 0:

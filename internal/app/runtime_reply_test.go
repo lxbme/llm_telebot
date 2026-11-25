@@ -62,7 +62,7 @@ func TestReplyKeepsMCPGenerationAcrossReload(t *testing.T) {
 			}
 
 			oldProvider := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, round int, req openai.ChatCompletionRequest) {
-				if tt.failPlaceholder || req.Model != "old-model" || req.Messages[0].Content != "old prompt" {
+				if tt.failPlaceholder || req.Model != "old-model" || !strings.HasPrefix(req.Messages[0].Content, "old prompt\n\n") {
 					t.Errorf("unexpected old-model request: %+v", req)
 				}
 				switch round {
@@ -96,7 +96,7 @@ func TestReplyKeepsMCPGenerationAcrossReload(t *testing.T) {
 				}
 			})
 			newProvider := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, _ int, req openai.ChatCompletionRequest) {
-				if req.Model != "new-model" || req.Messages[0].Content != "new prompt" || !req.Stream {
+				if req.Model != "new-model" || !strings.HasPrefix(req.Messages[0].Content, "new prompt\n\n") || !req.Stream {
 					t.Errorf("unexpected new-model request: %+v", req)
 				}
 				assertReplyMCPNames(t, req, "new_global", newPersonalName)
