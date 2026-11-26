@@ -113,8 +113,8 @@ func runEinoModelAttempts[T any](
 		if i != 0 && req.Stream && m.waitForPreviewReset != nil {
 			m.waitForPreviewReset(ctx)
 		}
-		if ctx.Err() != nil {
-			return result, ctx.Err()
+		if err := checkRoleReplyUse(ctx); err != nil {
+			return result, err
 		}
 		wire := req
 		wire.Model, wire.MaxTokens = name, 0

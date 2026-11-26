@@ -152,14 +152,22 @@ func currentLocalDate(loc *time.Location) string {
 // has exceeded any of their configured daily limits. Admins always pass.
 // Callers should short-circuit the request when ok is false.
 func (b *Bot) checkDailyQuota(userID, chatID int64) (string, bool) {
-	snap := b.snapshot()
+	return b.snapshot().dailyQuotaAt(userID, chatID, time.Now())
+}
+
+func (b *Bot) backgroundQuota(userID, chatID int64, now time.Time) bool {
+	_, allowed := b.snapshot().dailyQuotaAt(userID, chatID, now)
+	return allowed
+}
+
+func (snap runtimeSnapshot) dailyQuotaAt(userID, chatID int64, now time.Time) (string, bool) {
 	userTokenLimit := snap.cfg.UserDailyTokenLimit
 	userUSDLimit := snap.cfg.UserDailyUSDLimit
 	chatTokenLimit := snap.cfg.ChatDailyTokenLimit
 	if userTokenLimit <= 0 && userUSDLimit <= 0 && chatTokenLimit <= 0 {
 		return "", true
 	}
-	if b.isAdmin(userID) {
+	if snap.cfg.isAdmin(userID) {
 		return "", true
 	}
 	if snap.stats == nil {
@@ -169,7 +177,7 @@ func (b *Bot) checkDailyQuota(userID, chatID int64) (string, bool) {
 	if loc == nil {
 		loc = time.UTC
 	}
-	localDate := currentLocalDate(loc)
+	localDate := now.In(loc).Format("20060102")
 
 	if userID != 0 && (userTokenLimit > 0 || userUSDLimit > 0) {
 		bucket := snap.stats.GetQuotaBucket(UsageScopeUser, 0, userID, localDate)
@@ -210,17 +218,19 @@ func (b *Bot) handleQuotaReset(c tele.Context) error {
 	if sender == nil {
 		return nil
 	}
-	if !b.isAdmin(sender.ID) {
-		return c.Reply("🚫 Only admins can reset quota.")
-	}
+	return b.replyAsAdmin(c, "🚫 Only admins can reset quota.", func(snap runtimeSnapshot) string {
+		return quotaResetReply(snap, sender.ID, c.Chat().ID, c.Message().Payload)
+	})
+}
 
-	args := strings.Fields(strings.TrimSpace(c.Message().Payload))
+func quotaResetReply(snap runtimeSnapshot, senderID, currentChatID int64, payload string) string {
+	args := strings.Fields(payload)
 	if len(args) == 0 {
-		return c.Reply("用法：\n" +
+		return "用法：\n" +
 			"/quota_reset me              重置你自己的今日配额\n" +
 			"/quota_reset here            重置当前聊天的今日配额\n" +
 			"/quota_reset user <user_id>  重置指定用户\n" +
-			"/quota_reset chat <chat_id>  重置指定聊天")
+			"/quota_reset chat <chat_id>  重置指定聊天"
 	}
 
 	var (
@@ -232,41 +242,40 @@ func (b *Bot) handleQuotaReset(c tele.Context) error {
 	switch strings.ToLower(args[0]) {
 	case "me":
 		scope = UsageScopeUser
-		userID = sender.ID
+		userID = senderID
 		label = fmt.Sprintf("user %d (me)", userID)
 	case "here":
 		scope = UsageScopeChat
-		chatID = c.Chat().ID
+		chatID = currentChatID
 		label = fmt.Sprintf("chat %d (here)", chatID)
 	case "user":
 		if len(args) < 2 {
-			return c.Reply("Usage: /quota_reset user <user_id>")
+			return "Usage: /quota_reset user <user_id>"
 		}
 		id, err := strconv.ParseInt(args[1], 10, 64)
 		if err != nil {
-			return c.Reply(fmt.Sprintf("❌ Invalid user ID: %q", args[1]))
+			return fmt.Sprintf("❌ Invalid user ID: %q", args[1])
 		}
 		scope = UsageScopeUser
 		userID = id
 		label = fmt.Sprintf("user %d", userID)
 	case "chat":
 		if len(args) < 2 {
-			return c.Reply("Usage: /quota_reset chat <chat_id>")
+			return "Usage: /quota_reset chat <chat_id>"
 		}
 		id, err := strconv.ParseInt(args[1], 10, 64)
 		if err != nil {
-			return c.Reply(fmt.Sprintf("❌ Invalid chat ID: %q", args[1]))
+			return fmt.Sprintf("❌ Invalid chat ID: %q", args[1])
 		}
 		scope = UsageScopeChat
 		chatID = id
 		label = fmt.Sprintf("chat %d", chatID)
 	default:
-		return c.Reply(fmt.Sprintf("❌ Unknown target %q. Valid: me, here, user, chat", args[0]))
+		return fmt.Sprintf("❌ Unknown target %q. Valid: me, here, user, chat", args[0])
 	}
 
-	snap := b.snapshot()
 	if snap.stats == nil {
-		return c.Reply("❌ Stats subsystem not available.")
+		return "❌ Stats subsystem not available."
 	}
 	evicted := snap.stats.ResetQuota(scope, chatID, userID)
 
@@ -288,11 +297,11 @@ func (b *Bot) handleQuotaReset(c tele.Context) error {
 		}
 	}
 
-	log.Printf("[quota] reset by admin %d: %s evicted=%v", sender.ID, label, evicted)
+	log.Printf("[quota] reset by admin %d: %s evicted=%v", senderID, label, evicted)
 	if evicted {
-		return c.Reply(fmt.Sprintf("✅ Quota reset for %s. The counter is back to zero for today.", label))
+		return fmt.Sprintf("✅ Quota reset for %s. The counter is back to zero for today.", label)
 	}
-	return c.Reply(fmt.Sprintf("ℹ️ No active counter for %s today — nothing to reset.", label))
+	return fmt.Sprintf("ℹ️ No active counter for %s today — nothing to reset.", label)
 }
 
 // localDateToUTCStamps returns the set of UTC "YYYYMMDD" stamps that could

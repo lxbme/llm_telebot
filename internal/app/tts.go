@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os/exec"
 	"regexp"
@@ -29,6 +31,7 @@ const (
 	defaultTTSSampleRate    = 24000
 	speechModePrompt        = "\n\n=== Speech Mode Instruction ===\nAnswer the user briefly and directly in plain natural language that is easy to listen to. Avoid markdown tables, long lists, code blocks, and unnecessary preamble unless the user explicitly asks for detail."
 	telegramTTSFailureReply = "⚠️ 语音合成失败，本次仅发送文本回复。"
+	maxTTSTextRunes         = 1200
 )
 
 var (
@@ -84,6 +87,7 @@ type VolcengineTTSClient struct {
 type ttsResponse struct {
 	Audio  []byte
 	Format string
+	Text   string
 }
 
 type volcengineSSEPayload struct {
@@ -298,39 +302,33 @@ func (c *VolcengineTTSClient) Synthesize(ctx context.Context, uid, text string) 
 	return &ttsResponse{
 		Audio:  audioBuf.Bytes(),
 		Format: c.audioFormat,
+		Text:   text,
 	}, nil
 }
 
-func (c *VolcengineTTSClient) SendTelegramVoice(ctx context.Context, bot *tele.Bot, chat *tele.Chat, uid, text string) error {
-	if bot == nil || chat == nil {
-		return fmt.Errorf("telegram bot or chat is nil")
-	}
-
+func (c *VolcengineTTSClient) telegramVoice(ctx context.Context, uid, text string) ([]byte, string, error) {
 	resp, err := c.Synthesize(ctx, uid, text)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 
 	voiceData, err := transcodeToTelegramVoice(ctx, resp.Audio, resp.Format)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-
-	voice := &tele.Voice{
-		File: tele.FromReader(bytes.NewReader(voiceData)),
-		MIME: "audio/ogg",
-	}
-	_, err = bot.Send(chat, voice)
-	return err
+	return voiceData, resp.Text, nil
 }
 
 func normalizeTextForTTS(text string) string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return ""
+	text = formatTextForTTS(text)
+	if runes := []rune(text); len(runes) > maxTTSTextRunes {
+		text = string(runes[:maxTTSTextRunes]) + "。"
 	}
+	return text
+}
 
-	text = strings.ReplaceAll(text, "\r\n", "\n")
+func formatTextForTTS(text string) string {
+	text = telegramLineEndings(strings.TrimSpace(text))
 	text = codeBlockRE.ReplaceAllString(text, "")
 	text = markdownLinkRE.ReplaceAllString(text, "$1")
 	text = headingRE.ReplaceAllString(text, "")
@@ -338,16 +336,13 @@ func normalizeTextForTTS(text string) string {
 	text = quoteMarkerRE.ReplaceAllString(text, "")
 	text = inlineFormatRE.ReplaceAllString(text, "")
 	text = strings.ReplaceAll(text, "|", " ")
+	return normalizeSpeechWhitespace(text)
+}
+
+func normalizeSpeechWhitespace(text string) string {
 	text = multiSpaceRE.ReplaceAllString(text, " ")
 	text = multiNewlineRE.ReplaceAllString(text, "\n\n")
-	text = strings.TrimSpace(text)
-
-	const maxRunes = 1200
-	runes := []rune(text)
-	if len(runes) > maxRunes {
-		text = string(runes[:maxRunes]) + "。"
-	}
-	return text
+	return strings.TrimSpace(text)
 }
 
 func isNullJSON(raw json.RawMessage) bool {
@@ -435,42 +430,113 @@ func (snap runtimeSnapshot) shouldSendSpeechText(chatID int64) bool {
 	return snap.cfg.VolcengineTTSSendText
 }
 
-func (snap runtimeSnapshot) sendSpeechReply(chat *tele.Chat, sender *tele.User, text string) error {
-	if snap.tts == nil || snap.speechModes == nil || chat == nil || !snap.speechModes.Enabled(chat.ID) {
-		return nil
+type speechReplyResult struct {
+	text   string
+	spoken bool
+	err    error
+}
+
+func (snap runtimeSnapshot) finalizeSpeechReply(
+	turn RoleTurn,
+	chat *tele.Chat,
+	sender *tele.User,
+	text string,
+	placeholder *tele.Message,
+	textDelivered bool,
+	editFallback func(allowed func() bool) (string, error),
+) (result speechReplyResult) {
+	if chat == nil || snap.speechModes == nil || !snap.speechModes.Enabled(turn.ChatID) {
+		return result
 	}
 
 	uid := strconv.FormatInt(chat.ID, 10)
 	if sender != nil {
 		uid = strconv.FormatInt(sender.ID, 10)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(turn.generation, 2*time.Minute)
 	defer cancel()
-
-	if err := snap.tts.SendTelegramVoice(ctx, snap.tg, chat, uid, text); err != nil {
-		return err
+	if err := turn.checkUse(ctx); err != nil {
+		result.err = err
+		return result
 	}
-	return nil
+	allowed := func() bool { return turn.checkUse(ctx) == nil }
+	replacePlaceholder := !textDelivered && placeholder != nil
+	var voice []byte
+	var spokenText string
+	var err error
+	if snap.tts != nil {
+		voice, spokenText, err = snap.tts.telegramVoice(ctx, uid, text)
+	}
+	if !turn.withCurrent(func() {
+		if result.err = turn.checkUse(ctx); result.err != nil {
+			return
+		}
+		if err == nil && voice != nil {
+			err = snap.sendSpeechVoice(ctx, chat.ID, voice)
+			if err == nil {
+				result.text, result.spoken = spokenText, true
+			} else if errors.Is(err, errTelegramDeliveryUnknown) {
+				result.err = err
+				return
+			}
+		}
+		if err != nil {
+			log.Printf("[tts] telegram send error: %v", err)
+			if replacePlaceholder {
+				if editFallback != nil {
+					result.text, result.err = editFallback(allowed)
+				} else {
+					result.text = snap.editFinalResponse(placeholder, text, allowed)
+				}
+			}
+			if allowed() {
+				_, _ = snap.tg.Send(chat, telegramTTSFailureReply)
+			}
+			return
+		}
+
+		if replacePlaceholder {
+			if err := snap.tg.Delete(placeholder); err != nil {
+				log.Printf("[tts] delete placeholder error: %v", err)
+			}
+		}
+	}) {
+		result.err = ctx.Err()
+	}
+	return result
 }
 
-func (snap runtimeSnapshot) finalizeSpeechReply(chatID int64, chat *tele.Chat, sender *tele.User, text string, placeholder *tele.Message) {
-	if chat == nil || snap.speechModes == nil || !snap.speechModes.Enabled(chatID) {
-		return
+func (snap runtimeSnapshot) sendSpeechVoice(ctx context.Context, chatID int64, voice []byte) error {
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
+		return err
 	}
-
-	if err := snap.sendSpeechReply(chat, sender, text); err != nil {
-		log.Printf("[tts] telegram send error: %v", err)
-		if !snap.shouldSendSpeechText(chatID) && placeholder != nil {
-			snap.editFinalResponse(placeholder, text)
+	// Match the Bot API upload used by the previous Telegram adapter.
+	part, err := form.CreateFormFile("voice", "")
+	if err != nil {
+		return err
+	}
+	if _, err := part.Write(voice); err != nil {
+		return err
+	}
+	if err := form.Close(); err != nil {
+		return err
+	}
+	response, err := snap.telegramRequest(ctx, "sendVoice", form.FormDataContentType(), &body)
+	if err != nil {
+		return errTelegramDeliveryUnknown
+	}
+	if !response.OK {
+		if response.Code >= 400 && response.Code < 500 {
+			return fmt.Errorf("Telegram rejected voice delivery (%d)", response.Code)
 		}
-		_, _ = snap.tg.Send(chat, telegramTTSFailureReply)
-		return
+		return errTelegramDeliveryUnknown
 	}
-
-	if !snap.shouldSendSpeechText(chatID) && placeholder != nil {
-		if err := snap.tg.Delete(placeholder); err != nil {
-			log.Printf("[tts] delete placeholder error: %v", err)
-		}
+	var sent tele.Message
+	if json.Unmarshal(response.Result, &sent) != nil || sent.ID <= 0 || sent.Chat == nil ||
+		sent.Chat.ID != chatID || sent.Voice == nil || sent.Voice.FileID == "" {
+		return errTelegramDeliveryUnknown
 	}
+	return nil
 }

@@ -101,7 +101,7 @@ func TestReplyKeepsMCPGenerationAcrossReload(t *testing.T) {
 
 			placeholderStarted := make(chan struct{})
 			unblock := make(chan struct{})
-			telegram := newEinoReplyTelegram(t, func(id int) error {
+			telegram := newEinoReplyTelegramForChat(t, tele.Chat{ID: userID, Type: tele.ChatPrivate}, func(id int) error {
 				if id == 1 {
 					close(placeholderStarted)
 					<-unblock
@@ -110,7 +110,7 @@ func TestReplyKeepsMCPGenerationAcrossReload(t *testing.T) {
 					}
 				}
 				return nil
-			})
+			}, nil)
 			var unblockOnce sync.Once
 			releasePlaceholder := func() { unblockOnce.Do(func() { close(unblock) }) }
 			t.Cleanup(releasePlaceholder)
@@ -133,7 +133,7 @@ func TestReplyKeepsMCPGenerationAcrossReload(t *testing.T) {
 					current.mcpClients.Close()
 				}
 			})
-			chat := &tele.Chat{ID: 41, Type: tele.ChatPrivate}
+			chat := &tele.Chat{ID: userID, Type: tele.ChatPrivate}
 			user := &tele.User{ID: userID}
 			message := newEinoReplyMessages()[1]
 			oldSend := make(chan error, 1)
@@ -223,7 +223,7 @@ func TestMCPClearWaitsForSamePathReload(t *testing.T) {
 		einoModelSSE(w, einoReplyTextFrame("reply during reload"))
 		einoReplyFinish(w, "stop")
 	})
-	telegram := newEinoReplyTelegram(t, nil)
+	telegram := newEinoReplyTelegramForChat(t, tele.Chat{ID: userID, Type: tele.ChatPrivate}, nil, nil)
 	dir := t.TempDir()
 	cfg := Config{
 		OpenAIKey: "test-key", OpenAIModel: "test-model", OpenAIBase: provider.url + "/v1",
@@ -260,7 +260,7 @@ func TestMCPClearWaitsForSamePathReload(t *testing.T) {
 	}()
 	waitReplySignal(t, restoreStarted, "personal MCP restore after reading the saved config")
 
-	chat := &tele.Chat{ID: 41, Type: tele.ChatPrivate}
+	chat := &tele.Chat{ID: userID, Type: tele.ChatPrivate}
 	user := &tele.User{ID: userID}
 	sendDone = make(chan struct{})
 	go func() {

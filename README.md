@@ -7,7 +7,8 @@
 - **流式回复** — 实时编辑消息，逐步展示 LLM 的生成内容，无需等待完整回复
 - **多轮对话上下文** — 滑动窗口记忆最近 N 条消息，支持连续对话
 - **动态对话摘要** — 当对话超出滑动窗口时，自动将更早的对话压缩为摘要，赋予 LLM 更长的记忆能力
-- **用户画像提取** — 从对话中自动提取用户兴趣、职业等标签，注入系统提示词让 LLM 了解对话对象
+- **角色记忆** — 从互动中学习和修订记忆，按当前聊天和受众提供上下文
+- **主动闲聊与长期跟踪** — 空闲时由当前角色决定是否开口，通过已配置的后台来源核实进度，把有依据的更新发给约定受众
 - **群聊支持** — 通过 @机器人 触发回复，自动识别并剥离 @mention
 - **上下文模式**
   - `at` 模式：仅记录 @机器人 的消息作为上下文
@@ -37,7 +38,7 @@
 
 ### 前置要求
 
-- Go 1.21+
+- Go 1.25.1+
 - 一个 Telegram Bot Token（从 [@BotFather](https://t.me/BotFather) 获取）
 - 一个 OpenAI 兼容 API Key
 
@@ -190,6 +191,7 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 
 - `-i` 指向的是与你写入 `authorized_keys` 的那条公钥相对应的私钥
 - 用户名只是 SSH 会话字段，占位即可，例如 `dashboard`
+- Dashboard 使用独立的 SSH 公钥认证。`ADMIN_ID` 可以留空。生效名单中有一项为 `*` 时，Dashboard 会停止监听并断开现有连接。
 - 如果通过 Docker/Podman 运行，需要 compose 暴露 `23234:23234`，项目中的两个 compose 文件已包含该映射
 
 ### TUI 快捷键
@@ -442,9 +444,9 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `ADMIN_ID` | — | 管理员用户 ID 列表，逗号分隔。设为 `*` 表示所有用户均为管理员 |
+| `ADMIN_ID` | — | 逗号分隔的明确 Telegram 管理员用户 ID，留空表示没有 Telegram 管理员 |
 
-> **容器化场景：** 当 bot 运行在 Docker 容器中时，stdio MCP 子进程也在容器内执行，天然具有沙箱隔离。此时可安全地设置 `ADMIN_ID=*` 允许所有用户添加 command-based MCP 服务器。
+`/admin` 拒绝保存包含 `*` 的管理员名单。如果启动或重载时生效的环境变量或 YAML 配置仍含通配符，Bot 会停用所有管理入口、现有管理编辑会话、管理员配额豁免和 SSH Dashboard。普通对话和用户的个人操作继续按原访问规则运行。在生效的配置源中改为明确的 Telegram 用户 ID，再重载或重启即可恢复管理。
 
 ### 自动检测独立模型（可选）
 
@@ -456,25 +458,48 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 | `AUTO_DETECT_API_KEY` | `OPENAI_API_KEY` | 检测模型的 API Key |
 | `AUTO_DETECT_MODEL` | `OPENAI_MODEL` | 检测模型名称（推荐使用 `gpt-4o-mini` 等轻量模型） |
 
-### 用户画像提取（可选）
+### 角色记忆（Memory Book）
 
-自动从对话中提取用户的兴趣、职业、位置等标签，存入本地 bbolt 数据库。提取结果会注入到系统提示词中，帮助 LLM 了解对话对象。
+角色由当前 `SYSTEM_PROMPT` 定义，新一轮对话会采用热更新后的设定。角色在普通回复后评估本轮是否值得长期记住，学习结果存入 `CHAT_DB_PATH`。私聊事实默认只用于本人私聊，群内事实默认只用于原群。对同一 Telegram 用户的熟悉程度可以延续到其他聊天。普通群消息不会加载个人 MCP 工具。本人可按下文的个人 MCP 群查询流程授权指定工具和参数。
+
+用户可以在对话中补充或纠正记忆。在私聊中使用 Telegram 的跨聊天回复功能引用自己在超级群里发过的原消息，即可同时纠正由该事件产生的群内推断。要把某条私聊结论用于指定群，在本人私聊发送 `/memory_share <群 ID> <结论原文>`。Bot 会核实群组和本人群成员身份。`/memory_unshare` 使用相同参数撤回授权。撤回影响以后的记忆读取，群中已经发出的消息仍在 Telegram 聊天记录中。
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `PROFILE_ENABLED` | `true` | 是否启用用户画像提取 |
-| `PROFILE_DB_PATH` | `./data/profiles.db` | bbolt 数据库文件路径 |
-| `PROFILE_EXTRACT_EVERY` | `3` | 每 N 次 bot 回复触发一次后台提取（另有 2 分钟冷却） |
-| `PROFILE_API_BASE` | `OPENAI_API_BASE` | 画像提取模型的 API 地址 |
-| `PROFILE_API_KEY` | `OPENAI_API_KEY` | 画像提取模型的 API Key |
-| `PROFILE_MODEL` | `OPENAI_MODEL` | 画像提取模型名称（推荐轻量模型） |
+| `PROFILE_ENABLED` | `true` | 新部署默认开启自动学习。已有配置中的 `false` 继续关闭自动学习和旧画像命令。已存记忆仍按受众可见。 |
+| `PROFILE_DB_PATH` | `./data/profiles.db` | 旧画像数据库，保留本人私聊的 `/displayp` 与 `/clearp`。旧画像不进入角色提示。 |
+| `PROFILE_EXTRACT_EVERY` | `3` | 兼容旧配置，旧提取间隔已停用。角色评估每次完成的合格对话，一次最多记一条，同时最多八次后台评估。 |
+| `PROFILE_API_BASE` | `OPENAI_API_BASE` | 角色记忆评估模型的 API 地址 |
+| `PROFILE_API_KEY` | `OPENAI_API_KEY` | 角色记忆评估模型的 API Key |
+| `PROFILE_MODEL` | `OPENAI_MODEL` | 角色记忆评估模型名称 |
+
+### 主动闲聊与长期跟踪
+
+角色沿用当前 `SYSTEM_PROMPT`。可以用普通对话提出或调整关注，群聊中可以 @机器人 发起对话。角色会说明它能承接的部分和更新的去向。示例：
+
+- 「等上游把修复 #41 发进稳定版，我就能撤补丁了。」部署者配置了对应的只读发布源时，角色可以记下这一关注。来源需要能够证明正式发布且该版本包含 #41。合入和预览进度可以作为观察依据，同一来源的同一版本按约定受众去重。
+- 「等发行说明重写了 请私聊我。」更新只会发到发起人的私聊。Bot 需要能进入该私聊，并验证来源群及发起人的访问权限。仅靠个人白名单能在某个群里与 Bot 对话时，后台活动仍需要这个群本身可用。
+- 「帮项目组盯稳定版，发到这个群，再拉代码跑验证。」已配置发布源时可以承接通知。后台只支持配置好的读源和已授权的日历创建。群成员可对共同事项提议「只报稳定版」。个人事项、账号和明确约定的管理范围按实际 Telegram 身份核验。
+- 「我下周有一场手术。」角色可在原私聊安排一次适时的关心。默认至少等七天，明确的日期可用来安排其他时间。结果以本人回复为准。
+
+| 在对话中说 | 生效的范围 |
+|---|---|
+| 「这周少找我闲聊，发布照常告诉我」 | 私聊的主动闲聊。群员也可以提出「本群这周少主动闲聊」，由角色按本群语境裁决 |
+| 「这个聊天先别推跟踪更新」 | 当前会话的跟踪通知。后台仍可核实和执行已承接的动作 |
+| 「这件事先留意，这周别推消息」 | 指定事项的通知。恢复时重新核实只读结果，持续关注会合并仍有意义的更新。一次性关注若尚未投递且旧结果已失效，会继续等待新变化 |
+| 「这件事暂停」或「恢复这项跟踪」 | 暂停或按原约恢复该事项的检查、已承接动作和发送 |
+| 「我们换库了，这个不用再盯了」 | 结束匹配的关注及其后续动作，保留已发生的结果 |
+
+**频率与访问。** 私聊需要至少两条 Bot 实际收到的本人消息，空闲 12 小时后才考虑搭话。群需要观察至少两位成员的三条消息，空闲 48 小时后才考虑。角色可以保持安静，通常至多每天考虑一次。同会话两次主动开口至少间隔 72 小时，上一次未获回应就保持安静。在群内回复本 Bot 或用完整用户名提及它可解除等待。设为「减少」会拉长考虑间隔，设为「关闭」会停止主动闲聊。群隐私模式决定 Telegram 送达哪些消息，`CONTEXT_MODE=global` 可将 Bot 已收到的普通群消息加入原群上下文。旧部署在升级后收到新互动，才会建立主动闲聊所需的状态。
+
+**运行条件。** 请持久化 `CHAT_DB_PATH`，机器人重启后会记住会话冷却、事项偏好和投递结果。后台发布或活动检查通常间隔一分钟，受 Bot 在线状态、来源、模型和配额影响。群自主活动只计入群会话，明确委托按原发起人和执行会话计费。主动文字投递由 Telegram 返回对应聊天及实际正文后确认。结果不明的尝试会保留待核实状态，重启后不会自动重发。原有 `/remind` 定时提醒照约投递。`ADMIN_ID=*` 关闭管理入口，普通会话仍可用自然语言调整自己的偏好和跟踪事项。
 
 ### 对话摘要（自动长期记忆）
 
 当滑动窗口溢出时，溢出的消息不会丢失，而是被后台 LLM 调用压缩成一段摘要。每次发给 LLM 的上下文结构为：
 
 ```
-[系统提示词 + 用户画像 + 历史摘要] + [滑窗内原始对话] + [当前用户消息]
+[角色设定] + [受众可见记忆与本聊天摘要] + [滑窗内原始对话] + [当前用户消息]
 ```
 
 | 环境变量 | 默认值 | 说明 |
@@ -497,7 +522,7 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 |---|---|---|
 | `TOOLS_ENABLED` | `false` | 是否启用工具调用 |
 | `TOOLS_MAX_ITERATIONS` | `5` | 每次请求最多允许的工具调用轮数（防止无限循环） |
-| `MCP_CONFIG_PATH` | — | 全局 MCP 服务器 JSON 配置文件路径 |
+| `MCP_CONFIG_PATH` | — | 全局 MCP 服务器 JSON 配置文件路径。仅替换同路径文件后，重启 Bot 或触发工具连接重建才会读取新内容。更改配置路径会触发重建。 |
 | `USER_MCP_DB_PATH` | `./data/user_mcp.db` | 用户动态 MCP 配置的 bbolt 数据库路径 |
 
 **全局配置文件示例** (`mcp_config.json`)：
@@ -530,9 +555,38 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 | `sse` | Server-Sent Events | `url`，可选 `headers` |
 | `stdio` | 标准输入输出子进程 | `command`，可选 `args`、`env` |
 
+#### 后台发布与日历来源
+
+开启 `TOOLS_ENABLED` 并在 `MCP_CONFIG_PATH` 配置可以后台读取的全局 HTTP/SSE MCP 工具。为每个全局后台来源设置稳定、非空的 `backgroundIdentity`。同一来源重启后沿用原标识；更换来源时使用新标识并重新承接委托。下例中的来源标识、URL、工具名与仓库请替换为部署值。
+
+```json
+{
+  "mcpServers": {
+    "upstream": {
+      "type": "streamablehttp",
+      "url": "https://mcp.example.org/mcp",
+      "backgroundIdentity": "upstream-releases-v1",
+      "background": {
+        "list_releases": {
+          "operation": "release.list",
+          "target": "owner/project",
+          "arguments": {"repository": "owner/project"}
+        }
+      }
+    }
+  }
+}
+```
+
+`release.list` 和 `event.list` 接受 MCP `structuredContent` 或一段 JSON 文本，形如 `{"events":[{"id":"v2.0.0","title":"Stable v2.0.0","summary":"Stable release includes fix #41","url":"https://example.org/releases/v2.0.0"}]}`。请用稳定的版本或活动 ID，返回目前仍可据此通知的条目。发布源应明确提供发布渠道和修复包含关系。活动可带 RFC3339 的 `start` 和 `end`。
+
+个人日历创建需要本人在私聊导入 HTTP/SSE MCP，给对应工具设置 `"operation":"calendar.create"`、目标日历和固定的 `{"calendarId":"工作日历ID"}` 参数。工具还需接受活动的 `title`、`start`、`end`。只在本人明确委托、当时连接可用且只承接一次符合条件的活动时创建。成功回包应包含活动 `id` 和 `calendarId`。只有连接明确支持 `idempotencyKey` 的写入去重时才应设置 `idempotent: true`。群聊和兴趣关注不能以用户身份写入日历。接入新工具后，已有委托按原承接范围履行，需要扩约时请重新说明。
+
+日历写入前会按原约核实来源，活动必须尚未开始。如果服务对重放请求返回 `not_applied`，较早发出但没有回执的写入仍会显示为待确认。只有已登记的幂等连接可以在活动开始前用原参数和原键重放。各次请求都已确认未写入时，Bot 会重新查源再决定是否创建。状态提示单独记录送达结果。确认创建后，Bot 只补发仍可重试的正式通知。
+
 #### 动态 Per-User MCP
 
-每个用户可以在聊天中导入自己专属的 MCP 服务器。**用户的 MCP 工具只对该用户可见**，不同用户互不干扰。配置持久化存储在 bbolt 中，重启后自动恢复连接。
+每个用户可以在聊天中导入自己专属的 MCP 服务器。个人工具按账号隔离，默认在本人的私聊中可用。服务器配置保存在 bbolt，重启后按当前权限恢复连接。
 
 **导入方式**：直接向 bot 发送一条 JSON 消息即可：
 
@@ -551,6 +605,8 @@ ssh -i ~/.ssh/id_ed25519 -p 23234 dashboard@127.0.0.1
 ```
 
 Bot 会自动识别 JSON 格式并导入，返回确认消息。可多次发送以追加或更新服务器配置。
+
+要在指定群里查询并分享个人网络工具的结果，先在本人私聊发送 `/mcp_share <群 ID> <工具名> <JSON 参数>`。通过群成员核验后，由本人在该群发送 `/mcp_use <工具名> <JSON 参数>`，使用与授权一致的参数。回到私聊发送 `/mcp_unshare <群 ID> <工具名>` 可撤回授权。重启或重建该工具连接后需要重新授权。
 
 **管理命令**：
 
@@ -723,7 +779,7 @@ bot 复用现有 `internal/app/stats.go` 的 usage 管线，在其上层叠加�
 行为细节：
 
 - 配额判断只看 `main_chat` + `tool_round`（即用户可见的对话轮次）。`summary` / `profile_extract` / `relevance_check` / `sticker_strategy` / `reminder_parse` 等后台调用**不**计入配额上限，但**仍**写入 Dashboard 的 USD 总额（你支付的就该被看见）
-- 管理员（`ADMIN_ID` 列表中的用户或 `ADMIN_ID=*` 时的全部用户）**始终绕过**配额检查
+- `ADMIN_ID` 明确列出的管理员可绕过配额检查。生效名单中有一项为 `*` 时，所有用户都适用配额限制。
 - 超额后的处理：handleText / handleVoice / handlePhoto / handleDocument 四个入口在 `isAllowed` 之后、真正发起下载或 LLM 调用之前立即短路，返回中文友好提示（`💳 本日个人 token 配额已用完…`），**不**触发 LLM 请求、**不**扣链路消耗。正在进行中的流式回复不会被中断
 - Dashboard 的 **Today USD / Month USD** 两张卡按 `QUOTA_RESET_TZ` 计算起止时间，`SumDailyRange` 仅扫描 `usage_daily` 下 `scope=chat` 的聚合避免跨 scope 重复计入
 - **历史 USD 不回填**：部署前写入的 `usage_daily` 行没有 `cost_usd` 字段，反序列化时视为 0。"Month USD" 卡片标注 *since deploy* 以避免因价格随时间变化导致的重算失真
@@ -744,11 +800,13 @@ bot 复用现有 `internal/app/stats.go` 的 usage 管线，在其上层叠加�
 | 命令 | 说明 |
 |---|---|
 | `/start` | 显示欢迎信息 |
-| `/clear` | 清除当前对话的上下文历史和摘要 |
+| `/clear` | 清除当前聊天的历史、待摘要内容和摘要，并使清空前启动的对话工作失效。长期记忆保留。 |
 | `/summary` | 查看当前对话的摘要内容 |
 | `/speach [on\|off\|toggle\|status]` | 管理员切换当前聊天的 TTS 模式 |
-| `/displayp` | 查看自己的用户画像 |
-| `/clearp` | 清除自己的用户画像 |
+| `/displayp` | 在本人私聊查看旧画像 |
+| `/clearp` | 在本人私聊清除旧画像 |
+| `/memory list [游标]`、`show <ID> [分段]`、`edit <ID> <版本> <结论>`、`delete <ID> <版本>` | 管理员本人私聊管理原始记忆 |
+| `/memory_share <群 ID> <结论原文>`、`/memory_unshare <群 ID> <结论原文>` | 在本人私聊确认或撤回指定群的单条结论授权 |
 | `/sticker [status\|reload\|<label/alias>]` | 贴纸命令：查看状态、重载规则（仅管理员）、或按标签手动发送 |
 | `/mcp_list` | 查看个人 MCP 服务器列表 |
 | `/mcp_del <name>` | 删除指定 MCP 服务器 |
@@ -775,8 +833,8 @@ clear - 清除当前对话上下文和摘要
 summary - 查看当前对话摘要
 speech - 切换当前聊天的语音模式
 sticker - 查看贴纸状态或发送贴纸
-displayp - 查看自己的用户画像
-clearp - 清除自己的用户画像
+displayp - 在本人私聊查看旧画像
+clearp - 在本人私聊清除旧画像
 mcp_list - 查看个人 MCP 服务器列表
 mcp_del - 删除指定 MCP 服务器
 mcp_clear - 清空个人 MCP 服务器
@@ -807,7 +865,7 @@ admin - 管理员配置面板
             ├─ STT 未配置 → 静默忽略
             ├─ 下载 OGG/OPUS 流 → STT API (/v1/audio/transcriptions)
             ├─ STT_DISPLAY=true → 回复 🎙️ <转写内容>
-            └─ 以转写文本构建 userMsg → startChatFlow() （与文字消息完全相同的后续流程）
+            └─ 以转写文本构建 userMsg → startRoleReply()
 
 用户图片 → handlePhoto()
             ├─ 权限检查: isAllowed()
@@ -815,7 +873,7 @@ admin - 管理员配置面板
             ├─ 群聊: 检查 caption 中的 @mention（或 AUTO_DETECT 判定相关）
             ├─ 下载最大尺寸原图 → 校验大小不超过 VISION_MAX_IMAGE_BYTES
             ├─ 嗅探 MIME → base64 编码 → data URL
-            └─ 构建 MultiContent userMsg [text + image_url] → startChatFlow()
+            └─ 构建 MultiContent userMsg [text + image_url] → startRoleReply()
 
 用户文档 → handleDocument()
             ├─ 权限检查: isAllowed()
@@ -826,7 +884,7 @@ admin - 管理员配置面板
             ├─ 文本提取: PDF → pdftotext (stdin/stdout, 30s 超时)
             │                其余 → UTF-8 读取（非法字节替换为 U+FFFD）
             ├─ 按 rune 硬截断到 DOCUMENT_MAX_TEXT_CHARS
-            └─ 构建 userMsg（Content 含文件元信息 + 截断文本）→ startChatFlow()
+            └─ 构建 userMsg（Content 含文件元信息 + 截断文本）→ startRoleReply()
 
 用户消息 → handleText()
             ├─ 权限检查: isAllowed()
@@ -844,18 +902,12 @@ admin - 管理员配置面板
                      └─ 未被 @ → CONTEXT_MODE=global 时存入上下文，不回复
 
 处理流程:
-  1. 快照当前上下文 (snapshot)
-  2. 注入用户画像 + 对话摘要到系统提示词
-  3. 构建 [system_prompt + 摘要 + 画像 + snapshot + user_msg] 发送给 LLM
-  4. 合并工具视图: 全局工具 + 用户个人 MCP 工具 → MergedToolView
-  5. 若启用工具调用 → 非流式请求，LLM 可能返回 tool_calls
-     ├─ 有 tool_calls → 执行工具（全局或用户专属），将结果追加到消息，循环回步骤 5
-     └─ 无 tool_calls → 进入流式路径
-  6. 流式接收 LLM 最终回复，每 1.5s 更新 Telegram 消息
-  7. 完成后原子追加 [user_msg, assistant_reply] 到历史
-  8. 若溢出消息 ≥ SUMMARY_MIN_OVERFLOW → 后台触发摘要压缩
-  9. 若满足提取条件 → 后台触发用户画像提取
- 10. 执行 `finalizeSpeechReply()` 与 `finalizeStickerReply()` 收尾（按配置发送语音/贴纸）
+  1. 从 Telegram 更新取得真实发送者和聊天，读取本轮角色设定。
+  2. 按受众和授权筛选 Memory Book 条目，再选出相关记忆。
+  3. 将角色设定作为系统消息，将可见记忆和本聊天摘要作为参考资料，附上近期历史和当前消息。
+  4. Eino 按本轮权限提供工具，执行角色选择的调用并把结果交回模型。
+  5. 按会话设置投递文字、语音或贴纸。将用户消息和已送达的回复正文写入本聊天历史。
+  6. 有待摘要的历史且达到阈值时更新摘要。对符合学习条件的本轮发言，后台评估是否更新 Memory Book。
 ```
 
 ## 技术依赖

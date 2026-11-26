@@ -15,6 +15,7 @@ require (
 	github.com/sashabaranov/go-openai v1.41.2
 	github.com/xuri/excelize/v2 v2.10.1
 	go.etcd.io/bbolt v1.4.3
+	golang.org/x/crypto v0.48.0
 	gopkg.in/telebot.v3 v3.3.8
 )
 
@@ -71,7 +72,6 @@ require (
 	github.com/xuri/nfp v0.0.2-0.20250530014748-2ddeb826f9a9 // indirect
 	github.com/yargevad/filepathx v1.0.0 // indirect
 	golang.org/x/arch v0.11.0 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
 	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/text v0.34.0 // indirect

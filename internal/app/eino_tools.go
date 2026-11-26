@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -45,15 +46,6 @@ func newEinoTools(view *MergedToolView, summaryMode bool) (*einoToolSet, error) 
 		set.expanded = make(map[string]bool)
 		set.serverNames = view.ServerNames()
 		set.summaryGroups = make(map[string]string)
-		for _, group := range set.serverNames {
-			for _, definition := range view.OpenAIToolsForServer(group) {
-				name := definition.Function.Name
-				// An identically named personal tool may belong to a different group.
-				if remote, ok := canonical[name].(*MCPRemoteTool); ok && remote.serverName == group {
-					set.summaryGroups[name] = group
-				}
-			}
-		}
 		if err := set.addTool(getToolDetailsVirtualTool, nil); err != nil {
 			return nil, err
 		}
@@ -64,6 +56,9 @@ func newEinoTools(view *MergedToolView, summaryMode bool) (*einoToolSet, error) 
 			continue
 		}
 		registered := canonical[name]
+		if remote, ok := registered.(*MCPRemoteTool); summaryMode && ok {
+			set.summaryGroups[name] = remote.serverName
+		}
 		definition := openai.Tool{
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
@@ -182,15 +177,40 @@ func (s *einoToolSet) expandGroups(input string) string {
 type einoTool struct {
 	set        *einoToolSet
 	info       *schema.ToolInfo
-	registered MCPTool // nil for the virtual group expansion tool
+	registered MCPTool // nil for application-local tools
+	local      func(context.Context, string) (string, error)
 }
 
 func (t *einoTool) Info(context.Context) (*schema.ToolInfo, error) {
 	return t.info, nil
 }
 
-func (t *einoTool) InvokableRun(ctx context.Context, args string, _ ...tool.Option) (string, error) {
-	if err := ctx.Err(); err != nil {
+type einoToolPayloadsKey struct{}
+
+type einoToolPayloads struct {
+	mu         sync.Mutex
+	scheduled  bool
+	hasPayload bool
+	results    []mcpToolOutput
+}
+
+func (p *einoToolPayloads) add(output string, hasPayload bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.hasPayload = p.hasPayload || hasPayload
+	if p.scheduled && strings.TrimSpace(output) != "" {
+		p.results = append(p.results, mcpToolOutput{text: output, hasPayload: hasPayload})
+	}
+}
+
+func (p *einoToolPayloads) snapshot() (bool, []mcpToolOutput) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.hasPayload, slices.Clone(p.results)
+}
+
+func (t *einoTool) InvokableRun(ctx context.Context, args string, _ ...tool.Option) (output string, runErr error) {
+	if err := checkRoleReplyUse(ctx); err != nil {
 		return "", err
 	}
 	name := t.info.Name
@@ -200,7 +220,23 @@ func (t *einoTool) InvokableRun(ctx context.Context, args string, _ ...tool.Opti
 	if !allowed {
 		return unknownEinoTool(ctx, name, args)
 	}
+	var hasPayload bool
+	if payloads, ok := ctx.Value(einoToolPayloadsKey{}).(*einoToolPayloads); ok && (!payloads.scheduled || t.registered != nil) {
+		// Evaluate after command revocation and cancellation have had a
+		// chance to replace the result.
+		defer func() {
+			if runErr == nil && ctx.Err() == nil {
+				payloads.add(output, hasPayload)
+			}
+		}()
+	}
+	if t.local != nil {
+		output, runErr = t.local(ctx, args)
+		hasPayload = strings.TrimSpace(output) != ""
+		return output, runErr
+	}
 	if t.registered == nil {
+		hasPayload = true
 		return t.set.expandGroups(args), nil
 	}
 
@@ -221,18 +257,55 @@ func (t *einoTool) InvokableRun(ctx context.Context, args string, _ ...tool.Opti
 		observer.record(event)
 	}
 
-	var result string
+	if err := checkRoleReplyUse(ctx); err != nil {
+		return "", err
+	}
+	if run, ok := ctx.Value(roleReplyRunKey{}).(*roleReplyRun); ok {
+		if grant := run.turn.groupTool; grant != nil && grant.key.name == name {
+			if parsed, ok := groupToolArguments(args); !ok || parsed != grant.args {
+				return "error: the arguments do not match the account's approval for this group", nil
+			}
+			// Use the approved canonical payload after comparing it with the
+			// model request so only the authorized RPC reaches the server.
+			args = grant.args
+		}
+	}
+
+	var result mcpToolOutput
 	var err error
 	if remote, ok := t.registered.(*MCPRemoteTool); ok {
-		result, err = remote.ExecuteContext(ctx, args)
+		if command := remote.command; command != nil {
+			call := command.beginCall(ctx)
+			if call == nil {
+				err = errCommandMCPAccess
+			} else {
+				// The completion observer runs before this result is delivered.
+				// Keep revocation effective until InvokableRun is ready to return.
+				defer func() {
+					authorized := command.finishCall(call)
+					cancelErr := ctx.Err()
+					switch {
+					case cancelErr != nil:
+						hasPayload = false
+						output, runErr = "", cancelErr
+					case !authorized:
+						hasPayload = false
+						output, runErr = "error: "+errCommandMCPAccess.Error(), nil
+					}
+				}()
+				result, err = remote.executeRPC(call.ctx, args, true)
+			}
+		} else {
+			result, err = remote.executeRPC(ctx, args, true)
+		}
 	} else {
-		result, err = t.registered.Execute(args)
+		result.text, err = t.registered.Execute(args)
+		result.hasPayload = strings.TrimSpace(result.text) != ""
 	}
-	cancelErr := ctx.Err()
 	if observer.record != nil {
 		event.Type = DashboardEventToolCallFinished
 		event.LatencyMs = time.Since(started).Milliseconds()
-		event.Success = err == nil && cancelErr == nil
+		event.Success = err == nil && ctx.Err() == nil
 		event.Summary = "tool " + name + " failed"
 		if event.Success {
 			event.Summary = "tool " + name + " completed"
@@ -240,8 +313,8 @@ func (t *einoTool) InvokableRun(ctx context.Context, args string, _ ...tool.Opti
 		observer.record(event)
 	}
 
-	if cancelErr != nil {
-		return "", cancelErr
+	if err := checkRoleReplyUse(ctx); err != nil {
+		return "", err
 	}
 	if errors.Is(err, context.Canceled) {
 		return "", err
@@ -249,14 +322,19 @@ func (t *einoTool) InvokableRun(ctx context.Context, args string, _ ...tool.Opti
 	if err != nil {
 		return fmt.Sprintf("error: %v", err), nil
 	}
-	return result, nil
+	hasPayload = result.hasPayload
+	return result.text, nil
 }
 
 func unknownEinoTool(ctx context.Context, name, _ string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("error: unknown tool %q", name), nil
+	output := fmt.Sprintf("error: unknown tool %q", name)
+	if payloads, ok := ctx.Value(einoToolPayloadsKey{}).(*einoToolPayloads); ok && payloads.scheduled {
+		payloads.add(output, false)
+	}
+	return output, nil
 }
 
 type einoToolEventsKey struct{}
@@ -268,4 +346,35 @@ type einoToolEvents struct {
 
 func withEinoToolEvents(ctx context.Context, usage UsageContext, record func(DashboardEvent)) context.Context {
 	return context.WithValue(ctx, einoToolEventsKey{}, einoToolEvents{usage: usage, record: record})
+}
+
+// addEngagementDialogue installs role tools beside the foreground tools. The
+// local tools are directly visible even when remote schemas use lazy discovery.
+func (s *einoToolSet) addEngagementDialogue(d *engagementDialogue) error {
+	if s.rawTools == nil {
+		s.rawTools = make(map[string]openai.Tool)
+	}
+	for _, tool := range []struct {
+		name, description, schema string
+		run                       func(context.Context, string) (string, error)
+	}{
+		{"engagement_context", "Read the speaker's visible items, agreement versions, available background capabilities and conversation preferences. Use an empty object to list or supply an item id. Use the next cursor to read another page.",
+			`{"type":"object","properties":{"id":{"type":"string"},"after":{"type":"string"}}}`, d.read},
+		{"engagement_decide", "Propose the role's decision regarding a lasting tracking item or delegation. Supply id and its visible version on revision. A new item uses kind and change agree. Use the returned capability IDs. Authorization and management quotes must be verbatim from the current speaker and basis_message_id identifies an actual visible approving statement. Omit unchanged terms on revision. Supply declined quotations for partially accepted requests.",
+			`{"type":"object","required":["verdict"],"properties":{"id":{"type":"string"},"version":{"type":"integer"},"kind":{"enum":["tracking","delegation"]},"verdict":{"enum":["accept","reject","clarify"]},"change":{"enum":["agree","reaccept","pause","resume","end","manage","mute","unmute"]},"observe":{"type":"string"},"actions":{"type":"array","items":{"type":"string"}},"recipient":{"enum":["here","private"]},"trigger":{"type":"string"},"end_condition":{"type":"string"},"once":{"type":"boolean"},"check_after":{"type":"string","description":"Earliest RFC3339 date for an initial private:followup only"},"duration":{"type":"string","description":"ongoing, this_week, or explicit RFC3339 expiry"},"reply":{"type":"string","description":"One focused clarification or reason for declining, safe for this chat"},"declined":{"type":"array","items":{"type":"string"}},"authorization_quote":{"type":"string"},"management_quote":{"type":"string"},"basis_message_id":{"type":"integer"}}}`, d.decide},
+		{"conversation_preference", "Decide a request for proactive chatter and tracking notifications. Use the current version from engagement_context. Set either channel independently. An explicit reminder is independent of these preferences.",
+			`{"type":"object","required":["scope","verdict"],"properties":{"scope":{"enum":["private","group","self"]},"version":{"type":"integer"},"verdict":{"enum":["accept","reject","clarify"]},"chatter":{"enum":["on","off","reduce","default"]},"notifications":{"enum":["on","off","reduce","default"]},"duration":{"type":"string","description":"ongoing, this_week, or explicit RFC3339 expiry"},"chatter_duration":{"type":"string"},"notification_duration":{"type":"string"},"reply":{"type":"string"}}}`, d.changePreference},
+	} {
+		// These names are reserved locally in ordinary role dialogue. A
+		// conflicting remote definition must not receive local arguments.
+		s.tools = slices.DeleteFunc(s.tools, func(existing *einoTool) bool { return existing.info.Name == tool.name })
+		err := s.addTool(openai.Tool{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{
+			Name: tool.name, Description: tool.description, Parameters: json.RawMessage(tool.schema),
+		}}, nil)
+		if err != nil {
+			return err
+		}
+		s.tools[len(s.tools)-1].local = tool.run
+	}
+	return nil
 }

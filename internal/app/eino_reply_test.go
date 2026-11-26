@@ -102,7 +102,11 @@ func TestEinoReplyRounds(t *testing.T) {
 						want = "⚠️ The model did not generate a final reply. Here are the raw tool results for reference (information may be incomplete):\n\nresult 1"
 					}
 				}
-				if got != want || err != nil {
+				var wantErr error
+				if tt.final == "" && len(tt.calls) == 0 {
+					wantErr = errEinoEmptyReply
+				}
+				if got != want || !errors.Is(err, wantErr) {
 					t.Fatalf("reply = %q, %v, want %q", got, err, want)
 				}
 			}
@@ -289,11 +293,30 @@ func TestEinoReplyFallbackAfterUnknownTool(t *testing.T) {
 	defer cancel()
 	b := &Bot{}
 	reply, err := b.runEinoReply(ctx, server.snapshot(3), newEinoReplyMessages(), set, einoReplyUsageContext(), nil, nil)
-	if err != nil || !strings.HasSuffix(reply, "\n\n"+`error: unknown tool "missing"`) {
+	if !errors.Is(err, errEinoEmptyReply) || !strings.HasSuffix(reply, "\n\n"+`error: unknown tool "missing"`) {
 		t.Fatalf("reply = %q, %v, want fallback with unknown tool result", reply, err)
 	}
 	if toolRuns.Load() != 0 || server.calls.Load() != 2 {
 		t.Errorf("MCP calls = %d, model requests = %d, want 0 and 2", toolRuns.Load(), server.calls.Load())
+	}
+}
+
+func TestEinoReplyFallbackIgnoresPriorToolOutput(t *testing.T) {
+	server := newEinoReplyProvider(t, func(w http.ResponseWriter, _ *http.Request, _ int, _ openai.ChatCompletionRequest) {
+		einoModelSSE(w, einoReplyUsageFrame, "[DONE]")
+	})
+	messages := newEinoReplyMessages()
+	messages = append(messages[:1], openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleAssistant,
+		ToolCalls: []openai.ToolCall{{ID: "from-history", Type: openai.ToolTypeFunction,
+			Function: openai.FunctionCall{Name: "lookup", Arguments: "{}"}}},
+	}, openai.ChatCompletionMessage{
+		Role: openai.ChatMessageRoleTool, ToolCallID: "from-history", Content: "Prior private report",
+	}, messages[1])
+	b := &Bot{}
+	reply, err := b.runEinoReply(t.Context(), server.snapshot(3), messages, nil, einoReplyUsageContext(), nil, nil)
+	if !errors.Is(err, errEinoEmptyReply) || reply != "⚠️ The model returned an empty response." || server.calls.Load() != 1 {
+		t.Fatalf("stale result appeared in this reply: %q, %v", reply, err)
 	}
 }
 
@@ -378,19 +401,19 @@ func TestEinoReplyBotRouting(t *testing.T) {
 		cfg: snap.cfg, ai: snap.ai, tools: registry, userTools: userTools,
 		store: NewHistoryStore(nil), dashboardEvents: NewDashboardEventHub(0),
 	}
-	telegram := newEinoReplyTelegram(t, func(id int) error {
+	telegram := newEinoReplyTelegramForChat(t, tele.Chat{ID: 42, Type: tele.ChatPrivate}, func(id int) error {
 		if id == 1 {
 			return b.applyRuntimeConfig(next)
 		}
 		return nil
-	})
+	}, nil)
 	b.tg = telegram.bot
 	previewSeen = telegram.previewSeen
 	previewCleared = telegram.previewCleared
 
 	input := openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: "question"}
 	sender := &tele.User{ID: 42}
-	chat := &tele.Chat{ID: 41, Type: tele.ChatPrivate}
+	chat := &tele.Chat{ID: 42, Type: tele.ChatPrivate}
 	for i, tt := range []struct {
 		sender *tele.User
 		final  string
@@ -409,7 +432,7 @@ func TestEinoReplyBotRouting(t *testing.T) {
 			t.Fatalf("final edit = %+v", edit)
 		}
 		history := waitEinoReplyHistory(t, b, chat.ID, 2*id)
-		if history[2*i].Content != "question" || history[2*i+1].Role != openai.ChatMessageRoleAssistant || history[2*i+1].Content != "**"+tt.final+"**" {
+		if history[2*i].Content != "question" || history[2*i+1].Role != openai.ChatMessageRoleAssistant || history[2*i+1].Content != tt.final {
 			t.Fatalf("unexpected history after request %d: %+v", id, history)
 		}
 		finished := einoReplyDashboardEvents(b, DashboardEventConversationFinished)
@@ -542,7 +565,7 @@ func TestEinoReplyBotSpeechMode(t *testing.T) {
 		t.Fatal("Telegram received no speech failure notice")
 	}
 	history := waitEinoReplyHistory(t, b, chat.ID, 2)
-	if history[1].Content != "**spoken answer**" || speechCalls.Load() != 1 || server.calls.Load() != 1 {
+	if history[1].Content != "spoken answer" || speechCalls.Load() != 1 || server.calls.Load() != 1 {
 		t.Errorf("history = %+v, speech calls = %d, model requests = %d", history, speechCalls.Load(), server.calls.Load())
 	}
 	telegram.mu.Lock()
@@ -720,7 +743,7 @@ func newEinoReplyTelegramForChat(t *testing.T, chat tele.Chat, onSend func(int) 
 	var messages atomic.Int32
 	var previewOnce, clearOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var id string
+		var id, visible string
 		switch r.URL.Path {
 		case "/bottest-token/sendMessage":
 			var send struct {
@@ -752,6 +775,7 @@ func newEinoReplyTelegramForChat(t *testing.T, chat tele.Chat, onSend func(int) 
 			}
 			edit := payload.einoReplyEdit
 			id = edit.MessageID
+			visible = testTelegramVisibleText(edit.Text, edit.ParseMode)
 			tg.mu.Lock()
 			tg.edits = append(tg.edits, edit)
 			tg.mu.Unlock()
@@ -773,7 +797,7 @@ func newEinoReplyTelegramForChat(t *testing.T, chat tele.Chat, onSend func(int) 
 			http.Error(w, "unexpected Telegram request", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%s,"chat":{"id":%d,"type":%q}}}`, id, chat.ID, chat.Type)
+		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%s,"chat":{"id":%d,"type":%q},"text":%q}}`, id, chat.ID, chat.Type, visible)
 	}))
 	t.Cleanup(server.Close)
 	var err error

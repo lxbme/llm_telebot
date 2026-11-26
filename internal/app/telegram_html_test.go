@@ -22,7 +22,7 @@ func TestTelegramEditErrorsRedactBotToken(t *testing.T) {
 	previous := log.Writer()
 	log.SetOutput(&output)
 	snap := runtimeSnapshot{tg: bot}
-	snap.editFinalResponse(&tele.Message{ID: 1, Chat: &tele.Chat{ID: 10}}, "**hello**")
+	snap.editFinalResponse(&tele.Message{ID: 1, Chat: &tele.Chat{ID: 10}}, "**hello**", func() bool { return true })
 	log.SetOutput(previous)
 	if logged := output.String(); strings.Contains(logged, token) || !strings.Contains(logged, "connection refused") {
 		t.Fatal("Telegram edit error must keep the diagnosis and redact the token")

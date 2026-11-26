@@ -1,12 +1,10 @@
 package app
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
-	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -19,7 +17,7 @@ import (
 type SummaryStore struct {
 	mu          sync.RWMutex
 	summaries   map[int64]string // chatID → summary text
-	summarizing sync.Map         // chatID → bool (prevent concurrent summarisations)
+	summarizing sync.Map         // generation -> bool (one active summary per chat generation)
 	db          *ChatDB          // optional persistent backend
 }
 
@@ -57,28 +55,6 @@ func (s *SummaryStore) Set(chatID int64, summary string) {
 	}
 }
 
-// Clear removes the summary for a chat.
-func (s *SummaryStore) Clear(chatID int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.summaries, chatID)
-	if s.db != nil {
-		s.db.DeleteSummary(chatID)
-	}
-}
-
-// MarkSummarizing acquires a per-chat lock to prevent duplicate goroutines.
-// Returns false if summarisation is already running for this chat.
-func (s *SummaryStore) MarkSummarizing(chatID int64) bool {
-	_, loaded := s.summarizing.LoadOrStore(chatID, true)
-	return !loaded
-}
-
-// DoneSummarizing releases the per-chat lock.
-func (s *SummaryStore) DoneSummarizing(chatID int64) {
-	s.summarizing.Delete(chatID)
-}
-
 // ─── Summary Extraction ──────────────────────────────────────────────────────
 
 const summaryExtractSystemPrompt = `You are a conversation summarizer. Compress the given conversation history into a concise yet information-rich summary.
@@ -92,25 +68,40 @@ Rules:
 6. Maximum 300 words.
 7. Output ONLY the summary text — no markdown fences, no meta-commentary.`
 
+// Limit the prompt text per request independently of how long the queue has
+// grown. One message can still be summarized alongside a long custom persona.
+const summaryInputBudgetBytes = 6 * 1024
+
 // summarizeOverflow compresses overflow messages (those that fell out of the
 // sliding window) into the existing summary via a background LLM call.
 // Safe to call from a goroutine.
-func (b *Bot) summarizeOverflow(chatID int64) {
+func (b *Bot) summarizeOverflow(turn RoleTurn) {
+	turn.Purpose = RoleSummary
+	// These inputs are the same-chat transcript, already delivered legally.
+	turn.memoryUsed, turn.groupTool = nil, nil
 	snap := b.snapshot()
-	usageCtx := newUsageContext(chatID, 0, 0)
-	// Acquire per-chat lock.
-	if !snap.summaries.MarkSummarizing(chatID) {
-		return // another goroutine is already summarizing this chat
-	}
-	defer snap.summaries.DoneSummarizing(chatID)
-
-	// Drain accumulated overflow.
-	overflow := snap.store.DrainOverflow(chatID)
-	if len(overflow) == 0 {
+	if !snap.cfg.SummaryEnabled || snap.summaries == nil || snap.summaryAI == nil {
 		return
 	}
+	chatID := turn.ChatID
+	if _, busy := snap.summaries.summarizing.LoadOrStore(turn.generation, true); busy {
+		return
+	}
+	defer snap.summaries.summarizing.Delete(turn.generation)
 
-	existing := snap.summaries.Get(chatID)
+	var batch overflowBatch
+	var existing string
+	turn.withCurrent(func() {
+		batch = snap.store.pendingOverflow(chatID)
+		existing = snap.summaries.Get(chatID)
+	})
+	if len(batch.messages) == 0 {
+		return
+	}
+	messages := snap.buildRoleContext(&turn, "", "\n\n"+summaryExtractSystemPrompt, 0, false)
+	if len(messages) == 0 {
+		return
+	}
 
 	// Build the user prompt with existing summary + overflow messages.
 	var userPrompt strings.Builder
@@ -120,7 +111,9 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 		userPrompt.WriteString("\n\n")
 	}
 	userPrompt.WriteString("=== New Messages to Incorporate ===\n")
-	for _, m := range overflow {
+	headerBytes := userPrompt.Len()
+	userBudget := summaryInputBudgetBytes - len(messages[0].Content)
+	for i, m := range batch.messages {
 		if m.Role == openai.ChatMessageRoleSystem {
 			continue
 		}
@@ -128,31 +121,22 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 		if m.Role == openai.ChatMessageRoleUser {
 			tag = "user"
 		}
-		content := m.Content
-		if len([]rune(content)) > 500 {
-			content = string([]rune(content)[:500]) + "…"
+		line := fmt.Sprintf("[%s] %s\n", tag, truncate(userMessageText(m), 500))
+		if userPrompt.Len() > headerBytes && userPrompt.Len()+len(line) > userBudget {
+			batch.messages = batch.messages[:i]
+			break
 		}
-		userPrompt.WriteString(fmt.Sprintf("[%s] %s\n", tag, content))
+		userPrompt.WriteString(line)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	summaryReq := openai.ChatCompletionRequest{
-		Model: snap.summaryModel,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: summaryExtractSystemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPrompt.String()},
-		},
-		Temperature: 0.2,
-	}
-	applyMaxTokens(&summaryReq, 800)
-	sanitizeBetaRequest(&summaryReq)
-	started := time.Now()
-	resp, err := snap.summaryAI.CreateChatCompletion(ctx, summaryReq)
-	b.recordUsageEvent(usageEvent(usageCtx, UsageCallSummary, firstNonEmpty(resp.Model, snap.summaryModel), false, 0, started, &resp.Usage, err == nil))
+	messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: userPrompt.String()})
+	req := openai.ChatCompletionRequest{Model: snap.summaryModel, Messages: messages, Temperature: 0.2}
+	turn.BillingUserID = 0
+	resp, err := b.completeRoleDecision(turn, snap, snap.summaryAI, req, UsageCallSummary, 800)
 	if err != nil {
-		log.Printf("[summary] LLM error for chat %d: %v", chatID, err)
+		if turn.generation.Err() == nil {
+			log.Printf("[summary] LLM error for chat %d: %v", chatID, err)
+		}
 		return
 	}
 	if len(resp.Choices) == 0 {
@@ -160,12 +144,27 @@ func (b *Bot) summarizeOverflow(chatID int64) {
 		return
 	}
 
-	summary := strings.TrimSpace(resp.Choices[0].Message.Content)
-	if summary == "" {
+	choice := resp.Choices[0]
+	summary := strings.TrimSpace(choice.Message.Content)
+	if summary == "" || choice.Message.Refusal != "" ||
+		(choice.FinishReason != "" && choice.FinishReason != openai.FinishReasonStop) {
 		return
 	}
 
-	snap.summaries.Set(chatID, summary)
+	var committed bool
+	turn.withCurrent(func() {
+		if turn.checkUse(turn.generation) != nil {
+			return
+		}
+		var err error
+		committed, err = snap.store.commitSummary(chatID, snap.summaries, batch, existing, summary)
+		if err != nil {
+			log.Printf("[summary] save error for chat %d: %v", chatID, err)
+		}
+	})
+	if !committed {
+		return
+	}
 	b.recordDashboardEvent(DashboardEvent{
 		Type:    DashboardEventSummaryUpdated,
 		ChatID:  chatID,
