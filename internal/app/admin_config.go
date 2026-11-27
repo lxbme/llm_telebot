@@ -2,14 +2,17 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	openai "github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
@@ -18,6 +21,7 @@ import (
 const (
 	adminCancelButtonUnique = "admin_config_cancel"
 	adminEmptyValueToken    = "<empty>"
+	adminValueCommand       = "/admin_value"
 )
 
 type configOption struct {
@@ -34,11 +38,17 @@ type adminConfigSession struct {
 	Selection      int
 	PanelChatID    int64
 	PanelMessageID int
+	revision       uint64
+	rendering      bool
+	inputToken     string
 }
+
+type adminInputScope struct{ userID, chatID int64 }
 
 type AdminConfigSessionStore struct {
 	mu       sync.RWMutex
 	sessions map[int64]adminConfigSession
+	revision uint64
 }
 
 func NewAdminConfigSessionStore() *AdminConfigSessionStore {
@@ -54,7 +64,16 @@ func (s *AdminConfigSessionStore) Get(userID int64) (adminConfigSession, bool) {
 	return session, ok
 }
 
-func (s *AdminConfigSessionStore) Set(userID int64, session adminConfigSession) {
+func (s *AdminConfigSessionStore) Set(userID int64, session adminConfigSession) adminConfigSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.revision++
+	session.revision = s.revision
+	s.sessions[userID] = session
+	return session
+}
+
+func (s *AdminConfigSessionStore) setRendered(userID int64, session adminConfigSession) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions[userID] = session
@@ -79,6 +98,8 @@ type runtimeSnapshot struct {
 	stickerModel     string
 	reminderAI       *openai.Client
 	reminderModel    string
+	memory           *MemoryBook
+	engagements      *EngagementStore
 	chatDB           *ChatDB
 	store            *HistoryStore
 	stats            *StatsManager
@@ -90,6 +111,7 @@ type runtimeSnapshot struct {
 	tasks            *TaskStore
 	reminders        *ReminderStore
 	scheduleWizard   *ScheduleWizardStore
+	adminSessions    *AdminConfigSessionStore
 	speechModes      *SpeechModeStore
 	tts              *VolcengineTTSClient
 	stt              *STTClient
@@ -120,6 +142,8 @@ func (b *Bot) snapshotLocked() runtimeSnapshot {
 		stickerModel:     b.stickerModel,
 		reminderAI:       b.reminderAI,
 		reminderModel:    b.reminderModel,
+		memory:           b.memory,
+		engagements:      b.engagements,
 		chatDB:           b.chatDB,
 		store:            b.store,
 		stats:            b.stats,
@@ -131,6 +155,7 @@ func (b *Bot) snapshotLocked() runtimeSnapshot {
 		tasks:            b.tasks,
 		reminders:        b.reminders,
 		scheduleWizard:   b.scheduleWizard,
+		adminSessions:    b.adminSessions,
 		speechModes:      b.speechModes,
 		tts:              b.tts,
 		stt:              b.stt,
@@ -207,6 +232,23 @@ func (b *Bot) currentConfig() Config {
 	return b.snapshot().cfg
 }
 
+// Apply an admin action against the same configuration that authorized it.
+// Release the reload lock before making a Telegram request.
+func (b *Bot) replyAsAdmin(c tele.Context, denied string, action func(runtimeSnapshot) string) error {
+	b.runtimeConfigMu.Lock()
+	snap := b.snapshot()
+	if !snap.cfg.isAllowed(c) {
+		b.runtimeConfigMu.Unlock()
+		return nil
+	}
+	reply := denied
+	if sender := c.Sender(); sender != nil && snap.cfg.isAdmin(sender.ID) {
+		reply = action(snap)
+	}
+	b.runtimeConfigMu.Unlock()
+	return c.Reply(reply)
+}
+
 func allConfigOptions() []configOption {
 	return []configOption{
 		stringOption(1, "OPENAI_API_BASE", "Primary OpenAI-compatible base URL. Leave empty to use the official default.", false,
@@ -281,13 +323,13 @@ func allConfigOptions() []configOption {
 				cfg.AllowedGroups = ids
 				return nil
 			}),
-		boolOption(16, "PROFILE_ENABLED", "Enable user profile extraction.", false,
+		boolOption(16, "PROFILE_ENABLED", "Enable automatic role memory learning and the legacy profile store.", false,
 			func(cfg Config) bool { return cfg.ProfileEnabled },
 			func(cfg *Config, v bool) { cfg.ProfileEnabled = v }),
 		stringOption(17, "PROFILE_DB_PATH", "Path to the user profile database.", false,
 			func(cfg Config) string { return cfg.ProfileDBPath },
 			func(cfg *Config, v string) { cfg.ProfileDBPath = v }),
-		intOption(18, "PROFILE_EXTRACT_EVERY", "Run profile extraction every N bot replies. Must be greater than 0.", false,
+		intOption(18, "PROFILE_EXTRACT_EVERY", "Legacy extraction interval, retained for configuration compatibility.", false,
 			func(cfg Config) int { return cfg.ProfileExtractEvery },
 			func(cfg *Config, v int) { cfg.ProfileExtractEvery = v },
 			func(v int) error {
@@ -296,10 +338,10 @@ func allConfigOptions() []configOption {
 				}
 				return nil
 			}),
-		stringOption(19, "PROFILE_API_BASE", "Base URL for the profile model. Leave empty to fall back to the primary config.", false,
+		stringOption(19, "PROFILE_API_BASE", "Base URL for the role memory model. Leave empty to fall back to the primary config.", false,
 			func(cfg Config) string { return cfg.ProfileBase },
 			func(cfg *Config, v string) { cfg.ProfileBase = v }),
-		stringOption(20, "PROFILE_API_KEY", "API key for the profile model. Leave empty to fall back to the primary config.", true,
+		stringOption(20, "PROFILE_API_KEY", "API key for the role memory model. Leave empty to fall back to the primary config.", true,
 			func(cfg Config) string { return cfg.ProfileKey },
 			func(cfg *Config, v string) { cfg.ProfileKey = v }),
 		stringOption(21, "PROFILE_MODEL", "Model name for profile extraction. Leave empty to fall back to the primary model.", false,
@@ -347,25 +389,19 @@ func allConfigOptions() []configOption {
 		stringOption(31, "USER_MCP_DB_PATH", "Path to the per-user MCP database.", false,
 			func(cfg Config) string { return cfg.UserMCPDBPath },
 			func(cfg *Config, v string) { cfg.UserMCPDBPath = v }),
-		customOption(32, "ADMIN_ID", "Comma-separated admin Telegram user IDs. Use * to allow everyone, or <empty> to clear.", false,
-			func(cfg Config) string {
-				if cfg.AdminAll {
-					return "*"
-				}
-				return formatIDSet(cfg.AdminIDs)
-			},
+		customOption(32, "ADMIN_ID", "Comma-separated explicit Telegram administrator IDs. Use <empty> to clear.", false,
+			func(cfg Config) string { return formatIDSet(cfg.AdminIDs) },
 			func(input string, cfg *Config) error {
 				raw := strings.TrimSpace(input)
-				cfg.AdminAll = raw == "*"
-				if cfg.AdminAll {
-					cfg.AdminIDs = nil
-					return nil
+				if hasAdminWildcard(raw) {
+					return fmt.Errorf("ADMIN_ID does not accept a wildcard; enter explicit Telegram user IDs")
 				}
 				ids, err := parseIDListStrict(raw)
 				if err != nil {
 					return err
 				}
 				cfg.AdminIDs = ids
+				cfg.AdminWildcard = false
 				return nil
 			}),
 		stringOption(33, "VOLCENGINE_TTS_APP_ID", "Volcengine TTS App ID.", false,
@@ -896,17 +932,21 @@ func (b *Bot) buildAdminListText(cfg Config) string {
 }
 
 func (b *Bot) buildAdminEditPrompt(option configOption, cfg Config) string {
+	instruction := fmt.Sprintf("Send the new value directly.\n🧹 To clear a string or list, send %s.", adminEmptyValueToken)
+	if option.Sensitive {
+		instruction = fmt.Sprintf("Send the entire line below with <value> replaced by the new value. Use %s to clear it.", adminEmptyValueToken)
+	}
 	return fmt.Sprintf(
-		"✏️ Editing: %s\n\n📌 Current value: %s\nℹ️ Description: %s\n\n📝 Send the new value directly.\n🧹 To clear a string or list, send %s.\n↩️ Tap cancel to go back to the list.",
+		"✏️ Editing: %s\n\n📌 Current value: %s\nℹ️ Description: %s\n\n📝 %s\n↩️ Tap cancel to go back to the list.",
 		option.EnvKey,
 		previewConfigValue(option, cfg),
 		option.Desc,
-		adminEmptyValueToken,
+		instruction,
 	)
 }
 
-func (b *Bot) ensureAdminPrivateChat(c tele.Context) (bool, error) {
-	if !b.isAllowed(c) {
+func (b *Bot) ensureAdminPrivateChat(c tele.Context, cfg Config) (bool, error) {
+	if !cfg.isAllowed(c) {
 		if c.Sender() != nil && c.Chat() != nil {
 			log.Printf("Access denied for /admin: user=%d chat=%d", c.Sender().ID, c.Chat().ID)
 		}
@@ -915,144 +955,309 @@ func (b *Bot) ensureAdminPrivateChat(c tele.Context) (bool, error) {
 	if c.Chat() == nil || c.Chat().Type != tele.ChatPrivate {
 		return false, c.Reply("🔒 `/admin` is only available in a private admin chat.")
 	}
-	if c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
+	if c.Sender() == nil || !cfg.isAdmin(c.Sender().ID) {
 		return false, c.Reply("⛔ Only admins can use this feature.")
 	}
 	return true, nil
 }
 
+const adminEditEnded = "ℹ️ No active config edit. Open /admin to start again."
+
+func (b *Bot) lockAdminPanel(chatID int64) func() {
+	lock, _ := b.adminPanelLocks.LoadOrStore(chatID, make(chan struct{}, 1))
+	panel := lock.(chan struct{})
+	panel <- struct{}{}
+	return func() { <-panel }
+}
+
+// The caller holds the private chat's panel lock through the Telegram update.
+// Recheck the interaction before rendering and before accepting its response.
+func (b *Bot) showAdminSession(c tele.Context, snap runtimeSnapshot, scope adminInputScope, before, next adminConfigSession, text string, opts *tele.SendOptions, sensitive bool) (bool, error) {
+	b.runtimeConfigMu.Lock()
+	current := b.snapshot()
+	active, _ := snap.adminSessions.Get(scope.userID)
+	if current.adminSessions != snap.adminSessions || active.revision != before.revision ||
+		!current.cfg.isAdmin(scope.userID) || !current.cfg.isAllowed(c) {
+		b.runtimeConfigMu.Unlock()
+		return false, c.Reply(adminEditEnded)
+	}
+
+	next.PanelChatID = scope.chatID
+	next.PanelMessageID = active.PanelMessageID
+	next.rendering, next.inputToken = true, ""
+	if sensitive {
+		next.inputToken = rand.Text()
+		text += "\n\n" + adminValueCommand + " " + next.inputToken + " <value>"
+	}
+	reserved := snap.adminSessions.Set(scope.userID, next)
+	b.runtimeConfigMu.Unlock()
+
+	rendered, err := b.renderAdminPanel(c, reserved, text, opts)
+
+	b.runtimeConfigMu.Lock()
+	revoked := b.snapshot().adminSessions != snap.adminSessions
+	active, _ = snap.adminSessions.Get(scope.userID)
+	if !revoked && active == reserved {
+		switch {
+		case err == nil && rendered.Step == "":
+			snap.adminSessions.Clear(scope.userID)
+		case err == nil:
+			rendered.rendering = false
+			snap.adminSessions.setRendered(scope.userID, rendered)
+		case before.Step == "" || before.rendering || sensitive:
+			snap.adminSessions.Clear(scope.userID)
+		default:
+			snap.adminSessions.Set(scope.userID, before)
+		}
+	}
+	b.runtimeConfigMu.Unlock()
+
+	if revoked && sensitive && err == nil {
+		// Retire the displayed prompt if possible. Its input token has expired
+		// regardless of whether this additional edit reaches Telegram.
+		if msg := b.adminMessageRef(rendered); msg != nil {
+			_, _ = snap.tg.Edit(msg, adminEditEnded, &tele.SendOptions{})
+		}
+	}
+	return err == nil, err
+}
+
+func splitAdminInput(text string) (word, rest string) {
+	text = strings.TrimSpace(text)
+	if i := strings.IndexFunc(text, unicode.IsSpace); i >= 0 {
+		return text[:i], strings.TrimSpace(text[i:])
+	}
+	return text, ""
+}
+
+func adminValuePayload(text string) (string, bool) {
+	word, payload := splitAdminInput(text)
+	command, _, _ := strings.Cut(word, "@")
+	return payload, command == adminValueCommand
+}
+
+// Reserve the marked input across Telegram routes, including media captions.
+// Recognizing the marker needs no session state, even after a process restart.
+func (b *Bot) guardAdminValue(next tele.HandlerFunc) tele.HandlerFunc {
+	return func(c tele.Context) error {
+		if handled, err := b.handleMarkedAdminValue(c); handled {
+			return err
+		}
+		return next(c)
+	}
+}
+
+func (b *Bot) handleMarkedAdminValue(c tele.Context) (bool, error) {
+	msg := c.Update().Message
+	if msg == nil || msg.Chat == nil {
+		return false, nil
+	}
+	if payload, marked := adminValuePayload(msg.Text); marked {
+		return true, b.handleAdminValue(c, msg, payload)
+	}
+	if _, marked := adminValuePayload(msg.Caption); marked {
+		b.deleteAdminInputMessage(msg)
+		return true, c.Send(adminEditEnded)
+	}
+	return false, nil
+}
+
+func (b *Bot) handleAdminValue(c tele.Context, msg *tele.Message, payload string) error {
+	defer b.deleteAdminInputMessage(msg)
+	if msg.Chat.Type != tele.ChatPrivate || msg.Sender == nil {
+		return c.Send(adminEditEnded)
+	}
+	snap := b.snapshot()
+	scope := adminInputScope{msg.Sender.ID, msg.Chat.ID}
+	if snap.adminSessions == nil || !snap.cfg.isAdmin(scope.userID) || !snap.cfg.allowsChat(msg.Chat, msg.Sender) {
+		return c.Send(adminEditEnded)
+	}
+	token, value := splitAdminInput(payload)
+	session, ok := snap.adminSessions.Get(scope.userID)
+	if !ok || session.Step != "edit" || session.rendering || session.PanelChatID != scope.chatID ||
+		session.inputToken == "" || session.inputToken != token {
+		return c.Send(adminEditEnded)
+	}
+	option, ok := findConfigOption(session.Selection)
+	if !ok || !option.Sensitive {
+		return c.Send(adminEditEnded)
+	}
+	if value == "" {
+		return c.Send("ℹ️ Include the new value after the edit token, or use " + adminEmptyValueToken + " to clear it.")
+	}
+	unlock := b.lockAdminPanel(scope.chatID)
+	defer unlock()
+	return b.submitAdminValue(c, snap, scope, session, option, value)
+}
+
 func (b *Bot) handleAdminCommand(c tele.Context) error {
-	if ok, err := b.ensureAdminPrivateChat(c); !ok || err != nil {
+	snap := b.snapshot()
+	if ok, err := b.ensureAdminPrivateChat(c, snap.cfg); !ok || err != nil {
 		return err
 	}
-	cfg := b.currentConfig()
-	session, _ := b.adminSessions.Get(c.Sender().ID)
-	session.Step = "select"
-	session.Selection = 0
-	rendered, err := b.renderAdminPanel(c, session, b.buildAdminListText(cfg), b.adminSendOptions(tele.ModeDefault))
-	if err != nil {
-		return err
+	scope := adminInputScope{c.Sender().ID, c.Chat().ID}
+	unlock := b.lockAdminPanel(scope.chatID)
+	defer unlock()
+	current := b.snapshot()
+	if current.adminSessions != snap.adminSessions {
+		return c.Reply(adminEditEnded)
 	}
-	b.adminSessions.Set(c.Sender().ID, rendered)
-	return nil
+	before, _ := snap.adminSessions.Get(scope.userID)
+	next := before
+	next.Step, next.Selection = "select", 0
+	_, err := b.showAdminSession(c, current, scope, before, next, b.buildAdminListText(current.cfg), b.adminSendOptions(tele.ModeDefault), false)
+	return err
 }
 
 func (b *Bot) handleAdminCancel(c tele.Context) error {
 	if cb := c.Callback(); cb != nil {
 		_ = c.Respond()
 	}
-	if ok, err := b.ensureAdminPrivateChat(c); !ok || err != nil {
+	snap := b.snapshot()
+	if ok, err := b.ensureAdminPrivateChat(c, snap.cfg); !ok || err != nil {
 		return err
 	}
-	session, ok := b.adminSessions.Get(c.Sender().ID)
-	if !ok {
+	scope := adminInputScope{c.Sender().ID, c.Chat().ID}
+	unlock := b.lockAdminPanel(scope.chatID)
+	defer unlock()
+	if b.snapshot().adminSessions != snap.adminSessions {
+		return c.Reply(adminEditEnded)
+	}
+	session, ok := snap.adminSessions.Get(scope.userID)
+	if !ok || c.Message() == nil || c.Message().ID != session.PanelMessageID || scope.chatID != session.PanelChatID || session.Step == "" {
 		return c.EditOrReply("ℹ️ No active config session.")
 	}
+	next := session
+	next.Step, next.Selection = "", 0
+	text, opts := "👋 Exited the admin config panel.", &tele.SendOptions{}
 	if session.Step == "edit" {
-		cfg := b.currentConfig()
-		session.Step = "select"
-		session.Selection = 0
-		rendered, err := b.renderAdminPanel(c, session, b.buildAdminListText(cfg), b.adminSendOptions(tele.ModeDefault))
-		if err != nil {
-			return err
-		}
-		b.adminSessions.Set(c.Sender().ID, rendered)
-		return nil
+		next.Step = "select"
+		text, opts = b.buildAdminListText(snap.cfg), b.adminSendOptions(tele.ModeDefault)
 	}
-	b.adminSessions.Clear(c.Sender().ID)
-	if _, err := b.renderAdminPanel(c, session, "👋 Exited the admin config panel.", &tele.SendOptions{}); err != nil {
-		return err
-	}
-	return nil
+	_, err := b.showAdminSession(c, snap, scope, session, next, text, opts, false)
+	return err
 }
 
 func (b *Bot) handleAdminTextIfNeeded(c tele.Context, text string) (bool, error) {
-	if !b.isAllowed(c) || c.Chat() == nil || c.Chat().Type != tele.ChatPrivate || c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
+	if handled, err := b.handleMarkedAdminValue(c); handled {
+		return true, err
+	}
+	snap := b.snapshot()
+	if c.Chat() == nil || c.Chat().Type != tele.ChatPrivate || c.Sender() == nil {
 		return false, nil
 	}
-	session, ok := b.adminSessions.Get(c.Sender().ID)
-	if !ok {
+	scope := adminInputScope{c.Sender().ID, c.Chat().ID}
+	if snap.adminSessions == nil || !snap.cfg.isAllowed(c) || !snap.cfg.isAdmin(scope.userID) {
 		return false, nil
 	}
-	shouldDeleteInput := false
-	defer func() {
-		if shouldDeleteInput {
-			b.deleteAdminInputMessage(c.Message())
-		}
-	}()
+	session, ok := snap.adminSessions.Get(scope.userID)
+	if !ok || session.Step == "" || session.PanelChatID != scope.chatID {
+		return false, nil
+	}
+	if session.rendering {
+		return true, c.Send("ℹ️ Wait for the admin panel to finish updating.")
+	}
+	unlock := b.lockAdminPanel(scope.chatID)
+	defer unlock()
 
+	panelOptions := b.adminSendOptions(tele.ModeDefault)
 	switch session.Step {
 	case "select":
 		number, err := strconv.Atoi(strings.TrimSpace(text))
-		if err != nil {
-			rendered, renderErr := b.renderAdminPanel(c, session, "🔢 Please send a config item number.\n\n"+b.buildAdminListText(b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
-			if renderErr == nil {
-				b.adminSessions.Set(c.Sender().ID, rendered)
-				shouldDeleteInput = true
-			}
-			return true, renderErr
-		}
 		option, found := findConfigOption(number)
-		if !found {
-			rendered, renderErr := b.renderAdminPanel(c, session, "❓ Unknown config item number. Please try again.\n\n"+b.buildAdminListText(b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
-			if renderErr == nil {
-				b.adminSessions.Set(c.Sender().ID, rendered)
-				shouldDeleteInput = true
-			}
-			return true, renderErr
+		next := session
+		var panelText string
+		switch {
+		case err != nil:
+			panelText = "🔢 Please send a config item number.\n\n" + b.buildAdminListText(snap.cfg)
+		case !found:
+			panelText = "❓ Unknown config item number. Please try again.\n\n" + b.buildAdminListText(snap.cfg)
+		default:
+			next.Step, next.Selection = "edit", number
+			panelText = b.buildAdminEditPrompt(option, snap.cfg)
 		}
-		session.Step = "edit"
-		session.Selection = number
-		rendered, renderErr := b.renderAdminPanel(c, session, b.buildAdminEditPrompt(option, b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
-		if renderErr == nil {
-			b.adminSessions.Set(c.Sender().ID, rendered)
-			shouldDeleteInput = true
+		rendered, err := b.showAdminSession(c, snap, scope, session, next, panelText, panelOptions, option.Sensitive)
+		if rendered {
+			b.deleteAdminInputMessage(c.Message())
 		}
-		return true, renderErr
+		return true, err
 
 	case "edit":
 		option, found := findConfigOption(session.Selection)
 		if !found {
-			session.Step = "select"
-			session.Selection = 0
-			rendered, renderErr := b.renderAdminPanel(c, session, "⚠️ That config item no longer exists. Back to the list.\n\n"+b.buildAdminListText(b.currentConfig()), b.adminSendOptions(tele.ModeDefault))
-			if renderErr == nil {
-				b.adminSessions.Set(c.Sender().ID, rendered)
-				shouldDeleteInput = true
+			next := session
+			next.Step, next.Selection = "select", 0
+			rendered, err := b.showAdminSession(c, snap, scope, session, next, "⚠️ That config item no longer exists. Back to the list.\n\n"+b.buildAdminListText(snap.cfg), panelOptions, false)
+			if rendered {
+				b.deleteAdminInputMessage(c.Message())
 			}
-			return true, renderErr
+			return true, err
+		}
+		if option.Sensitive {
+			b.deleteAdminInputMessage(c.Message())
+			return true, c.Send("ℹ️ Use the " + adminValueCommand + " line in the current prompt.")
 		}
 
-		next := b.currentConfig()
-		if err := option.Apply(text, &next); err != nil {
-			rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("❌ Invalid input: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminSendOptions(tele.ModeDefault))
-			if renderErr == nil {
-				b.adminSessions.Set(c.Sender().ID, rendered)
-				shouldDeleteInput = true
-			}
-			return true, renderErr
-		}
-		if err := b.applyAndPersistConfig(next); err != nil {
-			rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("❌ Failed to apply config: %v\n\n%s", err, b.buildAdminEditPrompt(option, b.currentConfig())), b.adminSendOptions(tele.ModeDefault))
-			if renderErr == nil {
-				b.adminSessions.Set(c.Sender().ID, rendered)
-				shouldDeleteInput = true
-			}
-			return true, renderErr
-		}
-
-		updated := b.currentConfig()
-		session.Step = "select"
-		session.Selection = 0
-		rendered, renderErr := b.renderAdminPanel(c, session, fmt.Sprintf("✅ Updated: %s\n📌 Current value: %s%s\n\n%s", option.EnvKey, previewConfigValue(option, updated), configOverrideNotice(option.EnvKey), b.buildAdminListText(updated)), b.adminSendOptions(tele.ModeDefault))
-		if renderErr == nil {
-			b.adminSessions.Set(c.Sender().ID, rendered)
-			shouldDeleteInput = true
-		}
-		return true, renderErr
+		return true, b.submitAdminValue(c, snap, scope, session, option, text)
 	}
 
 	return false, nil
+}
+
+// The caller holds the private chat's panel lock.
+func (b *Bot) submitAdminValue(c tele.Context, snap runtimeSnapshot, scope adminInputScope, session adminConfigSession, option configOption, text string) error {
+	b.runtimeConfigMu.Lock()
+	current := b.snapshot()
+	active, ok := current.adminSessions.Get(scope.userID)
+	if current.adminSessions != snap.adminSessions || !current.cfg.isAdmin(scope.userID) ||
+		!current.cfg.isAllowed(c) || !ok || active.rendering || active.revision != session.revision {
+		b.runtimeConfigMu.Unlock()
+		return c.Send(adminEditEnded)
+	}
+	next := current.cfg
+	failure := "Invalid input"
+	err := option.Apply(text, &next)
+	if err == nil {
+		failure = "Failed to apply config"
+		err = b.applyAndPersistConfigLocked(current.cfg, next, option)
+	}
+	updated := b.snapshot()
+	if updated.adminSessions == snap.adminSessions && (err == nil || option.Sensitive) {
+		// A successful edit or consumed token needs a fresh interaction.
+		// An ordinary failed edit can still use its previous prompt if both
+		// Telegram requests for the retry fail.
+		session.rendering, session.inputToken = true, ""
+		session = updated.adminSessions.Set(scope.userID, session)
+	}
+	b.runtimeConfigMu.Unlock()
+
+	panelOptions := b.adminSendOptions(tele.ModeDefault)
+	if err != nil {
+		if !option.Sensitive {
+			failure += ": " + err.Error()
+		}
+		panelText := "❌ " + failure + "\n\n" + b.buildAdminEditPrompt(option, current.cfg)
+		rendered, renderErr := b.showAdminSession(c, snap, scope, session, session, panelText, panelOptions, option.Sensitive)
+		if rendered && !option.Sensitive {
+			b.deleteAdminInputMessage(c.Message())
+		}
+		return renderErr
+	}
+	if !option.Sensitive {
+		b.deleteAdminInputMessage(c.Message())
+	}
+	if !updated.cfg.isAdmin(scope.userID) || !updated.cfg.isAllowed(c) {
+		_, err := b.renderAdminPanel(c, session, "✅ Updated: "+option.EnvKey, &tele.SendOptions{})
+		return err
+	}
+	if updated.adminSessions != snap.adminSessions {
+		session = adminConfigSession{}
+	}
+	ready := session
+	ready.Step, ready.Selection = "select", 0
+	panelText := fmt.Sprintf("✅ Updated: %s\n📌 Current value: %s%s\n\n%s", option.EnvKey, previewConfigValue(option, updated.cfg), configOverrideNotice(option.EnvKey), b.buildAdminListText(updated.cfg))
+	_, err = b.showAdminSession(c, updated, scope, session, ready, panelText, panelOptions, false)
+	return err
 }
 
 func buildOpenAIClient(apiKey, baseURL string) (*openai.Client, error) {
@@ -1192,25 +1397,12 @@ func buildToolResources(cfg Config, stores *userMCPStorePool) (*ToolRegistry, *M
 	return registry, mcpManager, userTools, summaryStore, summaryGen, nil
 }
 
-func (b *Bot) persistRuntimeSummariesAndSchedules(db *ChatDB) {
+func (b *Bot) persistRuntimeSchedules(db *ChatDB) {
 	if db == nil {
 		return
 	}
 
 	snap := b.snapshot()
-	if snap.summaries != nil {
-		snap.summaries.mu.RLock()
-		summaryCopy := make(map[int64]string, len(snap.summaries.summaries))
-		for chatID, summary := range snap.summaries.summaries {
-			summaryCopy[chatID] = summary
-		}
-		snap.summaries.mu.RUnlock()
-
-		for chatID, summary := range summaryCopy {
-			db.SaveSummary(chatID, summary)
-		}
-	}
-
 	if snap.tasks != nil {
 		snap.tasks.mu.RLock()
 		taskCopy := make(map[int64][]ScheduledTask, len(snap.tasks.tasks))
@@ -1232,6 +1424,10 @@ func (b *Bot) persistRuntimeSummariesAndSchedules(db *ChatDB) {
 func (b *Bot) applyRuntimeConfig(next Config) error {
 	b.runtimeConfigMu.Lock()
 	defer b.runtimeConfigMu.Unlock()
+	return b.applyRuntimeConfigLocked(next)
+}
+
+func (b *Bot) applyRuntimeConfigLocked(next Config) error {
 	current := b.snapshot()
 
 	mainAI, detectorAI, profileAI, summaryAI, stickerAI, reminderAI, detectorModel, profileModel, summaryModel, stickerModel, reminderModel, err := buildAIResources(next)
@@ -1316,8 +1512,8 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 		}
 	}
 
-	if chatDBChanged && current.store != nil {
-		if err := current.store.migrateDB(newChatDB); err != nil {
+	if chatDBChanged {
+		if err := migrateChatStores(newChatDB, current.store, current.summaries, current.memory, current.engagements, current.reminders); err != nil {
 			_ = newChatDB.Close()
 			if newProfiles != nil && profilesChanged {
 				_ = newProfiles.Close()
@@ -1325,8 +1521,22 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 			if toolsChanged {
 				go closeToolResources(newMCPClients, newUserTools)
 			}
-			return fmt.Errorf("failed to migrate chat history: %w", err)
+			return fmt.Errorf("failed to migrate CHAT_DB_PATH: %w", err)
 		}
+	}
+
+	b.closeChangedDashboardSSH(next)
+
+	adminAccessChanged := current.cfg.AdminWildcard != next.AdminWildcard || !maps.Equal(current.cfg.AdminIDs, next.AdminIDs) ||
+		(current.cfg.AllowedUsers == nil) != (next.AllowedUsers == nil) || !maps.Equal(current.cfg.AllowedUsers, next.AllowedUsers) ||
+		(current.cfg.AllowedGroups == nil) != (next.AllowedGroups == nil) || !maps.Equal(current.cfg.AllowedGroups, next.AllowedGroups)
+	if b.commandMCP == nil {
+		b.commandMCP = &commandMCPAccess{cfg: next}
+	} else if adminAccessChanged {
+		b.commandMCP.update(next)
+	}
+	if newUserTools != nil && (toolsChanged || adminAccessChanged) {
+		newUserTools.refreshCommands(b.commandMCP)
 	}
 
 	b.mu.Lock()
@@ -1334,6 +1544,14 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	oldProfiles := b.profiles
 	var closeRetiredTools func()
 
+	if adminAccessChanged {
+		// Handlers waiting for Telegram can only update their old session stores.
+		b.adminSessions = NewAdminConfigSessionStore()
+		b.scheduleWizard = NewScheduleWizardStore()
+	}
+	if current.cfg.ProfileEnabled != next.ProfileEnabled {
+		b.memoryWriteEpoch.Add(1)
+	}
 	b.cfg = next
 	b.ai = mainAI
 	b.detectorAI = detectorAI
@@ -1355,14 +1573,8 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 		if b.stats != nil {
 			b.stats.RebindDB(newChatDB)
 		}
-		if b.summaries != nil {
-			b.summaries.db = newChatDB
-		}
 		if b.tasks != nil {
 			b.tasks.RebindDB(newChatDB)
-		}
-		if b.reminders != nil {
-			b.reminders.RebindDB(newChatDB)
 		}
 	}
 
@@ -1380,11 +1592,20 @@ func (b *Bot) applyRuntimeConfig(next Config) error {
 	}
 	b.mu.Unlock()
 
+	if next.AdminWildcard {
+		logAdminAccessDisabled()
+	} else if current.cfg.AdminWildcard {
+		log.Printf("[admin] ADMIN_ID wildcard removed; using the configured Telegram admin IDs and SSH settings")
+	}
+	if err := b.configureDashboardSSH(next); err != nil {
+		log.Printf("[dashboard] failed to apply SSH settings: %v", err)
+	}
+
 	if closeRetiredTools != nil {
 		go closeRetiredTools()
 	}
 	if chatDBChanged {
-		b.persistRuntimeSummariesAndSchedules(newChatDB)
+		b.persistRuntimeSchedules(newChatDB)
 		if b.stats != nil {
 			_ = b.stats.Flush()
 		}

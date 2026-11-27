@@ -1,7 +1,6 @@
 package app
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	openai "github.com/sashabaranov/go-openai"
 	tele "gopkg.in/telebot.v3"
@@ -257,13 +255,12 @@ func (b *Bot) handleStickerCommand(c tele.Context) error {
 	}
 
 	if strings.EqualFold(payload, "reload") {
-		if c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
-			return c.Reply("🚫 Only admins can reload sticker rules.")
-		}
-		if err := snap.stickers.Reload(snap.cfg.StickerRulesPath); err != nil {
-			return c.Reply(fmt.Sprintf("❌ Failed to reload sticker rules: %v", err))
-		}
-		return c.Reply("✅ Sticker rules reloaded.")
+		return b.replyAsAdmin(c, "🚫 Only admins can reload sticker rules.", func(snap runtimeSnapshot) string {
+			if err := snap.stickers.Reload(snap.cfg.StickerRulesPath); err != nil {
+				return fmt.Sprintf("❌ Failed to reload sticker rules: %v", err)
+			}
+			return "✅ Sticker rules reloaded."
+		})
 	}
 
 	label := snap.stickers.ResolveCommandLabel(payload)
@@ -295,7 +292,7 @@ func (b *Bot) sendSticker(chat *tele.Chat, fileID string) error {
 	return nil
 }
 
-func (b *Bot) selectStickerLabel(chatID int64, userMsg, finalText string) string {
+func (b *Bot) selectStickerLabel(turn *RoleTurn, userMsg, finalText string) string {
 	snap := b.snapshot()
 	if snap.stickers == nil {
 		return ""
@@ -316,33 +313,23 @@ func (b *Bot) selectStickerLabel(chatID int64, userMsg, finalText string) string
 	if !snap.cfg.StickerModelEnabled || snap.stickerAI == nil {
 		return ""
 	}
-	return b.selectStickerLabelWithModel(chatID, extractUserIDFromContent(userMsg), userText, finalText, snap.stickers.Labels())
+	return b.selectStickerLabelWithModel(turn, snap, userText, finalText, snap.stickers.Labels())
 }
 
-func (b *Bot) selectStickerLabelWithModel(chatID, userID int64, userText, finalText string, labels []string) string {
+func (b *Bot) selectStickerLabelWithModel(turn *RoleTurn, snap runtimeSnapshot, userText, finalText string, labels []string) string {
 	if len(labels) == 0 {
 		return ""
 	}
-	snap := b.snapshot()
-	usageCtx := newUsageContext(chatID, userID, 0)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	systemPrompt := fmt.Sprintf("You select one sticker label for a Telegram bot reply. Allowed labels: %s. Return ONE label only, or NONE if no sticker should be sent.", strings.Join(labels, ", "))
-	userPrompt := fmt.Sprintf("User message:\n%s\n\nAssistant final reply:\n%s\n\nPick one label.", strings.TrimSpace(userText), strings.TrimSpace(finalText))
-	req := openai.ChatCompletionRequest{
-		Model: snap.stickerModel,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
-		},
-		Temperature: 0,
+	turn.Purpose = RoleSticker
+	instruction := fmt.Sprintf("\n\nSelect one sticker label for your reply. Allowed labels: %s. Return ONE label only, or NONE if no sticker should be sent.", strings.Join(labels, ", "))
+	messages := snap.buildRoleContext(turn, userText, instruction, 0, true)
+	if len(messages) == 0 {
+		return ""
 	}
-	applyMaxTokens(&req, 16)
-	sanitizeBetaRequest(&req)
-	started := time.Now()
-	resp, err := snap.stickerAI.CreateChatCompletion(ctx, req)
-	b.recordUsageEvent(usageEvent(usageCtx, UsageCallStickerModel, firstNonEmpty(resp.Model, snap.stickerModel), false, 0, started, &resp.Usage, err == nil))
+	userPrompt := fmt.Sprintf("User message:\n%s\n\nAssistant final reply:\n%s\n\nPick one label.", strings.TrimSpace(userText), strings.TrimSpace(finalText))
+	messages = append(messages, openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: userPrompt})
+	req := openai.ChatCompletionRequest{Model: snap.stickerModel, Messages: messages}
+	resp, err := b.completeRoleDecision(*turn, snap, snap.stickerAI, req, UsageCallStickerModel, 16)
 	if err != nil {
 		log.Printf("[sticker] model selection error: %v", err)
 		return ""
@@ -364,12 +351,13 @@ func (b *Bot) selectStickerLabelWithModel(chatID, userID int64, userText, finalT
 }
 
 func (b *Bot) finalizeStickerReply(
-	chatID int64,
+	turn RoleTurn,
 	chat *tele.Chat,
 	userMsg openai.ChatCompletionMessage,
 	finalText string,
 	placeholder *tele.Message,
 ) {
+	chatID := turn.ChatID
 	snap := b.snapshot()
 	if chat == nil || snap.stickers == nil || !snap.cfg.StickerEnabled {
 		return
@@ -387,7 +375,7 @@ func (b *Bot) finalizeStickerReply(
 		return
 	}
 
-	label := b.selectStickerLabel(chatID, userMessageText(userMsg), finalText)
+	label := b.selectStickerLabel(&turn, userMessageText(userMsg), finalText)
 	if label == "" {
 		return
 	}
@@ -396,19 +384,24 @@ func (b *Bot) finalizeStickerReply(
 	if maxCount <= 0 {
 		maxCount = 1
 	}
-	if snap.cfg.StickerMode == stickerModeReplace && placeholder != nil {
-		if err := snap.tg.Delete(placeholder); err != nil && !strings.Contains(strings.ToLower(err.Error()), "message to delete not found") {
-			log.Printf("[sticker] delete placeholder error: %v", err)
+	turn.withCurrent(func() {
+		if snap.cfg.StickerMode == stickerModeReplace && placeholder != nil {
+			if turn.checkUse(turn.generation) != nil {
+				return
+			}
+			if err := snap.tg.Delete(placeholder); err != nil && !strings.Contains(strings.ToLower(err.Error()), "message to delete not found") {
+				log.Printf("[sticker] delete placeholder error: %v", err)
+			}
 		}
-	}
-	for i := 0; i < maxCount; i++ {
-		fileID, ok := snap.stickers.PickByLabel(label)
-		if !ok {
-			return
+		for i := 0; i < maxCount; i++ {
+			fileID, ok := snap.stickers.PickByLabel(label)
+			if !ok || turn.checkUse(turn.generation) != nil {
+				return
+			}
+			if err := b.sendSticker(chat, fileID); err != nil {
+				log.Printf("[sticker] send error: %v", err)
+				return
+			}
 		}
-		if err := b.sendSticker(chat, fileID); err != nil {
-			log.Printf("[sticker] send error: %v", err)
-			return
-		}
-	}
+	})
 }

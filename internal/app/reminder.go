@@ -5,15 +5,18 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
 	openai "github.com/sashabaranov/go-openai"
+	bolt "go.etcd.io/bbolt"
 	tele "gopkg.in/telebot.v3"
 )
 
@@ -33,6 +36,11 @@ type Reminder struct {
 	CreatedBy string    `json:"created_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	Original  string    `json:"original,omitempty"`
+
+	// FireAttempt is written before any delivery. A reservation left by a
+	// prior process is evidence of possible delivery.
+	FireAttempt         string `json:"fire_attempt,omitempty"`
+	DeliveryUnconfirmed bool   `json:"delivery_unconfirmed,omitempty"`
 }
 
 // IsRecurring reports whether the reminder should re-arm after firing.
@@ -45,15 +53,19 @@ func (r Reminder) IsRecurring() bool {
 // /reminders in a private chat has to list every reminder the caller owns
 // across every chat they've used the bot in.
 type ReminderStore struct {
-	mu   sync.RWMutex
-	data map[int64]map[string]Reminder // userID → reminderID → Reminder
-	db   *ChatDB
+	mu       sync.RWMutex
+	data     map[int64]map[string]Reminder // userID → reminderID → Reminder
+	inFlight map[string]struct{}           // attempts owned by this process
+	db       *ChatDB
+	now      func() time.Time
 }
 
 func NewReminderStore(db *ChatDB) *ReminderStore {
 	s := &ReminderStore{
-		data: make(map[int64]map[string]Reminder),
-		db:   db,
+		data:     make(map[int64]map[string]Reminder),
+		inFlight: make(map[string]struct{}),
+		db:       db,
+		now:      time.Now,
 	}
 	if db != nil {
 		for userID, items := range db.LoadAllReminders() {
@@ -72,27 +84,82 @@ func NewReminderStore(db *ChatDB) *ReminderStore {
 	return s
 }
 
-func (s *ReminderStore) RebindDB(db *ChatDB) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.db = db
+// saveLocked updates memory only after the replacement owner row commits.
+func (s *ReminderStore) saveLocked(userID int64, id string, next *Reminder) error {
+	items := s.data[userID]
+	if s.db != nil {
+		list := make([]Reminder, 0, len(items)+1)
+		for key, rem := range items {
+			if key != id {
+				list = append(list, rem)
+			}
+		}
+		if next != nil {
+			list = append(list, *next)
+		}
+		if err := s.db.db.Update(func(tx *bolt.Tx) error {
+			return putReminders(tx.Bucket(reminderBucket), userIDKey(userID), list)
+		}); err != nil {
+			return err
+		}
+	}
+	if next == nil {
+		delete(items, id)
+		if len(items) == 0 {
+			delete(s.data, userID)
+		}
+		return nil
+	}
+	if items == nil {
+		items = make(map[string]Reminder)
+		s.data[userID] = items
+	}
+	items[id] = *next
+	return nil
 }
 
-func (s *ReminderStore) persistLocked(userID int64) {
-	if s.db == nil {
-		return
+func (s *ReminderStore) copyTo(tx *bolt.Tx) error {
+	bucket := tx.Bucket(reminderBucket)
+	// Without a shared history, a destination-only row could be an
+	// independent reminder or an obsolete copy of a canceled occurrence.
+	// Reject both instead of overwriting or rescheduling an obsolete row.
+	if err := bucket.ForEach(func(key, raw []byte) error {
+		userID, err := strconv.ParseInt(string(key), 10, 64)
+		if err != nil {
+			return err
+		}
+		var reminders []Reminder
+		if err := json.Unmarshal(raw, &reminders); err != nil {
+			return err
+		}
+		for _, rem := range reminders {
+			current, ok := s.data[userID][rem.ID]
+			if !ok || !sameReminder(current, rem) {
+				return fmt.Errorf("destination has incompatible reminder %s for user %d", rem.ID, userID)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
-	items := s.data[userID]
-	if len(items) == 0 {
-		s.db.DeleteRemindersForUser(userID)
-		return
+	for userID, items := range s.data {
+		list := make([]Reminder, 0, len(items))
+		for _, rem := range items {
+			list = append(list, rem)
+		}
+		if err := putReminders(bucket, userIDKey(userID), list); err != nil {
+			return err
+		}
 	}
-	list := make([]Reminder, 0, len(items))
-	for _, rem := range items {
-		list = append(list, rem)
+	return nil
+}
+
+func sameReminder(a, b Reminder) bool {
+	if !a.FireAt.Equal(b.FireAt) || !a.CreatedAt.Equal(b.CreatedAt) {
+		return false
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
-	s.db.SaveReminders(userID, list)
+	a.FireAt, a.CreatedAt = b.FireAt, b.CreatedAt
+	return a == b
 }
 
 // ListForUser returns every reminder owned by userID, sorted by next fire time.
@@ -132,32 +199,27 @@ func (s *ReminderStore) Get(userID int64, id string) (Reminder, bool) {
 	return rem, ok
 }
 
-// Insert stores a new reminder. Caller is responsible for ID uniqueness.
-func (s *ReminderStore) Insert(rem Reminder) {
+// Insert stores a new reminder. A collision cannot replace an in-flight row.
+func (s *ReminderStore) Insert(rem Reminder) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	items := s.data[rem.UserID]
-	if items == nil {
-		items = make(map[string]Reminder)
-		s.data[rem.UserID] = items
+	if _, exists := s.data[rem.UserID][rem.ID]; exists {
+		return fmt.Errorf("reminder %s already exists", rem.ID)
 	}
-	items[rem.ID] = rem
-	s.persistLocked(rem.UserID)
+	return s.saveLocked(rem.UserID, rem.ID, &rem)
 }
 
-// Delete removes a reminder owned by userID. Returns true if it existed.
+// Delete removes a reminder owned by userID. Returns true if committed.
 func (s *ReminderStore) Delete(userID int64, id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	items := s.data[userID]
-	if _, ok := items[id]; !ok {
+	if _, ok := s.data[userID][id]; !ok {
 		return false
 	}
-	delete(items, id)
-	if len(items) == 0 {
-		delete(s.data, userID)
+	if err := s.saveLocked(userID, id, nil); err != nil {
+		log.Printf("[reminder] delete user=%d id=%s: %v", userID, id, err)
+		return false
 	}
-	s.persistLocked(userID)
 	return true
 }
 
@@ -181,7 +243,8 @@ func (s *ReminderStore) Due(now time.Time) []reminderRef {
 	var due []reminderRef
 	for userID, items := range s.data {
 		for _, rem := range items {
-			if rem.FireAt.IsZero() || rem.FireAt.After(now) {
+			if _, active := s.inFlight[rem.FireAttempt]; active || rem.DeliveryUnconfirmed ||
+				rem.FireAt.IsZero() || rem.FireAt.After(now) {
 				continue
 			}
 			due = append(due, reminderRef{UserID: userID, Item: rem})
@@ -190,48 +253,69 @@ func (s *ReminderStore) Due(now time.Time) []reminderRef {
 	return due
 }
 
-// CompleteFire handles post-fire bookkeeping. One-shot reminders are deleted;
-// recurring reminders get their FireAt advanced to the next cron occurrence.
-// If cron re-parse fails the reminder is removed so it doesn't get stuck.
-func (s *ReminderStore) CompleteFire(userID int64, id string, now time.Time) {
+// beginFire reserves the exact due version. An abandoned reservation only
+// admits local recovery, which settles it as uncertain without sending.
+func (s *ReminderStore) beginFire(userID int64, due Reminder) (reserved Reminder, send bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	items := s.data[userID]
-	rem, ok := items[id]
-	if !ok {
-		return
+	current, ok := s.data[userID][due.ID]
+	if !ok || !sameReminder(current, due) || current.DeliveryUnconfirmed {
+		return Reminder{}, false, nil
 	}
-	if !rem.IsRecurring() {
-		delete(items, id)
-		if len(items) == 0 {
-			delete(s.data, userID)
+	if _, active := s.inFlight[current.FireAttempt]; active {
+		return Reminder{}, false, nil
+	}
+	if current.FireAttempt == "" {
+		current.FireAttempt = rand.Text()
+		if err := s.saveLocked(userID, current.ID, &current); err != nil {
+			return Reminder{}, false, fmt.Errorf("reserve reminder delivery: %w", err)
 		}
-		s.persistLocked(userID)
-		return
+		send = true
+	}
+	s.inFlight[current.FireAttempt] = struct{}{}
+	return current, send, nil
+}
+
+// completeFire changes only the reserved version, leaving any cancellation
+// or newer row intact. If settlement fails, the durable reservation remains.
+func (s *ReminderStore) completeFire(userID int64, reserved Reminder, outcome error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	defer delete(s.inFlight, reserved.FireAttempt)
+	id := reserved.ID
+	rem, ok := s.data[userID][id]
+	if !ok || !sameReminder(rem, reserved) {
+		return nil
+	}
+	unknown := errors.Is(outcome, errTelegramDeliveryUnknown)
+	if !rem.IsRecurring() {
+		if !unknown {
+			return s.saveLocked(userID, id, nil)
+		}
+		rem.DeliveryUnconfirmed = true
+		return s.saveLocked(userID, id, &rem)
+	}
+	rem.FireAttempt = ""
+	if outcome != nil && !unknown {
+		return s.saveLocked(userID, id, &rem)
 	}
 	loc, err := time.LoadLocation(rem.Timezone)
 	if err != nil {
 		log.Printf("[reminder] drop recurring %s: bad timezone %q: %v", id, rem.Timezone, err)
-		delete(items, id)
-		if len(items) == 0 {
-			delete(s.data, userID)
-		}
-		s.persistLocked(userID)
-		return
+		return s.saveLocked(userID, id, nil)
 	}
 	schedule, err := cron.ParseStandard(rem.CronExpr)
 	if err != nil {
 		log.Printf("[reminder] drop recurring %s: bad cron %q: %v", id, rem.CronExpr, err)
-		delete(items, id)
-		if len(items) == 0 {
-			delete(s.data, userID)
-		}
-		s.persistLocked(userID)
-		return
+		return s.saveLocked(userID, id, nil)
+	}
+	// Advance even if the process clock moved backwards since the tick.
+	now := s.now()
+	if now.Before(rem.FireAt) {
+		now = rem.FireAt
 	}
 	rem.FireAt = schedule.Next(now.In(loc)).UTC()
-	items[id] = rem
-	s.persistLocked(userID)
+	return s.saveLocked(userID, id, &rem)
 }
 
 // ─── Runner hook (shared with scheduler) ─────────────────────────────────────
@@ -256,20 +340,33 @@ func (r *TaskRunner) runDueReminders(now time.Time) {
 	}
 }
 
-func (r *TaskRunner) executeReminder(userID int64, rem Reminder) {
-	log.Printf("[reminder] triggering user=%d chat=%d id=%s", userID, rem.ChatID, rem.ID)
-	r.bot.recordDashboardEvent(DashboardEvent{
-		Type:    DashboardEventScheduleTriggered,
-		ChatID:  rem.ChatID,
-		UserID:  userID,
-		Summary: fmt.Sprintf("trigger reminder %s", rem.ID),
-		Detail:  truncateDashboardText("[reminder] "+rem.Prompt, 160),
-		Success: true,
-	})
-
-	msg := buildReminderMessage(rem)
-	chat := &tele.Chat{ID: rem.ChatID}
-	if err := r.bot.startChatFlowWithInstruction(chat, nil, msg, false, reminderDeliveryInstruction); err != nil {
+func (r *TaskRunner) executeReminder(userID int64, rem Reminder) error {
+	store := r.bot.reminders
+	reserved, send, err := store.beginFire(userID, rem)
+	if err == nil && reserved.ID == "" {
+		return nil
+	}
+	if send {
+		log.Printf("[reminder] triggering user=%d chat=%d id=%s", userID, rem.ChatID, rem.ID)
+		r.bot.recordDashboardEvent(DashboardEvent{
+			Type:    DashboardEventScheduleTriggered,
+			ChatID:  rem.ChatID,
+			UserID:  userID,
+			Summary: fmt.Sprintf("trigger reminder %s", rem.ID),
+			Detail:  truncateDashboardText("[reminder] "+rem.Prompt, 160),
+			Success: true,
+		})
+		turn := r.bot.beginRoleTurn(RoleTurn{ChatID: rem.ChatID, InitiatorID: userID, Purpose: RoleBackground})
+		err = r.bot.runScheduledReply(turn, buildReminderMessage(rem), false, reminderDeliveryInstruction)
+	} else if reserved.ID != "" {
+		err = errTelegramDeliveryUnknown
+	}
+	if reserved.ID != "" {
+		if saveErr := store.completeFire(userID, reserved, err); saveErr != nil {
+			err = errors.Join(err, fmt.Errorf("settle reminder delivery: %w", saveErr))
+		}
+	}
+	if err != nil {
 		log.Printf("[reminder] trigger failed user=%d id=%s: %v", userID, rem.ID, err)
 		r.bot.recordDashboardEvent(DashboardEvent{
 			Type:    DashboardEventScheduleFailed,
@@ -278,14 +375,8 @@ func (r *TaskRunner) executeReminder(userID int64, rem Reminder) {
 			Summary: fmt.Sprintf("reminder %s failed", rem.ID),
 			Detail:  err.Error(),
 		})
-		// Leave recurring reminders in place so we retry next tick; advance
-		// one-shot reminders to avoid wedging the runner on a dead chat.
-		if !rem.IsRecurring() {
-			r.bot.reminders.Delete(userID, rem.ID)
-		}
-		return
 	}
-	r.bot.reminders.CompleteFire(userID, rem.ID, time.Now().UTC())
+	return err
 }
 
 const reminderDeliveryInstruction = `Your task is to deliver a scheduled reminder to the recipient now. The text after the [reminder] metadata line is what the recipient should be reminded to do. Address the recipient directly in the same language as that text. Preserve identifiers exactly, including case, digits, and punctuation. Do not perform the action, call tools, offer advice, or ask follow-up questions. Return only the brief reminder message.`
@@ -562,7 +653,10 @@ func (b *Bot) handleRemindCommand(c tele.Context) error {
 		CreatedAt: now,
 		Original:  payload,
 	}
-	b.reminders.Insert(rem)
+	if err := b.reminders.Insert(rem); err != nil {
+		log.Printf("[reminder] create user=%d id=%s: %v", rem.UserID, rem.ID, err)
+		return c.Reply("❌ Failed to save the reminder.")
+	}
 
 	loc, _ := time.LoadLocation(parsed.Timezone)
 	fireLocal := parsed.FireAt.In(loc).Format("2006-01-02 15:04")
@@ -612,6 +706,9 @@ func (b *Bot) handleRemindersCommand(c tele.Context) error {
 		tag := ""
 		if rem.IsRecurring() {
 			tag = "  (recurring: " + rem.CronExpr + ")"
+		}
+		if rem.DeliveryUnconfirmed || rem.FireAttempt != "" {
+			tag += "  (delivery unconfirmed)"
 		}
 		chatHint := ""
 		if isPrivate && rem.ChatID != c.Chat().ID {

@@ -27,8 +27,7 @@ var (
 	usageRecentBucket = []byte("usage_recent_meta")
 )
 
-// ChatDB wraps a bbolt database shared by HistoryStore and SummaryStore for
-// persistent chat storage that survives restarts.
+// ChatDB wraps the bbolt database shared by the persistent chat stores.
 type ChatDB struct {
 	db *bolt.DB
 }
@@ -52,12 +51,23 @@ func OpenChatDB(path string) (*ChatDB, error) {
 			usageMinuteBucket,
 			usageDailyBucket,
 			usageRecentBucket,
+			memoryEntryBucket,
+			memoryEventBucket,
+			engagementBucket,
+			engagementRequestsBucket,
+			engagementWorkBucket,
+			engagementRevisionsBucket,
+			conversationPreferenceBucket,
+			chatterBucket,
 		} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
 		}
-		return nil
+		if err := pruneLegacyEngagementRevisions(tx); err != nil {
+			return err
+		}
+		return pruneLegacyChatterRevisions(tx.Bucket(chatterBucket))
 	}); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init chat db buckets: %w", err)
@@ -81,31 +91,155 @@ func chatIDKey(chatID int64) []byte {
 // ─── History Persistence ─────────────────────────────────────────────────────
 
 // migrateDB copies the in-memory history, overflow and removals before redirecting writes.
-// Appends, clears and overflow drains all use the same lock.
 func (s *HistoryStore) migrateDB(db *ChatDB) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return migrateChatDB(db, s, nil)
+}
+
+func migrateChatDB(db *ChatDB, history *HistoryStore, memory *MemoryBook, summaryStores ...*SummaryStore) error {
+	var summaries *SummaryStore
+	if len(summaryStores) > 0 {
+		summaries = summaryStores[0]
+	}
+	return migrateChatStores(db, history, summaries, memory, nil)
+}
+
+// migrateChatStores commits all stores before rebinding any handle. Acquire
+// the history, summary, memory, engagement and reminder locks in that order.
+func migrateChatStores(db *ChatDB, history *HistoryStore, summaries *SummaryStore, memory *MemoryBook, engagements *EngagementStore, reminderStores ...*ReminderStore) error {
+	var reminders *ReminderStore
+	if len(reminderStores) > 0 {
+		reminders = reminderStores[0]
+	}
+	if history != nil {
+		history.mu.Lock()
+		defer history.mu.Unlock()
+	}
+	if summaries != nil {
+		summaries.mu.Lock()
+		defer summaries.mu.Unlock()
+	}
+	if memory != nil {
+		memory.mu.Lock()
+		defer memory.mu.Unlock()
+	}
+	if engagements != nil {
+		engagements.mu.Lock()
+		defer engagements.mu.Unlock()
+	}
+	if reminders != nil {
+		reminders.mu.Lock()
+		defer reminders.mu.Unlock()
+	}
 
 	if err := db.db.Update(func(tx *bolt.Tx) error {
-		for _, state := range []struct {
-			bucket   []byte
-			messages map[int64][]openai.ChatCompletionMessage
-		}{
-			{historyBucket, s.history},
-			{overflowBucket, s.overflow},
-		} {
-			bucket := tx.Bucket(state.bucket)
-			for chatID, messages := range state.messages {
-				if err := putChatMessages(bucket, chatIDKey(chatID), messages); err != nil {
+		if history != nil {
+			if err := history.copyTo(tx); err != nil {
+				return fmt.Errorf("migrate chat history: %w", err)
+			}
+		}
+		if summaries != nil {
+			for chatID, summary := range summaries.summaries {
+				if err := tx.Bucket(summaryBucket).Put(chatIDKey(chatID), []byte(summary)); err != nil {
+					return fmt.Errorf("migrate chat summaries: %w", err)
+				}
+			}
+		}
+		if memory != nil && memory.db != nil && memory.db != db {
+			if err := memory.db.db.View(func(source *bolt.Tx) error {
+				return copyMemoryBook(source, tx)
+			}); err != nil {
+				return fmt.Errorf("migrate memory book: %w", err)
+			}
+		}
+		if engagements != nil && engagements.db != nil && engagements.db != db {
+			if err := engagements.db.db.View(func(source *bolt.Tx) error {
+				if err := copyEngagements(source, tx); err != nil {
 					return err
 				}
+				if err := copyConversationPreferences(source, tx); err != nil {
+					return err
+				}
+				return copyChatter(source, tx)
+			}); err != nil {
+				return fmt.Errorf("migrate engagements: %w", err)
+			}
+		}
+		if reminders != nil {
+			if err := reminders.copyTo(tx); err != nil {
+				return fmt.Errorf("migrate reminders: %w", err)
 			}
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
-	s.db = db
+	if history != nil {
+		history.db = db
+	}
+	if summaries != nil {
+		summaries.db = db
+	}
+	if memory != nil {
+		memory.db = db
+	}
+	if engagements != nil {
+		engagements.db = db
+	}
+	if reminders != nil {
+		reminders.db = db
+	}
+	return nil
+}
+
+func (s *HistoryStore) copyTo(tx *bolt.Tx) error {
+	for _, state := range []struct {
+		bucket   []byte
+		messages map[int64][]openai.ChatCompletionMessage
+	}{
+		{historyBucket, s.history},
+		{overflowBucket, s.overflow},
+	} {
+		bucket := tx.Bucket(state.bucket)
+		for chatID, messages := range state.messages {
+			if err := putChatMessages(bucket, chatIDKey(chatID), messages); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// clearContext resets the three stores in one transaction. Empty persisted
+// values carry the removal across later runtime database switches.
+func (s *HistoryStore) clearContext(chatID int64, summaries *SummaryStore) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if summaries != nil {
+		summaries.mu.Lock()
+		defer summaries.mu.Unlock()
+	}
+	if s.db != nil {
+		key := chatIDKey(chatID)
+		if err := s.db.db.Update(func(tx *bolt.Tx) error {
+			if err := putChatMessages(tx.Bucket(historyBucket), key, nil); err != nil {
+				return err
+			}
+			if err := putChatMessages(tx.Bucket(overflowBucket), key, nil); err != nil {
+				return err
+			}
+			if err := clearChatter(tx, key); err != nil {
+				return err
+			}
+			return tx.Bucket(summaryBucket).Put(key, []byte{})
+		}); err != nil {
+			return err
+		}
+	}
+	s.history[chatID], s.overflow[chatID] = nil, nil
+	s.overflowRevision[chatID]++
+	if summaries != nil {
+		summaries.summaries[chatID] = ""
+	}
 	return nil
 }
 
@@ -165,6 +299,49 @@ func (c *ChatDB) LoadAllHistory() map[int64][]openai.ChatCompletionMessage {
 }
 
 // ─── Overflow Persistence ────────────────────────────────────────────────────
+
+type overflowBatch struct {
+	messages []openai.ChatCompletionMessage
+	revision uint64
+}
+
+// pendingOverflow selects the current prefix. Appends do not change the
+// selected messages or revision, even if they reallocate the queue.
+func (s *HistoryStore) pendingOverflow(chatID int64) overflowBatch {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return overflowBatch{s.overflow[chatID], s.overflowRevision[chatID]}
+}
+
+// commitSummary publishes the new summary and removes only the selected
+// prefix. Later appends remain pending. The caller holds the role generation
+// guard, and the lock order matches clearContext and migrateChatDB.
+func (s *HistoryStore) commitSummary(chatID int64, summaries *SummaryStore, batch overflowBatch, existing, summary string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	summaries.mu.Lock()
+	defer summaries.mu.Unlock()
+
+	if len(batch.messages) == 0 || s.overflowRevision[chatID] != batch.revision || summaries.summaries[chatID] != existing {
+		return false, nil
+	}
+	remaining := append([]openai.ChatCompletionMessage(nil), s.overflow[chatID][len(batch.messages):]...)
+	if s.db != nil {
+		key := chatIDKey(chatID)
+		if err := s.db.db.Update(func(tx *bolt.Tx) error {
+			if err := putChatMessages(tx.Bucket(overflowBucket), key, remaining); err != nil {
+				return err
+			}
+			return tx.Bucket(summaryBucket).Put(key, []byte(summary))
+		}); err != nil {
+			return false, err
+		}
+	}
+	s.overflow[chatID] = remaining
+	s.overflowRevision[chatID]++
+	summaries.summaries[chatID] = summary
+	return true, nil
+}
 
 func (c *ChatDB) markOverflowDrained(chatID int64) {
 	if c == nil {
@@ -540,27 +717,17 @@ func userIDKey(userID int64) []byte {
 	return []byte(strconv.FormatInt(userID, 10))
 }
 
-// SaveReminders persists the reminder list for a user. An empty slice deletes
-// the key. Reminders are keyed by userID (not chatID) so the private-chat
-// "show me all my reminders across chats" listing is a single bucket lookup.
-func (c *ChatDB) SaveReminders(userID int64, reminders []Reminder) {
-	if c == nil {
-		return
-	}
+// putReminders replaces an owner's reminders inside the caller's transaction.
+func putReminders(bucket *bolt.Bucket, key []byte, reminders []Reminder) error {
 	if len(reminders) == 0 {
-		c.DeleteRemindersForUser(userID)
-		return
+		return bucket.Delete(key)
 	}
+	sort.Slice(reminders, func(i, j int) bool { return reminders[i].ID < reminders[j].ID })
 	data, err := json.Marshal(reminders)
 	if err != nil {
-		log.Printf("[chat-db] marshal reminders error for user %d: %v", userID, err)
-		return
+		return err
 	}
-	if err := c.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(reminderBucket).Put(userIDKey(userID), data)
-	}); err != nil {
-		log.Printf("[chat-db] save reminders error for user %d: %v", userID, err)
-	}
+	return bucket.Put(key, data)
 }
 
 // LoadAllReminders loads all persisted reminders grouped by owner user ID.
@@ -586,14 +753,4 @@ func (c *ChatDB) LoadAllReminders() map[int64][]Reminder {
 		})
 	})
 	return result
-}
-
-// DeleteRemindersForUser removes persisted reminders owned by a user.
-func (c *ChatDB) DeleteRemindersForUser(userID int64) {
-	if c == nil {
-		return
-	}
-	c.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(reminderBucket).Delete(userIDKey(userID))
-	})
 }

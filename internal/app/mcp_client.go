@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -54,13 +55,15 @@ import (
 //	  }
 //	}
 type MCPServerConfig struct {
-	Type     string            `json:"type,omitempty"`     // "streamablehttp", "sse", or "stdio" (auto-inferred if empty)
-	URL      string            `json:"url,omitempty"`      // for streamablehttp / sse
-	Headers  map[string]string `json:"headers,omitempty"`  // for streamablehttp / sse
-	Command  string            `json:"command,omitempty"`  // for stdio
-	Args     []string          `json:"args,omitempty"`     // for stdio
-	Env      FlexEnv           `json:"env,omitempty"`      // for stdio: accepts both ["K=V"] and {"K":"V"}
-	Disabled bool              `json:"disabled,omitempty"` // if true, skip this server (Claude Desktop compat)
+	Type               string                         `json:"type,omitempty"`     // "streamablehttp", "sse", or "stdio" (auto-inferred if empty)
+	URL                string                         `json:"url,omitempty"`      // for streamablehttp / sse
+	Headers            map[string]string              `json:"headers,omitempty"`  // for streamablehttp / sse
+	Command            string                         `json:"command,omitempty"`  // for stdio
+	Args               []string                       `json:"args,omitempty"`     // for stdio
+	Env                FlexEnv                        `json:"env,omitempty"`      // for stdio: accepts both ["K=V"] and {"K":"V"}
+	Disabled           bool                           `json:"disabled,omitempty"` // if true, skip this server (Claude Desktop compat)
+	Background         map[string]EngagementMCPPolicy `json:"background,omitempty"`
+	BackgroundIdentity string                         `json:"backgroundIdentity,omitempty"`
 }
 
 // FlexEnv holds environment variables and supports JSON unmarshalling from
@@ -142,7 +145,8 @@ func LoadMCPConfig(path string) (*MCPConfig, error) {
 // MCPClientManager manages connections to multiple MCP servers and registers
 // their tools into the ToolRegistry.
 type MCPClientManager struct {
-	clients map[string]*client.Client // serverName → MCP client
+	clients      map[string]*client.Client // serverName → MCP client
+	stdioContext context.Context           // personal command lifetime, independent of startup
 }
 
 // NewMCPClientManager creates an empty client manager.
@@ -187,6 +191,15 @@ func (m *MCPClientManager) connectOne(
 ) error {
 	var c *client.Client
 	var err error
+	var stopProcessStartup func() bool
+	var cancelProcess context.CancelFunc
+	closeFailedClient := func() {
+		if cancelProcess != nil {
+			stopProcessStartup()
+			cancelProcess()
+		}
+		_ = c.Close()
+	}
 
 	transportType := InferTransportType(&srv)
 	switch strings.ToLower(transportType) {
@@ -238,7 +251,13 @@ func (m *MCPClientManager) connectOne(
 		}
 		stdioTransport := transport.NewStdio(srv.Command, srv.EnvList(), srv.Args...)
 		c = client.NewClient(stdioTransport)
-		if err := c.Start(ctx); err != nil {
+		processCtx := ctx
+		if m.stdioContext != nil {
+			processCtx, cancelProcess = context.WithCancel(m.stdioContext)
+			stopProcessStartup = context.AfterFunc(ctx, cancelProcess)
+		}
+		if err := c.Start(processCtx); err != nil {
+			closeFailedClient()
 			return fmt.Errorf("start stdio client: %w", err)
 		}
 
@@ -257,7 +276,7 @@ func (m *MCPClientManager) connectOne(
 
 	serverInfo, err := c.Initialize(ctx, initReq)
 	if err != nil {
-		c.Close()
+		closeFailedClient()
 		return fmt.Errorf("initialize: %w", err)
 	}
 
@@ -265,24 +284,38 @@ func (m *MCPClientManager) connectOne(
 		name, serverInfo.ServerInfo.Name, serverInfo.ServerInfo.Version)
 
 	// Discover and register tools.
-	toolsResult, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	var toolsResult []mcp.Tool
+	if len(srv.Background) != 0 && !IsCommandMCP(srv) {
+		toolsResult, err = listEngagementMCPTools(ctx, c)
+	} else {
+		var result *mcp.ListToolsResult
+		result, err = c.ListTools(ctx, mcp.ListToolsRequest{})
+		if err == nil {
+			toolsResult = result.Tools
+		}
+	}
 	if err != nil {
-		c.Close()
+		closeFailedClient()
 		return fmt.Errorf("list tools: %w", err)
 	}
+	if stopProcessStartup != nil && !stopProcessStartup() {
+		closeFailedClient()
+		return fmt.Errorf("stdio startup expired: %w", ctx.Err())
+	}
 
-	for _, tool := range toolsResult.Tools {
+	for _, tool := range toolsResult {
 		wrapper := &MCPRemoteTool{
 			client:     c,
 			serverName: name,
 			tool:       tool,
+			background: newEngagementBinding(name, srv, tool),
 		}
 		registry.Register(wrapper)
 		log.Printf("[mcp]   registered tool: %s (from %s)", tool.Name, name)
 	}
 
 	m.clients[name] = c
-	log.Printf("[mcp] %q: %d tools registered", name, len(toolsResult.Tools))
+	log.Printf("[mcp] %q: %d tools registered", name, len(toolsResult))
 	return nil
 }
 
@@ -290,6 +323,10 @@ func (m *MCPClientManager) connectOne(
 func (m *MCPClientManager) Close() {
 	for name, c := range m.clients {
 		if err := c.Close(); err != nil {
+			var exitErr *exec.ExitError
+			if m.stdioContext != nil && m.stdioContext.Err() != nil && errors.As(err, &exitErr) {
+				continue
+			}
 			log.Printf("[mcp] error closing %q: %v", name, err)
 		}
 	}
@@ -302,7 +339,9 @@ func (m *MCPClientManager) Close() {
 type MCPRemoteTool struct {
 	client     *client.Client
 	serverName string
+	background *engagementMCPBinding
 	tool       mcp.Tool
+	command    *userCommandMCP
 }
 
 func (t *MCPRemoteTool) Name() string        { return t.tool.Name }
@@ -371,29 +410,52 @@ func sanitizeSchema(v any) {
 
 // Execute calls the remote MCP tool and returns the text result.
 func (t *MCPRemoteTool) Execute(args string) (string, error) {
-	result, err := t.call(context.Background(), args)
-	if err != nil {
-		return "", err
-	}
-	return extractTextFromContent(result), nil
+	return t.execute(context.Background(), args, false)
 }
 
 // ExecuteContext reports MCP tool errors and uses the caller's context.
 func (t *MCPRemoteTool) ExecuteContext(ctx context.Context, args string) (string, error) {
+	return t.execute(ctx, args, true)
+}
+
+func (t *MCPRemoteTool) execute(ctx context.Context, args string, reportToolError bool) (text string, err error) {
+	if t.command != nil {
+		call := t.command.beginCall(ctx)
+		if call == nil {
+			return "", errCommandMCPAccess
+		}
+		defer func() {
+			if !t.command.finishCall(call) {
+				text, err = "", errCommandMCPAccess
+			}
+		}()
+		ctx = call.ctx
+	}
+	result, err := t.executeRPC(ctx, args, reportToolError)
+	return result.text, err
+}
+
+type mcpToolOutput struct {
+	text       string
+	hasPayload bool
+}
+
+// The caller owns any command authorization through delivery of this result.
+func (t *MCPRemoteTool) executeRPC(ctx context.Context, args string, reportToolError bool) (mcpToolOutput, error) {
 	result, err := t.call(ctx, args)
 	if err != nil {
-		return "", err
+		return mcpToolOutput{}, err
 	}
-	text := extractTextFromContent(result)
-	if result != nil && result.IsError {
-		return "", errors.New(text)
+	output := extractMCPToolOutput(result)
+	if reportToolError && result != nil && result.IsError {
+		return mcpToolOutput{}, errors.New(output.text)
 	}
-	return text, nil
+	return output, nil
 }
 
 func (t *MCPRemoteTool) call(ctx context.Context, args string) (*mcp.CallToolResult, error) {
-	// Parse the JSON arguments from the LLM into a map.
-	var arguments map[string]any
+	// Keep JSON numbers exact when forwarding approved argument values.
+	var arguments map[string]json.RawMessage
 	if args != "" && args != "{}" {
 		if err := json.Unmarshal([]byte(args), &arguments); err != nil {
 			return nil, fmt.Errorf("invalid arguments JSON: %w", err)
@@ -414,10 +476,10 @@ func (t *MCPRemoteTool) call(ctx context.Context, args string) (*mcp.CallToolRes
 	return result, nil
 }
 
-// extractTextFromContent concatenates all text content pieces from a CallToolResult.
-func extractTextFromContent(result *mcp.CallToolResult) string {
+// Keep placeholders in the display path and measure payload before adding them.
+func extractMCPToolOutput(result *mcp.CallToolResult) mcpToolOutput {
 	if result == nil || len(result.Content) == 0 {
-		return "(no output)"
+		return mcpToolOutput{text: "(no output)"}
 	}
 
 	var parts []string
@@ -426,18 +488,23 @@ func extractTextFromContent(result *mcp.CallToolResult) string {
 		case mcp.TextContent:
 			parts = append(parts, content.Text)
 		case *mcp.TextContent:
-			parts = append(parts, content.Text)
+			if content != nil {
+				parts = append(parts, content.Text)
+			}
 		default:
 			// For non-text content (images, audio, etc.), marshal to JSON.
-			data, err := json.Marshal(content)
-			if err == nil {
-				parts = append(parts, string(data))
+			if content != nil {
+				data, err := json.Marshal(content)
+				if err == nil {
+					parts = append(parts, string(data))
+				}
 			}
 		}
 	}
 
 	if len(parts) == 0 {
-		return "(no text output)"
+		return mcpToolOutput{text: "(no text output)"}
 	}
-	return strings.Join(parts, "\n")
+	text := strings.Join(parts, "\n")
+	return mcpToolOutput{text: text, hasPayload: strings.TrimSpace(text) != ""}
 }

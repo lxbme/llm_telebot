@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	openai "github.com/sashabaranov/go-openai"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -150,6 +151,11 @@ func (s *UserMCPStore) AddServers(userID int64, incoming map[string]MCPServerCon
 
 	var names []string
 	for name, srv := range incoming {
+		// A personal import or replacement always creates a fresh enrollment.
+		srv.BackgroundIdentity = ""
+		if len(srv.Background) > 0 && !IsCommandMCP(srv) {
+			srv.BackgroundIdentity = rand.Text()
+		}
 		existing.MCPServers[name] = srv
 		names = append(names, name)
 	}
@@ -200,22 +206,27 @@ func (s *UserMCPStore) AllUserIDs() ([]int64, error) {
 // UserToolManager manages per-user MCP client connections and tool registries.
 // Each user has their own set of connected MCP servers and discovered tools.
 type UserToolManager struct {
-	mu           sync.RWMutex
-	store        *UserMCPStore
-	registries   map[int64]*ToolRegistry     // userID → personal tool registry
-	clients      map[int64]*MCPClientManager // userID → personal MCP connections
-	summaryStore *MCPSummaryStore            // nil when summary mode is disabled
-	summaryGen   *MCPSummaryGenerator        // nil when summary mode is disabled
+	mu                sync.RWMutex
+	store             *UserMCPStore
+	registries        map[int64]*ToolRegistry // combined personal tool views
+	networkRegistries map[int64]*ToolRegistry
+	clients           map[int64]*MCPClientManager // ordinary network connections
+	commands          map[int64]*userCommandMCP
+	commandAccess     *commandMCPAccess
+	summaryStore      *MCPSummaryStore // nil when summary mode is disabled
+	summaryGen        *MCPSummaryGenerator
 }
 
 // NewUserToolManager creates a new manager backed by the given store.
 func NewUserToolManager(store *UserMCPStore, summaryStore *MCPSummaryStore, summaryGen *MCPSummaryGenerator) *UserToolManager {
 	return &UserToolManager{
-		store:        store,
-		registries:   make(map[int64]*ToolRegistry),
-		clients:      make(map[int64]*MCPClientManager),
-		summaryStore: summaryStore,
-		summaryGen:   summaryGen,
+		store:             store,
+		registries:        make(map[int64]*ToolRegistry),
+		networkRegistries: make(map[int64]*ToolRegistry),
+		clients:           make(map[int64]*MCPClientManager),
+		commands:          make(map[int64]*userCommandMCP),
+		summaryStore:      summaryStore,
+		summaryGen:        summaryGen,
 	}
 }
 
@@ -252,11 +263,94 @@ func (m *UserToolManager) connectUser(userID int64, cfg *MCPConfig) map[string]e
 
 	registry := NewToolRegistry()
 	manager := NewMCPClientManager()
-	failures := manager.ConnectAll(cfg, registry)
-
-	m.registries[userID] = registry
+	network := &MCPConfig{MCPServers: make(map[string]MCPServerConfig)}
+	for name, srv := range cfg.MCPServers {
+		if !IsCommandMCP(srv) {
+			network.MCPServers[name] = srv
+		}
+	}
+	failures := manager.ConnectAll(network, registry)
+	m.networkRegistries[userID] = registry
 	m.clients[userID] = manager
+	commandFailures := m.connectCommands(userID, cfg)
+	m.publishRegistry(userID)
+	m.generateSummaries(userID, m.registries[userID])
+	if failures == nil {
+		return commandFailures
+	}
+	maps.Copy(failures, commandFailures)
+	return failures
+}
 
+func (m *UserToolManager) connectCommands(userID int64, cfg *MCPConfig) map[string]error {
+	commands := &MCPConfig{MCPServers: make(map[string]MCPServerConfig)}
+	for name, srv := range cfg.MCPServers {
+		if IsCommandMCP(srv) && !srv.Disabled {
+			commands.MCPServers[name] = srv
+		}
+	}
+	if len(commands.MCPServers) == 0 {
+		return nil
+	}
+	conn := m.commandAccess.authorize(userID)
+	if conn == nil {
+		return nil
+	}
+	failures := conn.client.ConnectAll(commands, conn.registry)
+	if len(conn.client.clients) == 0 {
+		conn.disconnect()
+		return failures
+	}
+	for _, tool := range conn.registry.tools {
+		tool.(*MCPRemoteTool).command = conn
+	}
+	m.commands[userID] = conn
+	return failures
+}
+
+// refreshCommands reapplies access without replacing ordinary connections or
+// changing the persisted configurations. Called during runtime reload.
+func (m *UserToolManager) refreshCommands(access *commandMCPAccess) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.commandAccess = access
+	for userID := range m.networkRegistries {
+		conn := m.commands[userID]
+		if conn != nil && conn.lifetime.Err() == nil {
+			continue
+		}
+		delete(m.commands, userID)
+		if access.allowsUser(userID) {
+			cfg, err := m.store.Get(userID)
+			if err != nil {
+				log.Printf("[user-mcp] failed to load command MCP config for user %d: %v", userID, err)
+			} else if cfg != nil {
+				m.connectCommands(userID, cfg)
+			}
+		}
+		m.publishRegistry(userID)
+		if conn := m.commands[userID]; conn != nil {
+			m.generateSummaries(userID, conn.registry)
+		}
+	}
+}
+
+func (m *UserToolManager) publishRegistry(userID int64) {
+	network := m.networkRegistries[userID]
+	m.registries[userID] = network
+	if conn := m.commands[userID]; conn != nil {
+		merged := &ToolRegistry{tools: maps.Clone(network.tools), order: append([]string(nil), network.order...)}
+		for _, name := range conn.registry.order {
+			if _, exists := merged.tools[name]; !exists {
+				merged.order = append(merged.order, name)
+			}
+			merged.tools[name] = conn.registry.tools[name]
+		}
+		m.registries[userID] = merged
+	}
+}
+
+func (m *UserToolManager) generateSummaries(userID int64, registry *ToolRegistry) {
 	// Fire summary generation for all connected servers asynchronously.
 	if m.summaryGen != nil {
 		prefix := fmt.Sprintf("u%d", userID)
@@ -266,16 +360,20 @@ func (m *UserToolManager) connectUser(userID int64, cfg *MCPConfig) map[string]e
 		}
 	}
 
-	return failures
 }
 
 // disconnectUserLocked closes existing connections for a user.
 // Caller must hold m.mu.
 func (m *UserToolManager) disconnectUserLocked(userID int64) {
+	if conn := m.commands[userID]; conn != nil {
+		conn.disconnect()
+		delete(m.commands, userID)
+	}
 	if mgr, ok := m.clients[userID]; ok {
 		mgr.Close()
 		delete(m.clients, userID)
 	}
+	delete(m.networkRegistries, userID)
 	delete(m.registries, userID)
 }
 
@@ -290,6 +388,13 @@ type MCPAddResult struct {
 // Servers that fail to connect are rolled back from the DB.
 func (m *UserToolManager) AddServers(userID int64, incoming map[string]MCPServerConfig) (*MCPAddResult, error) {
 	result := &MCPAddResult{}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, srv := range incoming {
+		if IsCommandMCP(srv) && !m.commandAccess.allowsUser(userID) {
+			return nil, errCommandMCPAccess
+		}
+	}
 
 	// First, persist all incoming servers.
 	_, err := m.store.AddServers(userID, incoming)
@@ -302,9 +407,6 @@ func (m *UserToolManager) AddServers(userID int64, incoming map[string]MCPServer
 	if err != nil {
 		return nil, fmt.Errorf("added but failed to reload: %w", err)
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	failures := m.connectUser(userID, cfg)
 
@@ -501,20 +603,6 @@ func (v *MergedToolView) ServerNames() []string {
 	return out
 }
 
-// OpenAIToolsForServer returns full tool schemas for a single server, checking
-// user registry first (higher priority), then global.
-func (v *MergedToolView) OpenAIToolsForServer(serverName string) []openai.Tool {
-	if v.user != nil {
-		if tools := v.user.OpenAIToolsForServer(serverName); len(tools) > 0 {
-			return tools
-		}
-	}
-	if v.global != nil {
-		return v.global.OpenAIToolsForServer(serverName)
-	}
-	return nil
-}
-
 // ─── JSON Detection Helper ──────────────────────────────────────────────────
 
 // TryParseMCPConfig attempts to parse a message as MCP server configuration.
@@ -627,4 +715,12 @@ func filterCommandMCPs(cfg *MCPConfig) []string {
 		}
 	}
 	return rejected
+}
+
+// engagementNetworkRegistry excludes personal command tools and foreground
+// group grants. Reopening the user database restores the same enrollment.
+func (m *UserToolManager) engagementNetworkRegistry(owner int64) *ToolRegistry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.networkRegistries[owner]
 }

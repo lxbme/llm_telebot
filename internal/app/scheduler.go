@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -371,14 +372,15 @@ type ScheduledTaskRef struct {
 	Task   ScheduledTask
 }
 
-func (s *TaskStore) MarkRunResult(chatID int64, id string, ranAt time.Time, errText string) (ScheduledTask, bool) {
+func (s *TaskStore) markRunResult(chatID int64, attempted ScheduledTask, ranAt time.Time, errText string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	chatTasks := s.tasks[chatID]
+	id := attempted.ID
 	task, ok := chatTasks[id]
-	if !ok {
-		return ScheduledTask{}, false
+	if !ok || task != attempted {
+		return
 	}
 
 	task.LastRunAt = ranAt.UTC()
@@ -401,7 +403,6 @@ func (s *TaskStore) MarkRunResult(chatID int64, id string, ranAt time.Time, errT
 
 	chatTasks[id] = task
 	s.persistLocked(chatID)
-	return task, true
 }
 
 func (s *TaskStore) persistLocked(chatID int64) {
@@ -438,26 +439,55 @@ func NewTaskRunner(bot *Bot, store *TaskStore) *TaskRunner {
 	return &TaskRunner{bot: bot, store: store}
 }
 
-func (r *TaskRunner) Start() {
-	if r == nil || r.store == nil {
+func (r *TaskRunner) Start(ctx context.Context) {
+	if r == nil || r.bot == nil {
 		return
 	}
 	r.started.Do(func() {
-		go r.loop()
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			r.loop(ctx, ticker.C)
+		}()
 	})
 }
 
-func (r *TaskRunner) loop() {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
+func (r *TaskRunner) loop(ctx context.Context, ticks <-chan time.Time) {
+	r.tick(ctx, time.Now().UTC())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case tick, ok := <-ticks:
+			if !ok {
+				return
+			}
+			r.tick(ctx, tick.UTC())
+		}
+	}
+}
 
-	now := time.Now().UTC()
-	r.runDue(now)
+func (r *TaskRunner) tick(ctx context.Context, now time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
+	if r.store != nil {
+		r.runDue(now)
+	}
 	r.runDueReminders(now)
-	for tick := range ticker.C {
-		tickUTC := tick.UTC()
-		r.runDue(tickUTC)
-		r.runDueReminders(tickUTC)
+	const chatterKey = "proactivity:batch"
+	if _, busy := r.running.LoadOrStore(chatterKey, true); !busy {
+		go func() {
+			defer r.running.Delete(chatterKey)
+			r.runDueChatter(ctx)
+		}()
+	}
+	const key = "engagement:batch"
+	if _, busy := r.running.LoadOrStore(key, true); !busy {
+		go func() {
+			defer r.running.Delete(key)
+			r.runDueEngagements(ctx)
+		}()
 	}
 }
 
@@ -476,6 +506,12 @@ func (r *TaskRunner) runDue(now time.Time) {
 }
 
 func (r *TaskRunner) execute(chatID int64, task ScheduledTask) {
+	r.store.mu.RLock()
+	current := r.store.tasks[chatID][task.ID]
+	r.store.mu.RUnlock()
+	if current != task {
+		return
+	}
 	log.Printf("[schedule] triggering chat=%d id=%s", chatID, task.ID)
 	r.bot.recordDashboardEvent(DashboardEvent{
 		Type:    DashboardEventScheduleTriggered,
@@ -486,8 +522,8 @@ func (r *TaskRunner) execute(chatID int64, task ScheduledTask) {
 	})
 
 	taskMsg := buildScheduledTaskMessage(task)
-	chat := &tele.Chat{ID: chatID}
-	err := r.bot.startChatFlow(chat, nil, taskMsg, task.Context)
+	turn := r.bot.beginRoleTurn(RoleTurn{ChatID: chatID, InitiatorID: task.CreatedBy, Purpose: RoleBackground})
+	err := r.bot.runScheduledReply(turn, taskMsg, task.Context, "")
 	ranAt := time.Now().UTC()
 	errText := ""
 	if err != nil {
@@ -500,7 +536,7 @@ func (r *TaskRunner) execute(chatID int64, task ScheduledTask) {
 			Detail:  err.Error(),
 		})
 	}
-	r.store.MarkRunResult(chatID, task.ID, ranAt, errText)
+	r.store.markRunResult(chatID, task, ranAt, errText)
 }
 
 func buildScheduledTaskMessage(task ScheduledTask) openai.ChatCompletionMessage {
@@ -541,67 +577,63 @@ func (b *Bot) handleScheduleMessage(c tele.Context, text string) (bool, error) {
 	case scheduleActionList:
 		return true, c.Reply(formatScheduledTaskList(snap.tasks.List(chatID)))
 	case scheduleActionUpsert:
-		if !b.isAdmin(userID) {
-			return true, c.Reply("🚫 Only admins can create or update scheduled tasks.")
-		}
-		now := time.Now().UTC()
-		task := ScheduledTask{
-			ID:        req.ID,
-			Name:      req.Name,
-			Prompt:    req.Prompt,
-			CronExpr:  req.Time.CronExpr,
-			Timezone:  req.Time.Timezone,
-			Context:   req.ContextEnabled(),
-			Enabled:   req.EnabledValue(),
-			CreatedBy: userID,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-		if task.Enabled {
-			nextRun, err := computeNextRun(task, now)
-			if err != nil {
-				return true, c.Reply(fmt.Sprintf("❌ Failed to compute next run: %v", err))
+		return true, b.replyAsAdmin(c, "🚫 Only admins can create or update scheduled tasks.", func(snap runtimeSnapshot) string {
+			now := time.Now().UTC()
+			task := ScheduledTask{
+				ID:        req.ID,
+				Name:      req.Name,
+				Prompt:    req.Prompt,
+				CronExpr:  req.Time.CronExpr,
+				Timezone:  req.Time.Timezone,
+				Context:   req.ContextEnabled(),
+				Enabled:   req.EnabledValue(),
+				CreatedBy: userID,
+				CreatedAt: now,
+				UpdatedAt: now,
 			}
-			task.NextRunAt = nextRun
-		}
-		saved, created := snap.tasks.Upsert(chatID, task)
-		actionLabel := "updated"
-		if created {
-			actionLabel = "created"
-		}
-		return true, c.Reply(formatScheduledTaskUpsert(saved, actionLabel))
+			if task.Enabled {
+				nextRun, err := computeNextRun(task, now)
+				if err != nil {
+					return fmt.Sprintf("❌ Failed to compute next run: %v", err)
+				}
+				task.NextRunAt = nextRun
+			}
+			saved, created := snap.tasks.Upsert(chatID, task)
+			actionLabel := "updated"
+			if created {
+				actionLabel = "created"
+			}
+			return formatScheduledTaskUpsert(saved, actionLabel)
+		})
 	case scheduleActionDelete:
-		if !b.isAdmin(userID) {
-			return true, c.Reply("🚫 Only admins can delete scheduled tasks.")
-		}
-		if !snap.tasks.Delete(chatID, req.ID) {
-			return true, c.Reply(fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", req.ID))
-		}
-		return true, c.Reply(fmt.Sprintf("✅ Deleted schedule %q.", req.ID))
+		return true, b.replyAsAdmin(c, "🚫 Only admins can delete scheduled tasks.", func(snap runtimeSnapshot) string {
+			if !snap.tasks.Delete(chatID, req.ID) {
+				return fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", req.ID)
+			}
+			return fmt.Sprintf("✅ Deleted schedule %q.", req.ID)
+		})
 	case scheduleActionPause:
-		if !b.isAdmin(userID) {
-			return true, c.Reply("🚫 Only admins can pause scheduled tasks.")
-		}
-		task, found, err := snap.tasks.SetEnabled(chatID, req.ID, false, time.Now().UTC())
-		if err != nil {
-			return true, c.Reply(fmt.Sprintf("❌ Failed to pause schedule: %v", err))
-		}
-		if !found {
-			return true, c.Reply(fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", req.ID))
-		}
-		return true, c.Reply(formatScheduledTaskState(task, "paused"))
+		return true, b.replyAsAdmin(c, "🚫 Only admins can pause scheduled tasks.", func(snap runtimeSnapshot) string {
+			task, found, err := snap.tasks.SetEnabled(chatID, req.ID, false, time.Now().UTC())
+			if err != nil {
+				return fmt.Sprintf("❌ Failed to pause schedule: %v", err)
+			}
+			if !found {
+				return fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", req.ID)
+			}
+			return formatScheduledTaskState(task, "paused")
+		})
 	case scheduleActionResume:
-		if !b.isAdmin(userID) {
-			return true, c.Reply("🚫 Only admins can resume scheduled tasks.")
-		}
-		task, found, err := snap.tasks.SetEnabled(chatID, req.ID, true, time.Now().UTC())
-		if err != nil {
-			return true, c.Reply(fmt.Sprintf("❌ Failed to resume schedule: %v", err))
-		}
-		if !found {
-			return true, c.Reply(fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", req.ID))
-		}
-		return true, c.Reply(formatScheduledTaskState(task, "resumed"))
+		return true, b.replyAsAdmin(c, "🚫 Only admins can resume scheduled tasks.", func(snap runtimeSnapshot) string {
+			task, found, err := snap.tasks.SetEnabled(chatID, req.ID, true, time.Now().UTC())
+			if err != nil {
+				return fmt.Sprintf("❌ Failed to resume schedule: %v", err)
+			}
+			if !found {
+				return fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", req.ID)
+			}
+			return formatScheduledTaskState(task, "resumed")
+		})
 	default:
 		return true, c.Reply(fmt.Sprintf("❌ Unsupported schedule action %q.", req.Action))
 	}
@@ -646,7 +678,8 @@ func (b *Bot) handleScheduleNewCommand(c tele.Context) error {
 	if !b.isAllowed(c) {
 		return nil
 	}
-	if c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
+	snap := b.snapshot()
+	if c.Sender() == nil || !snap.cfg.isAdmin(c.Sender().ID) {
 		return c.Reply("🚫 Only admins can create scheduled tasks.")
 	}
 
@@ -661,7 +694,7 @@ func (b *Bot) handleScheduleNewCommand(c tele.Context) error {
 	if err != nil {
 		return err
 	}
-	b.scheduleWizard.Set(c.Sender().ID, rendered)
+	snap.scheduleWizard.Set(c.Sender().ID, rendered)
 	b.deleteScheduleWizardMessage(c.Message())
 	return nil
 }
@@ -671,19 +704,23 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		return false, nil
 	}
 
-	session, ok := b.scheduleWizard.Get(c.Sender().ID)
+	snap := b.snapshot()
+	if snap.scheduleWizard == nil {
+		return false, nil
+	}
+	session, ok := snap.scheduleWizard.Get(c.Sender().ID)
 	if !ok || session.ChatID != c.Chat().ID {
 		return false, nil
 	}
-	if !b.isAdmin(c.Sender().ID) {
-		b.scheduleWizard.Clear(c.Sender().ID)
+	if !snap.cfg.isAdmin(c.Sender().ID) {
+		snap.scheduleWizard.Clear(c.Sender().ID)
 		b.cleanupScheduleWizardPanel(session)
 		return true, c.Reply("🚫 Only admins can create scheduled tasks.")
 	}
 
 	trimmed := strings.TrimSpace(text)
 	if strings.EqualFold(trimmed, "cancel") {
-		b.scheduleWizard.Clear(c.Sender().ID)
+		snap.scheduleWizard.Clear(c.Sender().ID)
 		b.deleteScheduleWizardMessage(c.Message())
 		b.cleanupScheduleWizardPanel(session)
 		return true, c.Reply("🛑 Schedule creation cancelled.")
@@ -701,7 +738,7 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		if !scheduleIDPattern.MatchString(trimmed) {
 			rendered, err := b.renderScheduleWizardPanel(c, session, "❌ 任务 ID 无效。\n\n"+scheduleWizardPrompt(session))
 			if err == nil {
-				b.scheduleWizard.Set(c.Sender().ID, rendered)
+				snap.scheduleWizard.Set(c.Sender().ID, rendered)
 				shouldDeleteInput = true
 			}
 			return true, err
@@ -710,7 +747,7 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		session.Step = "cron"
 		rendered, err := b.renderScheduleWizardPanel(c, session, scheduleWizardPrompt(session))
 		if err == nil {
-			b.scheduleWizard.Set(c.Sender().ID, rendered)
+			snap.scheduleWizard.Set(c.Sender().ID, rendered)
 			shouldDeleteInput = true
 		}
 		return true, err
@@ -718,7 +755,7 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		if _, err := cron.ParseStandard(trimmed); err != nil {
 			rendered, renderErr := b.renderScheduleWizardPanel(c, session, "❌ Cron 表达式无效。\n\n"+scheduleWizardPrompt(session))
 			if renderErr == nil {
-				b.scheduleWizard.Set(c.Sender().ID, rendered)
+				snap.scheduleWizard.Set(c.Sender().ID, rendered)
 				shouldDeleteInput = true
 			}
 			return true, renderErr
@@ -727,7 +764,7 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		session.Step = "timezone"
 		rendered, err := b.renderScheduleWizardPanel(c, session, scheduleWizardPrompt(session))
 		if err == nil {
-			b.scheduleWizard.Set(c.Sender().ID, rendered)
+			snap.scheduleWizard.Set(c.Sender().ID, rendered)
 			shouldDeleteInput = true
 		}
 		return true, err
@@ -735,7 +772,7 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		if _, err := time.LoadLocation(trimmed); err != nil {
 			rendered, renderErr := b.renderScheduleWizardPanel(c, session, "❌ 时区无效。\n\n"+scheduleWizardPrompt(session))
 			if renderErr == nil {
-				b.scheduleWizard.Set(c.Sender().ID, rendered)
+				snap.scheduleWizard.Set(c.Sender().ID, rendered)
 				shouldDeleteInput = true
 			}
 			return true, renderErr
@@ -744,7 +781,7 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		session.Step = "prompt"
 		rendered, err := b.renderScheduleWizardPanel(c, session, scheduleWizardPrompt(session))
 		if err == nil {
-			b.scheduleWizard.Set(c.Sender().ID, rendered)
+			snap.scheduleWizard.Set(c.Sender().ID, rendered)
 			shouldDeleteInput = true
 		}
 		return true, err
@@ -752,7 +789,7 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		if trimmed == "" {
 			rendered, renderErr := b.renderScheduleWizardPanel(c, session, "❌ Prompt 不能为空。\n\n"+scheduleWizardPrompt(session))
 			if renderErr == nil {
-				b.scheduleWizard.Set(c.Sender().ID, rendered)
+				snap.scheduleWizard.Set(c.Sender().ID, rendered)
 				shouldDeleteInput = true
 			}
 			return true, renderErr
@@ -761,7 +798,7 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		session.Step = "context"
 		rendered, err := b.renderScheduleWizardPanel(c, session, scheduleWizardPrompt(session))
 		if err == nil {
-			b.scheduleWizard.Set(c.Sender().ID, rendered)
+			snap.scheduleWizard.Set(c.Sender().ID, rendered)
 			shouldDeleteInput = true
 		}
 		return true, err
@@ -770,17 +807,10 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		if !ok {
 			rendered, renderErr := b.renderScheduleWizardPanel(c, session, "❌ context 输入无效。\n\n"+scheduleWizardPrompt(session))
 			if renderErr == nil {
-				b.scheduleWizard.Set(c.Sender().ID, rendered)
+				snap.scheduleWizard.Set(c.Sender().ID, rendered)
 				shouldDeleteInput = true
 			}
 			return true, renderErr
-		}
-
-		snap := b.snapshot()
-		if snap.tasks == nil {
-			b.scheduleWizard.Clear(c.Sender().ID)
-			b.cleanupScheduleWizardPanel(session)
-			return true, c.Reply("⚠️ Schedule storage is unavailable.")
 		}
 
 		now := time.Now().UTC()
@@ -801,8 +831,23 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		}
 		task.NextRunAt = nextRun
 
-		saved, created := snap.tasks.Upsert(c.Chat().ID, task)
-		b.scheduleWizard.Clear(c.Sender().ID)
+		userID := c.Sender().ID
+		b.runtimeConfigMu.Lock()
+		current := b.snapshot()
+		active, ok := current.scheduleWizard.Get(userID)
+		if current.scheduleWizard != snap.scheduleWizard || !current.cfg.isAdmin(userID) || !current.cfg.isAllowed(c) || !ok || active != session {
+			b.runtimeConfigMu.Unlock()
+			return true, c.Reply("ℹ️ No active schedule session. Run /schedule_new to start again.")
+		}
+		if current.tasks == nil {
+			snap.scheduleWizard.Clear(userID)
+			b.runtimeConfigMu.Unlock()
+			b.cleanupScheduleWizardPanel(session)
+			return true, c.Reply("⚠️ Schedule storage is unavailable.")
+		}
+		saved, created := current.tasks.Upsert(c.Chat().ID, task)
+		snap.scheduleWizard.Clear(userID)
+		b.runtimeConfigMu.Unlock()
 		shouldDeleteInput = true
 		b.cleanupScheduleWizardPanel(session)
 
@@ -814,7 +859,7 @@ func (b *Bot) handleScheduleTextIfNeeded(c tele.Context, text string) (bool, err
 		return true, err
 	}
 
-	b.scheduleWizard.Clear(c.Sender().ID)
+	snap.scheduleWizard.Clear(c.Sender().ID)
 	b.cleanupScheduleWizardPanel(session)
 	return true, c.Reply("⚠️ Schedule wizard state was invalid and has been reset. Please run /schedule_new again.")
 }
@@ -853,61 +898,56 @@ func (b *Bot) handleScheduleToggleCommand(c tele.Context, enabled bool, id strin
 	if !b.isAllowed(c) {
 		return nil
 	}
-	if c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
-		if enabled {
-			return c.Reply("🚫 Only admins can resume scheduled tasks.")
-		}
-		return c.Reply("🚫 Only admins can pause scheduled tasks.")
-	}
-
-	id = strings.TrimSpace(id)
-	if !scheduleIDPattern.MatchString(id) {
-		usage := "/schedule_pause <id>"
-		if enabled {
-			usage = "/schedule_resume <id>"
-		}
-		return c.Reply("⚠️ Please provide a valid schedule id.\nUsage: " + usage)
-	}
-
-	snap := b.snapshot()
-	if snap.tasks == nil {
-		return c.Reply("⚠️ Schedule storage is unavailable.")
-	}
-	task, found, err := snap.tasks.SetEnabled(c.Chat().ID, id, enabled, time.Now().UTC())
-	if err != nil {
-		return c.Reply(fmt.Sprintf("❌ Failed to update schedule: %v", err))
-	}
-	if !found {
-		return c.Reply(fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", id))
-	}
-	state := "paused"
+	denied := "🚫 Only admins can pause scheduled tasks."
 	if enabled {
-		state = "resumed"
+		denied = "🚫 Only admins can resume scheduled tasks."
 	}
-	return c.Reply(formatScheduledTaskState(task, state))
+	return b.replyAsAdmin(c, denied, func(snap runtimeSnapshot) string {
+		id = strings.TrimSpace(id)
+		if !scheduleIDPattern.MatchString(id) {
+			usage := "/schedule_pause <id>"
+			if enabled {
+				usage = "/schedule_resume <id>"
+			}
+			return "⚠️ Please provide a valid schedule id.\nUsage: " + usage
+		}
+
+		if snap.tasks == nil {
+			return "⚠️ Schedule storage is unavailable."
+		}
+		task, found, err := snap.tasks.SetEnabled(c.Chat().ID, id, enabled, time.Now().UTC())
+		if err != nil {
+			return fmt.Sprintf("❌ Failed to update schedule: %v", err)
+		}
+		if !found {
+			return fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", id)
+		}
+		state := "paused"
+		if enabled {
+			state = "resumed"
+		}
+		return formatScheduledTaskState(task, state)
+	})
 }
 
 func (b *Bot) handleScheduleDeleteCommand(c tele.Context, id string) error {
 	if !b.isAllowed(c) {
 		return nil
 	}
-	if c.Sender() == nil || !b.isAdmin(c.Sender().ID) {
-		return c.Reply("🚫 Only admins can delete scheduled tasks.")
-	}
+	return b.replyAsAdmin(c, "🚫 Only admins can delete scheduled tasks.", func(snap runtimeSnapshot) string {
+		id = strings.TrimSpace(id)
+		if !scheduleIDPattern.MatchString(id) {
+			return "⚠️ Please provide a valid schedule id.\nUsage: /schedule_del <id>"
+		}
 
-	id = strings.TrimSpace(id)
-	if !scheduleIDPattern.MatchString(id) {
-		return c.Reply("⚠️ Please provide a valid schedule id.\nUsage: /schedule_del <id>")
-	}
-
-	snap := b.snapshot()
-	if snap.tasks == nil {
-		return c.Reply("⚠️ Schedule storage is unavailable.")
-	}
-	if !snap.tasks.Delete(c.Chat().ID, id) {
-		return c.Reply(fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", id))
-	}
-	return c.Reply(fmt.Sprintf("✅ Deleted schedule %q.", id))
+		if snap.tasks == nil {
+			return "⚠️ Schedule storage is unavailable."
+		}
+		if !snap.tasks.Delete(c.Chat().ID, id) {
+			return fmt.Sprintf("⚠️ Schedule %q was not found in this chat.", id)
+		}
+		return fmt.Sprintf("✅ Deleted schedule %q.", id)
+	})
 }
 
 func firstArg(fields []string) string {

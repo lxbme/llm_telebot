@@ -28,11 +28,15 @@ AUTO_DETECT_MODEL: ""
 # 逗号分隔的 Telegram ID；留空表示不限制。
 ALLOWED_USERS: ""
 ALLOWED_GROUPS: ""
+# 逗号分隔的明确 Telegram 管理员 ID，留空表示没有 Telegram 管理员。
+# 生效名单中有一项为 "*" 时，Telegram 管理、管理员配额豁免和 SSH Dashboard 都会停用。
 ADMIN_ID: ""
 
-# ── User Profile Extraction ───────────────────────────────────────────────────
+# ── Role Memory and Legacy Profiles ──────────────────────────────────────────
+# false 关闭自动学习和旧画像命令。新记忆存入 CHAT_DB_PATH。
 PROFILE_ENABLED: true
 PROFILE_DB_PATH: ./data/profiles.db
+# 兼容旧配置。角色学习按合格回复评估。
 PROFILE_EXTRACT_EVERY: 3
 PROFILE_API_BASE: ""
 PROFILE_API_KEY: ""

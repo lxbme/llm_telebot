@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
@@ -407,6 +410,9 @@ func (snap runtimeSnapshot) editReplyPreview(ctx context.Context, msg *tele.Mess
 	if client == nil {
 		client = http.DefaultClient
 	}
+	if checkRoleReplyUse(ctx) != nil {
+		return
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -429,20 +435,163 @@ func (snap runtimeSnapshot) editReplyPreview(ctx context.Context, msg *tele.Mess
 // editFinalResponse edits the placeholder with the LLM's final Markdown
 // response, converting it to Telegram HTML.  If the HTML exceeds Telegram's
 // 4096-char limit or the API rejects it, it falls back to plain text.
-func (snap runtimeSnapshot) editFinalResponse(msg *tele.Message, markdownText string) {
-	htmlText := mdToTgHTML(markdownText)
-	if len([]rune(htmlText)) <= 4096 {
-		_, err := snap.tg.Edit(msg, htmlText, tele.ModeHTML)
-		if err == nil {
-			return
+// It returns the confirmed visible text, or an empty string on failure.
+func (snap runtimeSnapshot) editFinalResponse(msg *tele.Message, markdownText string, allowed func() bool) string {
+	text, _ := snap.editFinalResponseWithResult(msg, markdownText, allowed)
+	return text
+}
+
+var errTelegramDeliveryUnknown = errors.New("Telegram delivery is unconfirmed")
+
+func (snap runtimeSnapshot) editFinalResponseWithResult(msg *tele.Message, markdownText string, allowed func() bool) (string, error) {
+	text, _, err := snap.editRenderedReply(msg, mdToTgHTML(markdownText), markdownText, allowed, false)
+	return text, err
+}
+
+func fitsTelegramMessage(text string) bool {
+	return utf8.RuneCountInString(text) <= telegramMessageLimit
+}
+
+func (snap runtimeSnapshot) editRenderedReply(msg *tele.Message, htmlText, plainText string, allowed func() bool, requireText bool) (string, tele.ParseMode, error) {
+	var uncertain bool
+	if htmlText != "" && fitsTelegramMessage(telegramLineEndings(visibleTelegramHTML(htmlText))) {
+		if !allowed() {
+			return "", tele.ModeDefault, errRoleAudience
 		}
-		if strings.Contains(err.Error(), "message is not modified") {
-			return
+		text, err := snap.editTelegramText(msg, htmlText, tele.ModeHTML, requireText)
+		if err == nil || requireText && errors.Is(err, errTelegramDeliveryUnknown) {
+			return text, tele.ModeHTML, err
 		}
-		// HTML edit failed (e.g., malformed tags); fall back to plain text.
+		uncertain = !telegramDefinitelyRejected(err)
+		// The fallback edits the same message, even if the first response
+		// was lost. A successful edit always establishes delivery.
 		log.Printf("HTML edit failed, falling back to plain text: %s", snap.telegramEditError(err))
 	}
-	snap.editOrLog(msg, markdownText)
+	if !allowed() {
+		if uncertain {
+			return "", tele.ModeDefault, errTelegramDeliveryUnknown
+		}
+		return "", tele.ModeDefault, errRoleAudience
+	}
+	text, err := snap.editTelegramText(msg, truncateTelegramMessage(plainText), tele.ModeDefault, requireText)
+	if err == nil {
+		return text, tele.ModeDefault, nil
+	}
+	log.Printf("editOrLog error: %s", snap.telegramEditError(err))
+	if uncertain || !telegramDefinitelyRejected(err) {
+		return "", tele.ModeDefault, errTelegramDeliveryUnknown
+	}
+	return "", tele.ModeDefault, fmt.Errorf("Telegram rejected reply delivery")
+}
+
+func telegramDefinitelyRejected(err error) bool {
+	var apiError *tele.Error
+	var flood tele.FloodError
+	var migrated tele.GroupError
+	if errors.As(err, &apiError) {
+		return apiError.Code >= 400 && apiError.Code < 500
+	}
+	if errors.As(err, &flood) || errors.As(err, &migrated) {
+		return true
+	}
+	// Telebot formats unlisted API rejections as an untyped error.
+	message := err.Error()
+	if !strings.HasPrefix(message, "telegram: ") || len(message) < 6 || message[len(message)-6:len(message)-4] != " (" {
+		return false
+	}
+	code, parseErr := strconv.Atoi(message[len(message)-4 : len(message)-1])
+	return parseErr == nil && code >= 400 && code < 500 && strings.HasSuffix(message, ")")
+}
+
+// A committed decision gets one new message only when Telegram definitively
+// rejects editing this placeholder. An ambiguous transport failure may already
+// have delivered the edit, so it cannot authorize a second message.
+func (snap runtimeSnapshot) deliverEngagementReceipt(msg *tele.Message, text string, allowed func() bool) string {
+	if msg == nil || msg.Chat == nil || !allowed() {
+		return ""
+	}
+	text = truncateTelegramMessage(text)
+	edited, err := snap.tg.Edit(msg, text, tele.ModeDefault)
+	if err == nil {
+		return confirmedEngagementText(edited, text)
+	}
+	if knownTelegramEditError(err, tele.ErrMessageNotModified, tele.ErrSameMessageContent) {
+		return text
+	}
+	log.Printf("engagement receipt edit failed: %s", snap.telegramEditError(err))
+	if !definitelyUneditable(err) || !allowed() {
+		return ""
+	}
+	sent, err := snap.tg.Send(msg.Chat, text, tele.ModeDefault)
+	if err != nil {
+		log.Printf("engagement receipt send failed: %s", snap.telegramEditError(err))
+		return ""
+	}
+	return confirmedEngagementText(sent, text)
+}
+
+func confirmedEngagementText(message *tele.Message, requested string) string {
+	if message == nil || message.ID <= 0 {
+		log.Print("engagement receipt response omitted the Telegram message")
+		return ""
+	}
+	return firstNonEmpty(message.Text, requested)
+}
+
+func definitelyUneditable(err error) bool {
+	return knownTelegramEditError(err, tele.ErrCantEditMessage, tele.NewError(400, "Bad Request: message to edit not found"))
+}
+
+func knownTelegramEditError(err error, choices ...*tele.Error) bool {
+	var apiError *tele.Error
+	typed := errors.As(err, &apiError)
+	for _, choice := range choices {
+		if typed {
+			if apiError.Code == choice.Code && apiError.Description == choice.Description {
+				return true
+			}
+		} else if err.Error() == fmt.Sprintf("telegram: %s (%d)", choice.Description, choice.Code) {
+			// telebot v3 returns an untyped error for unlisted API descriptions.
+			return true
+		}
+	}
+	return false
+}
+
+var telegramHTMLTag = regexp.MustCompile(`<[^>]+>`)
+
+func visibleTelegramHTML(text string) string {
+	return html.UnescapeString(telegramHTMLTag.ReplaceAllString(text, ""))
+}
+
+func telegramLineEndings(text string) string {
+	return strings.ReplaceAll(text, "\r\n", "\n")
+}
+
+func (snap runtimeSnapshot) editTelegramText(msg *tele.Message, text string, mode tele.ParseMode, requireText bool) (string, error) {
+	edited, err := snap.tg.Edit(msg, text, mode)
+	if err != nil && !knownTelegramEditError(err, tele.ErrMessageNotModified, tele.ErrSameMessageContent) {
+		return "", err
+	}
+	if err == nil && (edited == nil || edited.ID <= 0 || edited.Chat == nil || msg.Chat == nil || edited.Chat.ID != msg.Chat.ID) {
+		return "", errTelegramDeliveryUnknown
+	}
+	if edited != nil && edited.Text != "" {
+		if !requireText || edited.ID == msg.ID {
+			return edited.Text, nil
+		}
+	}
+	if err == nil && requireText {
+		return "", errTelegramDeliveryUnknown
+	}
+	// Telegram's "message is not modified" response omits the Message.
+	// Other reply callers also accept omitted text in a successful response.
+	// The HTML renderer escapes literal brackets, so only generated tags
+	// need to be removed before decoding the visible text.
+	if mode == tele.ModeHTML {
+		text = visibleTelegramHTML(text)
+	}
+	return text, nil
 }
 
 func (snap runtimeSnapshot) telegramEditError(err error) string {

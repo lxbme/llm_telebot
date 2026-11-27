@@ -282,7 +282,7 @@ func TestEinoReplyRecoveryClearsTelegramAndKeepsToolSideEffectOnce(t *testing.T)
 		t.Fatalf("Telegram final edit = %+v", edit)
 	}
 	history := waitEinoReplyHistory(t, b, chat.ID, 2)
-	if history[0].Content != "question" || history[1].Content != "**recovered**" {
+	if history[0].Content != "question" || history[1].Content != "recovered" {
 		t.Errorf("persisted history = %+v", history)
 	}
 	telegram.mu.Lock()

@@ -127,7 +127,7 @@ func TestEinoGroupTextUsesPersistedPhotoHistory(t *testing.T) {
 }
 
 func TestEinoTaskRunnerUsesGlobalToolsAndRequestedContext(t *testing.T) {
-	const chatID, ownerID = int64(41), int64(42)
+	const chatID, ownerID = int64(42), int64(42)
 	task := ScheduledTask{
 		ID: "daily", Prompt: "Summarize the archive", CronExpr: "0 8 * * *",
 		Timezone: "UTC", Context: true, Enabled: true, CreatedBy: ownerID,
@@ -175,7 +175,15 @@ func TestEinoTaskRunnerUsesGlobalToolsAndRequestedContext(t *testing.T) {
 	userTools := NewUserToolManager(nil, nil, nil)
 	userTools.registries[ownerID] = personal
 
-	telegram := newEinoReplyTelegram(t, nil)
+	telegram := newEinoReplyTelegramForChat(t, tele.Chat{ID: chatID, Type: tele.ChatPrivate}, nil,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/bottest-token/getChat" {
+				t.Errorf("unexpected Telegram API request %s", r.URL.Path)
+				http.NotFound(w, r)
+				return
+			}
+			fmt.Fprintf(w, `{"ok":true,"result":{"id":%d,"type":"private"}}`, chatID)
+		}))
 	snap := model.snapshot(3)
 	b := &Bot{
 		cfg: snap.cfg, ai: snap.ai, tg: telegram.bot, store: NewHistoryStore(nil),
